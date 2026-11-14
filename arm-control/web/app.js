@@ -3,7 +3,7 @@ import { OrbitControls } from './vendor/OrbitControls.js';
 import { TransformControls } from './vendor/TransformControls.js';
 
 // 每次改网页都同时改这里和 web/version.json；刷新后右上角应显示这个版本
-const WEB_VERSION = '2026-11-13.1';
+const WEB_VERSION = '2026-11-14.13';
 const webverEl = document.getElementById('pill-webver');
 if (webverEl) webverEl.textContent = `网页 v${WEB_VERSION}`;
 
@@ -511,7 +511,8 @@ let down = null;
 // 控制权 / 配置
 let CONFIG = null;
 let CONFIG_VERSION = '';
-let TOKEN = '';
+let TOKEN = sessionStorage.getItem('arm-token') || '';
+let RECOVER_TOKEN = '';   // 心跳失败后保留旧 token，先尝试原 token 立即拿回
 let EXEC_MODE = 'preview';
 let STATE = null;
 let READONLY = true;
@@ -548,6 +549,17 @@ async function apiPost(url, body = {}) {
   if (!TOKEN) throw new Error('没有控制权（只读）');
   return postRaw(url, { ...body, token: TOKEN, config_version: CONFIG_VERSION });
 }
+
+// 正常关闭/刷新页面时主动释放，避免“不自动释放”后控制权永远占着。
+// 崩溃/断网不会触发，这种情况按设计保留控制权，需重启执行器。
+window.addEventListener('beforeunload', () => {
+  const t = TOKEN || RECOVER_TOKEN;
+  if (!t) return;
+  try {
+    navigator.sendBeacon('/api/release',
+      new Blob([JSON.stringify({ token: t })], { type: 'application/json' }));
+  } catch (_) { /* ignore */ }
+});
 
 // ---------------------------------------------------------------------------
 // 初始化：配置版本 → 控制权 → SSE / 心跳
@@ -588,11 +600,14 @@ async function tryAcquire() {
   try {
     const r = await postRaw('/api/acquire', {
       client_id: CLIENT_ID, config_version: CONFIG_VERSION,
-      ...(TOKEN ? { token: TOKEN } : {}),
+      ...((TOKEN || RECOVER_TOKEN) ? { token: TOKEN || RECOVER_TOKEN } : {}),
     });
     TOKEN = r.token;
+    RECOVER_TOKEN = '';
+    sessionStorage.setItem('arm-token', TOKEN);
     READONLY = false;
     EXEC_MODE = r.exec_mode || EXEC_MODE;
+    if (acquireTimer) { clearInterval(acquireTimer); acquireTimer = null; }
     log('取得控制权', 'g');
     updateModeUI();
   } catch (e) {
@@ -604,15 +619,19 @@ async function tryAcquire() {
         try {
           const r = await postRaw('/api/acquire', {
             client_id: CLIENT_ID, config_version: CONFIG_VERSION,
-            ...(TOKEN ? { token: TOKEN } : {}),
+            ...((TOKEN || RECOVER_TOKEN) ? { token: TOKEN || RECOVER_TOKEN } : {}),
           });
-          TOKEN = r.token; READONLY = false;
+          TOKEN = r.token; RECOVER_TOKEN = ''; READONLY = false;
+          sessionStorage.setItem('arm-token', TOKEN);
           clearInterval(acquireTimer); acquireTimer = null;
           log('拿到控制权', 'g');
           updateModeUI();
         } catch (_) { /* 继续等 */ }
       }, 2000);
     }
+  } finally {
+    // 关键：无论成功/失败都要复位，否则心跳失败后再也拿不回来
+    ACQUIRING = false;
   }
 }
 
@@ -643,10 +662,14 @@ async function heartbeat() {
   try {
     await postRaw('/api/heartbeat', { token: TOKEN });
   } catch (e) {
+    // 不直接扔掉 token：先拿原 token 试一次 acquire。
+    // 页面自己仍是 owner 时后端会原样返回同一个 token，瞬间恢复；
+    // 执行器重启（owner=None）也会直接发新 token。
+    RECOVER_TOKEN = TOKEN || RECOVER_TOKEN;
     TOKEN = '';
     READONLY = true;
     updateModeUI();
-    log('心跳失败，控制权已丢：' + e.message, 'w');
+    log('心跳失败，正在尝试重新取得控制权：' + e.message, 'w');
     tryAcquire();
   }
 }
@@ -658,8 +681,8 @@ function syncVersion(s) {
     log('配置版本已更新（校准时会改配置），重新拿控制权', 'w');
     if (TOKEN) {
       postRaw('/api/acquire', { client_id: CLIENT_ID, config_version: CONFIG_VERSION,
-        ...(TOKEN ? { token: TOKEN } : {}) })
-        .then((r) => { TOKEN = r.token; })
+        ...((TOKEN || RECOVER_TOKEN) ? { token: TOKEN || RECOVER_TOKEN } : {}) })
+        .then((r) => { TOKEN = r.token; sessionStorage.setItem('arm-token', TOKEN); })
         .catch((e) => log('重新拿控制权失败：' + e.message, 'w'));
     }
   }
@@ -671,6 +694,7 @@ function applyState(s) {
   if (CALIB_OPEN) updateCalib(s.calib);
   if (MEASURE_OPEN) updateMeasureUI(s);
   STATE = s;
+  updateTrace(s);
   const nowUi = performance.now();
   if (!gizmoDragging && nowUi - lastUiAt > 80) {
     lastUiAt = nowUi;
@@ -703,7 +727,8 @@ function applyState(s) {
   }
   // 没有控制方或控制方心跳已老化：尝试拿回来
   const c = s.control || {};
-  if (!TOKEN && (c.owner === null || (c.age_s !== null && c.age_s > c.stale_s))) {
+  if (!TOKEN && (c.owner === null ||
+      (c.stale_s > 0 && c.age_s !== null && c.age_s > c.stale_s))) {
     const last = window.__lastAcquireTry || 0;
     if (!ACQUIRING && Date.now() - last > 2000) {
       window.__lastAcquireTry = Date.now();
@@ -820,6 +845,29 @@ function renderSafeCheck(s) {
     `<td class="${r.ok ? '' : 'bad'}">${r.joint} ${r.q.toFixed(2)}°<br>` +
     `<span style="opacity:.65">${r.lo}..${r.hi}</span></td>`).join('');
   el.innerHTML = `<b>${head}</b><table><tr>${t}</tr></table>`;
+}
+
+function updateTrace(s) {
+  const t = (s && s.trace) || {};
+  const bStart = document.getElementById('trace-start');
+  const bStop = document.getElementById('trace-stop');
+  const el = document.getElementById('trace-status');
+  if (!bStart || !bStop || !el) return;
+  const active = !!t.active;
+  bStart.disabled = READONLY || !s.connected || !!s.mock || active;
+  bStop.disabled = READONLY || !active;
+  if (active) {
+    el.textContent = `采样中：${t.samples || 0} 样本，实际 ${t.actual_hz || 0} Hz` +
+      (t.path ? `，写 ${t.path}` : '') + (t.error ? `；${t.error}` : '');
+    el.style.color = 'var(--ok)';
+  } else if (t.path) {
+    el.textContent = `上次：${t.samples || 0} 样本，实际 ${t.actual_hz || 0} Hz` +
+      `，文件 ${t.path}` + (t.error ? `；${t.error}` : '');
+    el.style.color = t.error ? 'var(--bad)' : 'var(--muted)';
+  } else {
+    el.textContent = '未运行。采样会额外占用 ECB/CAN，只在诊断时开。';
+    el.style.color = '';
+  }
 }
 
 function updateUI(s) {
@@ -1432,6 +1480,24 @@ function closeCalib() {
   CALIB_OPEN = false;
   $('calib-modal').classList.add('hidden');
 }
+$('trace-start').addEventListener('click', async () => {
+  const hz = (CONFIG && CONFIG.trace_hz) || 100;
+  const sec = (CONFIG && CONFIG.trace_seconds) || 10;
+  try {
+    const r = await apiPost('/api/trace/start', { hz, seconds: sec });
+    log(`高频采样开始：${r.trace.actual_hz || hz} Hz，${sec}s，文件 ${r.trace.path}`, 'g');
+  } catch (e) {
+    log('高频采样启动失败：' + e.message, 'b');
+  }
+});
+$('trace-stop').addEventListener('click', async () => {
+  try {
+    const r = await apiPost('/api/trace/stop', {});
+    log(`高频采样停止：${r.trace.samples || 0} 样本，实际 ${r.trace.actual_hz || 0} Hz`, 'g');
+  } catch (e) {
+    log('高频采样停止失败：' + e.message, 'b');
+  }
+});
 $('btn-calib').addEventListener('click', openCalib);
 $('calib-close').addEventListener('click', closeCalib);
 
@@ -1446,6 +1512,7 @@ function calibStageText(c) {
 
 const CALIB_ORDER = ['J6', 'J5', 'J4', 'J3', 'J2', 'J1'];
 let CALIB_STATE = null;
+let CALIB_PICK = '';
 let CALIB_SIG = '';
 
 function calibSignature(c) {
@@ -1482,9 +1549,20 @@ function updateCalibLive(c) {
   set('calib-stage', calibStageText(c));
 }
 
+$('calib-body').addEventListener('change', (e) => {
+  if (e.target && e.target.id === 'calib-pick') {
+    CALIB_PICK = e.target.value;
+    const btn = document.getElementById('calib-start-pick');
+    const done = !!(CALIB_STATE && CALIB_STATE.done && CALIB_STATE.done[CALIB_PICK]);
+    if (btn) btn.textContent = `${done ? '重做' : '开始'}选中的关节（零扭矩使能）`;
+  }
+});
 $('calib-body').addEventListener('click', (e) => {
-  const st = e.target.closest && e.target.closest('.calib-start');
-  if (st) { startCalib(st.dataset.joint); return; }
+  if (e.target.closest && e.target.closest('#calib-start-pick')) {
+    const sel = document.getElementById('calib-pick');
+    if (sel) startCalib(sel.value);
+    return;
+  }
   const ac = e.target.closest && e.target.closest('.calib-act');
   if (ac) { calibAct(ac.dataset.act, ac.dataset.sign); return; }
   if (e.target.closest && (e.target.closest('#calib-next') || e.target.closest('#calib-next2'))) {
@@ -1514,8 +1592,7 @@ function renderCalib(c) {
       <div class="calib-joint-name">${n}</div>
       <div><div class="calib-status ${cls}">${st}</div>
         <div class="calib-status">sign=${c.signs ? c.signs[n] : '?'} ${c.sign_checked && c.sign_checked[n] ? '· 已核对' : ''}</div></div>
-      <div>${active ? '<span class="calib-status pending">进行中</span>' :
-        `<button class="btn calib-start" data-joint="${n}" ${READONLY ? 'disabled' : ''}>${c.done && c.done[n] ? '重做' : '开始'}</button>`}</div>
+      <div>${active ? '<span class="calib-status pending">进行中</span>' : ''}</div>
     </div>`;
   }).join('');
 
@@ -1540,6 +1617,16 @@ function renderCalib(c) {
     `;
   }
 
+  const pick = CALIB_PICK || CALIB_ORDER.find((n) => !(c.done && c.done[n])) || 'J6';
+  const pickDone = !!(c.done && c.done[pick]);
+  const pickOpts = CALIB_ORDER.map((n) =>
+    `<option value="${n}"${n === pick ? ' selected' : ''}>${n}${c.done && c.done[n] ? '（已完成，可重做）' : ''}</option>`
+  ).join('');
+  const pickHtml = `<div class="calib-actions" style="margin-top:10px">
+    <span class="muted" style="align-self:center">单独校准：</span>
+    <select id="calib-pick" style="padding:5px 8px;border-radius:7px;background:#0b1219;color:#cfe0f0;border:1px solid #27384a">${pickOpts}</select>
+    <button id="calib-start-pick" class="btn primary" ${READONLY ? 'disabled' : ''}>${pickDone ? '重做' : '开始'}选中的关节（零扭矩使能）</button>
+  </div>`;
   let actions = '';
   if (c.active) {
     if (c.stage === 'ready') {
@@ -1552,7 +1639,7 @@ function renderCalib(c) {
         <button class="btn primary calib-act" data-act="sign" data-sign="-1">方向相反 → sign=−1</button>
         <button class="btn calib-act" data-act="return">退回零位（重新看）</button>`;
     } else if (c.stage === 'done') {
-      actions = `<button class="btn primary" id="calib-next">继续下一颗</button>`;
+      actions = `<button class="btn primary" id="calib-next">按顺序继续下一颗（可选）</button>`;
     } else if (c.stage === 'error') {
       actions = `<button class="btn calib-act" data-act="abort">结束并失能</button>`;
     }
@@ -1561,7 +1648,8 @@ function renderCalib(c) {
 
   $('calib-body').innerHTML = `
     <div class="calib-note" style="margin-top:0">
-      顺序固定 J6 → J5 → J4 → J3 → J2 → J1。每颗关节校准时其余关节全部失能，
+      默认顺序 J6 → J5 → J4 → J3 → J2 → J1，但<b>任意一颗都可以直接单独开始，不必按顺序</b>。
+      每颗关节校准时其余关节全部失能，
       <b>臂必须已经支撑好</b>，人站在直流空开旁。设零流程：清 Homing → 设零 → 回读
       → 写限位/限流/限速 → 存 EEPROM → 全部回读比对。
     </div>
@@ -1573,8 +1661,13 @@ function renderCalib(c) {
     </div>
     ${c.active ? activeBlock : ''}
     ${c.active ? `<div class="calib-actions">${actions}</div>` : ''}
-    ${!c.active && c.joint && c.stage === 'done' ? `<div class="calib-actions"><button class="btn primary" id="calib-next2">继续下一颗</button></div>` : ''}
-    <div style="margin-top:14px">${rows}</div>
+    ${!c.active && c.joint && c.stage === 'done' ? `<div class="calib-actions"><button class="btn primary" id="calib-next2">按顺序继续下一颗（可选）</button></div>` : ''}
+    ${pickHtml}
+    <div class="calib-note" style="margin-top:12px">
+      在顶部选择任意一颗后点按钮，就是校准会话的“零扭矩使能”：其余五颗先失能，
+      这颗切电流模式 0 A，之后才会出现“设为零位 / 点动 +5°”。已完成的关节会显示“重做”。臂必须先支撑好。
+    </div>
+    <div style="margin-top:10px">${rows}</div>
     ${READONLY ? '<div class="calib-note warn">当前是只读（没有控制权）。<button class="btn" id="calib-reacquire">重新拿控制权</button></div>' : ''}
     ${c.all_done ? '<div class="calib-note ok">六颗全部完成。关掉此面板，回到“连接”→ 连接真机 → 使能，开始 16.4 验收。</div>' : ''}
     ${c.msg ? `<div class="calib-note">${c.msg}</div>` : ''}

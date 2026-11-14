@@ -57,6 +57,7 @@ from .mock import MockJointBus, VirtualJointBus
 from .motion import Motion, MotionError
 from .sca import MODE_CURRENT, MODE_PROFILE_POSITION, describe_error
 from .recorder import Recorder
+from .trace import TraceSampler
 
 MIME = {".js": "text/javascript", ".mjs": "text/javascript",
         ".css": "text/css", ".html": "text/html; charset=utf-8",
@@ -80,6 +81,8 @@ class Executor:
         self.models_dir = self._path(self.cfg.get("models_dir", "models"))
         self.serve_web = bool(self.cfg.get("serve_web", True))
         self.push_hz = max(10.0, float(self.cfg.get("state_push_hz", 20)))
+        self.trace_hz = max(5.0, min(200.0, float(self.cfg.get("trace_hz", 100))))
+        self.trace_seconds = max(1.0, min(60.0, float(self.cfg.get("trace_seconds", 10))))
         self.hb_timeout = float(self.cfg.get("heartbeat_timeout_s", 0.5))
         self.control_stale = float(self.cfg.get("control_stale_s", 3.0))
         self.exec_mode = self.cfg.get("default_exec_mode", "preview")
@@ -104,6 +107,7 @@ class Executor:
         self.preview_motion = Motion(self.preview_bus, self.robot, self.fence,
                                      self.limits, recorder=None)
         self.recorder: Recorder | None = None
+        self.trace: TraceSampler | None = None
         self.mode = None
         self.ip = ""
         self.msg = "未连接"
@@ -232,6 +236,8 @@ class Executor:
             "exec_mode": self.exec_mode,
             "default_exec_mode": self.cfg.get("default_exec_mode", "preview"),
             "state_push_hz": self.push_hz,
+            "trace_hz": self.trace_hz,
+            "trace_seconds": self.trace_seconds,
             "heartbeat_hz": float(self.cfg.get("heartbeat_hz", 5)),
             "heartbeat_timeout_s": self.hb_timeout,
             "control_stale_s": self.control_stale,
@@ -264,7 +270,8 @@ class Executor:
         now = time.monotonic()
         if self.owner and self.owner != client_id:
             age = now - self.last_hb
-            if age < self.control_stale:
+            # 0 = 不自动释放：只要 owner 还在，别的 client 不能抢
+            if self.control_stale <= 0 or age < self.control_stale:
                 raise AuthError(f"控制权在 {self.owner} 手里（{age:.1f}s 前还有心跳）")
         if self.owner == client_id and self.token:
             # 20.9.5：同一个 client_id 重复 acquire 必须带原 token；
@@ -354,9 +361,13 @@ class Executor:
                 now = time.monotonic()
                 hb = self.last_hb if self.owner else 0.0
                 if self.calib.active:
-                    # 校准会话：没有控制方、或心跳断了 >0.5 s，就结束并失能。
+                    # 校准会话：没有控制方、或（自动释放模式）心跳断了 >0.5 s，
+                    # 就结束并失能。control_stale=0 时不因心跳断结束会话，
+                    # 否则浏览器后台/长确认框会把正在校准的会话踢掉。
                     # 正在执行长命令（设零/点动等）时不打断，操作自己会检查。
-                    if (not self.calib.busy) and ((not self.owner) or now - hb > self.hb_timeout):
+                    if (not self.calib.busy) and (
+                            (not self.owner) or
+                            (self.control_stale > 0 and now - hb > self.hb_timeout)):
                         age = (now - hb) if self.owner else 999.0
                         reason = (f"控制方心跳断了 {age:.2f}s"
                                   f"（>{self.hb_timeout}s），校准会话已结束并失能")
@@ -373,7 +384,8 @@ class Executor:
                                   f"（>{self.hb_timeout}s），已按中止处理：原地保持")
                         self.msg = reason
                         self.stop_all(reason, quiet=True)
-                    elif not busy and now - hb > self.control_stale:
+                    elif (not busy and self.control_stale > 0
+                          and now - hb > self.control_stale):
                         self.owner = None
                         self.token = None
                         self.msg = "控制方心跳超时，控制权已释放"
@@ -424,8 +436,30 @@ class Executor:
         return {"ok": self.connected, "mode": self.mode, "report": rep,
                 "msg": self.msg, "config_version": self.config_version}
 
+    def start_trace(self, hz: float = 100.0, seconds: float = 10.0) -> dict:
+        if self.trace and self.trace.status().get("active"):
+            raise MotionError("高频采样已经在跑")
+        if not isinstance(self.bus, JointBus) or not self.connected:
+            raise MotionError("高频采样需要真机连接（模拟模式没有真实 ECB 总线）")
+        self.trace = TraceSampler(self, hz=hz, seconds=seconds)
+        self.trace.start()
+        self.msg = f"高频采样开始：{hz:g} Hz / {seconds:g} s"
+        return self.trace.status()
+
+    def stop_trace(self) -> dict:
+        if not self.trace:
+            return {"ok": True, "active": False}
+        r = self.trace.stop()
+        self.msg = "高频采样已停止"
+        return {**r, **self.trace.status()}
+
     def disconnect(self):
         self._park_stop.set()
+        if self.trace:
+            try:
+                self.trace.stop()
+            except Exception:  # noqa: BLE001
+                pass
         if self.motion:
             self.motion.stop("断开连接")
         if self._park_thread and self._park_thread.is_alive():
@@ -602,6 +636,10 @@ class Executor:
             "preview": preview, "has_plan": pending,
             "recorder": str(self.recorder.path) if self.recorder else None,
             "stats": (self.bus.stats() if self.bus else None),
+            "trace": (self.trace.status() if self.trace else
+                      {"active": False, "hz": 0, "seconds": 0, "samples": 0,
+                       "actual_hz": 0, "started": None, "finished": None,
+                       "path": None, "error": ""}),
             "exec_mode": self.exec_mode,
             "config_version": self.config_version,
             "calib": self.calib.snapshot(),
@@ -2047,6 +2085,9 @@ class Handler(BaseHTTPRequestHandler):
                 if not isinstance(EXEC.bus, MockJointBus):
                     raise MotionError("仅 mock 模式可用")
                 return self._json(200, {"ok": True, **EXEC.bus.mock_faults()})
+            if p == "/api/trace/status":
+                return self._json(200, {"ok": True,
+                                        "trace": (EXEC.trace.status() if EXEC.trace else None)})
             return self._static(p)
         except Exception as exc:  # noqa: BLE001
             return self._json(500, {"ok": False, "error": str(exc)})
@@ -2076,6 +2117,18 @@ class Handler(BaseHTTPRequestHandler):
             if p == "/api/stop":
                 # 停是安全动作：不要求控制权，任何客户端都能停
                 return self._json(200, EXEC.stop_all("用户按停"))
+            if p == "/api/trace/start":
+                EXEC.require_control(body)
+                try:
+                    hz = float(body.get("hz") or EXEC.trace_hz)
+                    sec = float(body.get("seconds") or EXEC.trace_seconds)
+                except (TypeError, ValueError) as exc:
+                    raise MotionError(f"hz/seconds 不是数字：{exc}")
+                return self._json(200, {"ok": True,
+                                        "trace": EXEC.start_trace(hz, sec)})
+            if p == "/api/trace/stop":
+                EXEC.require_control(body)
+                return self._json(200, {"ok": True, "trace": EXEC.stop_trace()})
             if p == "/api/mock/fault":
                 # 20.0：仅 mock 的故障注入开关
                 if not isinstance(EXEC.bus, MockJointBus):

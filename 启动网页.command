@@ -6,10 +6,10 @@
 set -u
 cd "$(dirname "$0")/arm-control" || exit 1
 
-MOCK=()
+MOCK_FLAG=""
 MODE="真机"
 if [ "${1:-}" = "--mock" ]; then
-  MOCK=(--mock)
+  MOCK_FLAG="--mock"
   MODE="模拟（--mock）"
   shift
 fi
@@ -34,7 +34,11 @@ echo
 echo "停止：Ctrl+C"
 echo
 
-python3 -m arm.executor "${MOCK[@]}" --port "$PORT"
+if [ -n "$MOCK_FLAG" ]; then
+  python3 -m arm.executor "$MOCK_FLAG" --port "$PORT"
+else
+  python3 -m arm.executor --port "$PORT"
+fi
 RC=$?
 echo
 echo "执行器已退出（code=$RC）。"

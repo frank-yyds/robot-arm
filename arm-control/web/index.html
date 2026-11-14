@@ -176,6 +176,15 @@
       </section>
 
       <section class="card">
+        <h3>高频采样（诊断）</h3>
+        <div class="row" style="gap:8px;flex-wrap:wrap">
+          <button id="trace-start" class="btn">开始 10 s · 六颗 100 Hz</button>
+          <button id="trace-stop" class="btn">停止</button>
+        </div>
+        <div class="hint" id="trace-status">未运行。采样会额外占用 ECB/CAN，只在诊断时开。</div>
+      </section>
+
+      <section class="card">
         <h3>点动（输出端角度）</h3>
         <label class="check" style="margin-bottom:6px">
           <input type="checkbox" id="jog-live">

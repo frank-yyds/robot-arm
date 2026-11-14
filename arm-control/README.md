@@ -74,18 +74,34 @@ python3 -m arm.executor --mock --port 8770   # 无硬件模拟
 
 - `POST /api/acquire` 拿控制权（token）；同一时刻只认一个控制方，其他客户端只读。
 - 状态推送 `GET /api/events?client_id=...`（SSE，20 Hz）；`/api/state` 可轮询。
-- 网页每 200 ms 心跳；SSE 断开/心跳断 0.5 s，运动中按中止（原地保持），校准中自动结束并失能。
+- 网页每 200 ms 心跳；心跳断 0.5 s 时运动中止（原地保持）；控制权**不自动释放**（`control_stale_s=0`），正常关闭/刷新页面才主动 release。校准会话在 owner 还在时不会因心跳抖动结束。
 - 执行模式 `preview` / `direct`：验收 1–6 期间默认 preview；验收通过后默认改 direct。direct 下点完立即执行，自动检查一项不少；运动中再点桌面被忽略；空格 = 停。
 - 中止 = 把每颗目标改成当前位置，保持使能；全部失能只在“已回零且扶住”或通信完全断时。
+- **启动容忍**：每段开始时，若某颗起始误差 >5°，允许 **1 s 内最多 3° 的反向空程**（J3 回差）；超过 3° 立即中止，1 s 后恢复原来的 >5°/0.3 s 判据。
+- **抬高分支拦截**：抬高 IK 位置容差 0.5 mm；先试锁定/自由偏航和 J1/J3/J5 镜像种子，选连续且单关节跳 ≤30° 的解；仍无解则拒绝生成回零/停机计划。
+- **离线直接兜底**：`plan_home/plan_park(..., allow_direct_fallback=True)` 才允许不走抬高的关节空间兜底；真机默认关闭，不能靠它绕过搁架/碰撞风险。
+- **5° 目标拆段**：所有大动作自动拆成每段 ≤5° 的目标，避免驱动 0x0200“位置模式阶跃过大”。
 
 ## 接口
 
 `GET /api/config`、`GET /api/state`、`GET /api/events`、`GET /api/kt/points`、
 `POST /api/acquire|heartbeat|release|connect|enable|click|plan_click|execute|stop|jog|home|move_joints|move_tcp|move_through|tcp|yaw|exec_mode|calib/*`，
 18 节新增：`POST /api/end_effector`、`/api/park`、`/api/park/unpark`、`/api/park/support`、`/api/recover`、
-`/api/kt/goto`、`/api/kt/sample`、`/api/kt/fit`、`/api/kt/reset`。
+`/api/kt/goto`、`/api/kt/sample`、`/api/kt/fit`、`/api/kt/reset`、
+`POST /api/trace/start`、`POST /api/trace/stop`、`GET /api/trace/status`。
 
 运动接口（`move_joints`、`move_tcp`、`move_through`、click/jog/home）都由执行器重新检查软件限位、围栏、速度上限，不信任客户端。
+
+## 高频采样（诊断，默认不常开）
+
+网页左侧“高频采样（诊断）”按钮：默认 **六颗 × 100 Hz × 10 s**，写 `runs/trace_YYYYmmdd_HHMMSS.csv`。
+每行一个关节：位置、目标、电流、速度（每 2 个样本）、错误（每 5 个样本）。
+
+- 按需开 5–10 s；**不要常开**。ECB/CAN 是共享总线，100 Hz×六颗会占满带宽，
+  运动/停止命令可能排队，反而影响安全和跟踪。
+- 100 Hz 是目标值，实际取决于总线；网页会显示 `实际 Hz`，可能只有 40–60 Hz。
+- 常开日志会很大：约 600 行/s，几百 MB/小时；网页本身只按 20 Hz 显示，用不到这么高。
+- 采样时会和运动循环抢 `EcbTransport` 锁；诊断时人要在空开旁，随时准备按停。
 
 ## 自检 / 模型
 

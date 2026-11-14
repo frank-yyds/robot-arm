@@ -29,7 +29,7 @@
       "motion_accel_time_s": 0.5,
       "required_current_limit_a": 3.0,
       "current_check_max_a": 3.5,
-      "zero_date": "2026-11-08",
+      "zero_date": "2026-11-14",
       "note": "J1 比机械限位 ±153° 收窄；限流 3 A = 33 A 的 9%",
       "sign_checked": true,
       "safe_limits_deg": [
@@ -56,7 +56,7 @@
       "motion_accel_time_s": 0.5,
       "required_current_limit_a": 4.0,
       "current_check_max_a": 4.5,
-      "zero_date": "2026-11-08",
+      "zero_date": "2026-11-14",
       "note": "J2 ±95°（P03）；限流 4 A；P08 起启动阈值按 #0/#16 支架材料：PLA 4.5 A / PETG100 6.5 A（字段 j2_bracket）",
       "sign_checked": true,
       "safe_limits_deg": [
@@ -86,7 +86,7 @@
       "current_check_max_a": null,
       "factory_current_limit_a": 8.0,
       "factory_current_limit_note": "8 A 是出厂值（16.5 A 满量程的 48%），不动",
-      "zero_date": "2026-11-08",
+      "zero_date": "2026-11-14",
       "note": "J3 限流保持出厂 8 A",
       "sign_checked": true,
       "safe_limits_deg": [

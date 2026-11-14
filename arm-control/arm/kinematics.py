@@ -233,7 +233,8 @@ class RobotModel:
            yaw_deg: float | None = 0.0, seed_deg: Iterable[float] | None = None,
            preset: str = "probe", limits: tuple[np.ndarray, np.ndarray] | None = None,
            max_iters: int = 120, structured_seeds: bool = True,
-           restarts: int = 2, time_budget_s: float | None = None) -> "IKResult":
+           restarts: int = 2, time_budget_s: float | None = None,
+           pos_tol_mm: float = 0.2, axis_tol_deg: float = 0.5) -> "IKResult":
         """数值 IK：目标 = TCP 位置 + 工具轴方向 + 可选偏航。
 
         约束 6 维（位置 3 + 姿态 3）；yaw_deg=None 时只约束工具轴方向，
@@ -301,7 +302,7 @@ class RobotModel:
             score += 0.01 * float(np.linalg.norm(q - seed))
             if q[2] < 0:
                 score += 0.5 + 0.02 * abs(q[2])
-            ok = pe <= 0.2 and re <= 0.5
+            ok = pe <= float(pos_tol_mm) and re <= float(axis_tol_deg)
             cand = IKResult(q.copy(), pe, re, score, s.copy(), ok)
             if best is None or (ok and not best.ok) or \
                     (ok == best.ok and score < best.score):

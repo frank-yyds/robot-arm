@@ -197,16 +197,48 @@ class CalibSession:
         if not m.enable():
             t.close()
             raise RuntimeError(f"{joint} 使能无应答")
-        time.sleep(0.05)
+        time.sleep(0.3)                 # 使能后给驱动一点时间再读
         m.set_mode(MODE_CURRENT)
         m.set_current_a(0.0)
-        time.sleep(0.15)
-        m.clear_error()
-        pos = m.pos_turns()
+        time.sleep(0.2)
+
+        def read_pos(tries: int = 10):
+            for _ in range(tries):
+                try:
+                    p = m.pos_turns(timeout=0.25, retries=2)
+                except Exception:  # noqa: BLE001
+                    p = None
+                if p is not None:
+                    return p
+                time.sleep(0.15)
+            return None
+
+        def diag_text() -> str:
+            pw = m.power()
+            md = m.mode()
+            er = m.error()
+            vv = m.voltage_v()
+            bt = m.battery_v()
+            err = "读不到" if er is None else f"0x{er:04X}"
+            volt = "读不到" if vv is None else f"{vv:.1f}V"
+            batt = "读不到" if bt is None else f"{bt:.2f}V"
+            return f"power={pw}, mode={md}, error={err}, 母线={volt}, 电池={batt}"
+
+        pos = read_pos()
         if pos is None:
+            # 个别驱动清报警后会短暂不回答位置；先看错误位，再清一次并重试
+            er0 = m.error()
+            if er0:
+                m.clear_error()
+                time.sleep(0.3)
+                pos = read_pos(8)
+        if pos is None:
+            info = diag_text()
             m.disable()
             t.close()
-            raise RuntimeError(f"{joint} 零扭矩使能后读不到位置")
+            raise RuntimeError(
+                f"{joint} 零扭矩使能后读不到位置（{info}）；"
+                "先检查这颗的 CAN/编码器线是否插好，必要时断电重插后再试")
         mode = m.mode()
         cur = m.current_a()
         if mode is not None and mode != MODE_CURRENT:
@@ -224,7 +256,9 @@ class CalibSession:
             t.close()
             raise RuntimeError(f"{joint} 零扭矩时电流 {cur:.2f} A > 0.3 A，拒绝继续")
         time.sleep(0.1)
-        pos = m.pos_turns()
+        pos2 = read_pos(6)
+        if pos2 is not None:
+            pos = pos2
         batt = m.battery_v()
         if batt is not None and batt < 2.5:
             m.disable()
@@ -484,7 +518,7 @@ class CalibSession:
 
     def _require(self, joint, stages):
         if not self.active or not self.joint:
-            raise RuntimeError("没有活动的校准会话；先点“零扭矩使能”")
+            raise RuntimeError("没有活动的校准会话；先点该关节右侧的“开始（零扭矩使能）”")
         if joint and joint.upper() != self.joint:
             raise RuntimeError(f"当前校准的是 {self.joint}")
         if self.stage not in stages:

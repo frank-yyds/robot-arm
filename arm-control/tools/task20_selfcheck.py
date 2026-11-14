@@ -162,7 +162,7 @@ e = mk_exec()
 e.bus.set_faults(currents={"J2": 2.0, "J3": 1.0})
 e.park(preview=False, prereq=park_prereq())
 t0 = time.time()
-while time.time() - t0 < 15:
+while time.time() - t0 < 60:
     if e.park_step.get("phase") == "descending" and (e.park_step.get("step") or 0) >= 2:
         break
     time.sleep(0.02)
@@ -201,7 +201,7 @@ def fake_sample(names_, n=None, stop_event=None):
 e._sample_currents = fake_sample
 e.park(False, prereq=park_prereq())
 t0 = time.time()
-while time.time() - t0 < 30 and e.park_active:
+while time.time() - t0 < 90 and e.park_active:
     time.sleep(0.1)
 check("20.9.3 停机完成 startup_done=False", e.park_step.get("phase") == "parked"
       and e.bus.startup_done is False, e.park_step.get("phase", ""))

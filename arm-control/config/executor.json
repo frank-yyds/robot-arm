@@ -10,9 +10,12 @@
   "models_dir": "models",
   "serve_web": true,
   "state_push_hz": 20,
+  "trace_hz": 100,
+  "trace_seconds": 10,
   "heartbeat_hz": 5,
   "heartbeat_timeout_s": 0.5,
-  "control_stale_s": 3.0,
+  "control_stale_s": 0.0,
+  "control_stale_note": "0 = 不自动释放控制权；只有 /api/release（页面关闭）或重启执行器释放",
   "default_exec_mode": "preview",
   "mock_on_start": false
 }

@@ -30,12 +30,26 @@ class MotionError(RuntimeError):
     pass
 
 
+# 启动容忍：每段开始，若某颗起始误差 >5°，允许 1 s 内最多 3° 的反向空程；
+# 一旦朝目标动，仍用原来的 >5° 且 0.3 s 不降 1° 判据。超过 3° 立即中止。
+START_GRACE_S = 1.0
+START_REVERSE_DEG = 3.0
+
+# 驱动 0x0200“位置模式阶跃过大”保护：一次下发的目标不能离当前太远。
+# 5° 与已实测可用的 J3/J2 ±5° 点动一致；大动作自动拆成多段。
+MAX_TARGET_STEP_DEG = 5.0
+
+
 class TorqueError(MotionError):
     """18.2 重力力矩预检不通过（可以尝试“远端先收”重试）。"""
 
 
 class StartFenceError(MotionError):
     """16.4 第 11 条：起点在围栏外；只允许零扭矩拖动或先抬高再回零。"""
+
+
+class LiftBranchError(MotionError):
+    """抬高 IK 解到了另一个分支；拒绝执行，避免整臂甩过去。"""
 
 
 class Motion:
@@ -178,6 +192,23 @@ class Motion:
                 raise StartFenceError(
                     "起点在围栏外（" + problem + "）：只允许零扭矩拖动，"
                     "或先“竖直抬高”再回零；普通目标一律拒绝")
+        # 先按 5° 拆段：驱动对一次下发的目标阶跃有硬保护（0x0200），
+        # 不能把 0° 直接甩给 80° 外的关节。
+        q0a = np.asarray(q0, float)
+        q1a = np.asarray(q1, float)
+        maxd = float(np.max(np.abs(q1a - q0a)))
+        if maxd > MAX_TARGET_STEP_DEG + 1e-9:
+            n = int(math.ceil(maxd / MAX_TARGET_STEP_DEG))
+            out: list[dict] = []
+            prev = q0a.copy()
+            for k in range(1, n + 1):
+                qmid = q0a + (q1a - q0a) * (k / n)
+                out.extend(self._plan_move(
+                    prev, qmid, f"{label} {k}/{n}", descend,
+                    allow_outside_start=(allow_outside_start or k > 1),
+                    relax_below_z=relax_below_z))
+                prev = qmid
+            return out
         try:
             return [self._plan_joint(q0, q1, label, descend, relax_below_z)]
         except TorqueError as exc:
@@ -222,7 +253,8 @@ class Motion:
                       descend: bool = False, label: str = "move_tcp",
                       free_yaw: bool = False, fast: bool = False,
                       allow_outside_start: bool = False,
-                      relax_below_z: float | None = None) -> list[dict]:
+                      relax_below_z: float | None = None,
+                      pos_tol_mm: float = 0.2) -> list[dict]:
         old_preset, old_yaw = self.preset, self.yaw_deg
         if preset:
             self.preset = preset
@@ -233,7 +265,8 @@ class Motion:
             use_yaw = None if free_yaw else self.yaw_deg
             kw = {"max_iters": 60, "time_budget_s": 0.6} if fast else {}
             res = self.robot.ik(target_mm, tool_axis, use_yaw, q0,
-                                self.preset, (self.limits[0], self.limits[1]), **kw)
+                                self.preset, (self.limits[0], self.limits[1]),
+                                pos_tol_mm=pos_tol_mm, **kw)
             if not res.ok:
                 tx, ty, tz = (round(float(v), 1) for v in target_mm)
                 raise MotionError(
@@ -276,7 +309,7 @@ class Motion:
         finally:
             self.yaw_deg = old_yaw
 
-    def plan_home(self, q_from=None) -> list[dict]:
+    def plan_home(self, q_from=None, allow_direct_fallback: bool = False) -> list[dict]:
         """16.5 第 4 条：抬高 → 一步同步插补回 q=0。
 
         2026-11-09（P05/18.2）去掉“先收 J5 到 0”和“收臂到 (0,30,30)”两段：
@@ -284,7 +317,17 @@ class Motion:
         大关节的过载由 18.2 预检 + 远端先收重试处理。
         """
         q0 = self.read_q() if q_from is None else list(q_from)
-        segs: list[dict] = self._plan_lift(q0)
+        try:
+            segs: list[dict] = self._plan_lift(q0)
+        except LiftBranchError:
+            if not allow_direct_fallback:
+                raise
+            # 离线可达性/人工换姿态用：不走竖直抬高，直接关节空间回零。
+            # 真机默认不打开；它会少掉“先离开搁架”的保护。
+            segs = self._plan_move(
+                q0, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                "回零位（无抬高兜底）")
+            return segs
         cur = segs[-1]["q_target"] if segs else list(q0)
         segs.extend(self._plan_move(cur, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0], "回零位"))
         return segs
@@ -316,20 +359,68 @@ class Motion:
         }
 
     def _plan_lift(self, q0) -> list[dict]:
-        """抬高到 TCP z ≥ 150（回零和停机共用）。起点围栏不过时仍允许抬高。"""
-        try:
-            tcp = self.robot.tcp(q0, self.preset, self.yaw_deg)[:3, 3]
-            if tcp[2] < 150.0 - 0.5:
-                return self.plan_tcp_move([tcp[0], tcp[1], 150.0], (0, 0, -1),
-                                          self.yaw_deg, q0, label="抬高",
-                                          allow_outside_start=True,
-                                          relax_below_z=100.0)
-        except MotionError:
-            pass
-        return []
+        """抬高到 TCP z ≥ 150（回零和停机共用）；先做分支枚举 + 自由偏航。
+
+        2026-11-14：必须和当前 q 连续；单关节跳 >30° 的解不能用。
+        先试锁定偏航，再试自由偏航；每种都试当前 q 和几个镜像种子。
+        """
+        tcp = self.robot.tcp(q0, self.preset, self.yaw_deg)[:3, 3]
+        if tcp[2] >= 150.0 - 0.5:
+            return []
+        target = [float(tcp[0]), float(tcp[1]), 150.0]
+        q0a = np.asarray(q0, float)
+        lo = np.asarray(self.limits[0], float)
+        hi = np.asarray(self.limits[1], float)
+        # 分支种子：当前 q，以及 J1/J3/J5 翻 180° 的镜像
+        seeds = [q0a.copy()]
+        for i, delta in ((0, 180.0), (0, -180.0), (2, 180.0),
+                         (2, -180.0), (4, 180.0), (4, -180.0)):
+            s = q0a.copy()
+            s[i] += delta
+            seeds.append(np.clip(s, lo, hi))
+        last_reason = ""
+        best = None
+        for free in (False, True):
+            for seed in seeds:
+                try:
+                    res = self.robot.ik(
+                        target, (0, 0, -1),
+                        None if free else self.yaw_deg,
+                        seed, self.preset,
+                        (self.limits[0], self.limits[1]),
+                        pos_tol_mm=0.5, axis_tol_deg=0.5,
+                        structured_seeds=False, max_iters=80)
+                except Exception as exc:  # noqa: BLE001
+                    last_reason = str(exc)
+                    continue
+                if not res.ok:
+                    last_reason = (f"残余 {res.pos_err_mm:.2f} mm / "
+                                   f"轴 {res.axis_err_deg:.2f}°")
+                    continue
+                d = np.abs(np.asarray(res.q_deg, float) - q0a)
+                i = int(np.argmax(d))
+                if d[i] > 30.0:
+                    last_reason = (f"{self.order[i]} 跳 {d[i]:.1f}° >30°"
+                                   f"（{'自由' if free else '锁定'}偏航）")
+                    continue
+                score = (float(d[i]), 0 if free else 1)
+                if best is None or score < best[0]:
+                    best = (score, res, free)
+            if best is not None:
+                break
+        if best is None:
+            raise LiftBranchError(
+                f"抬高无连续解：{last_reason or '无可用分支'}；"
+                "请先支撑/手动抬高或分段点动")
+        _, res, free = best
+        lift = self._plan_move(
+            q0, res.q_deg, "抬高" + ("（自由偏航）" if free else ""),
+            allow_outside_start=True, relax_below_z=100.0)
+        return lift
 
     def plan_park(self, q_from=None, park: dict | None = None,
-                  include_down: bool = True) -> dict:
+                  include_down: bool = True,
+                  allow_direct_fallback: bool = False) -> dict:
         """18.3 停机：抬高 → 收拢+折腕+转 J1 → 预停机点 → P。
 
         返回四段列表；执行器在 pre / park 到达后各停 1 s 读 I₀、I₁。
@@ -338,7 +429,18 @@ class Motion:
         pk = park or self.default_park()
         self.park_side = int(pk.get("park_side", getattr(self, "park_side", -1)))
         poses = pk.get("poses") or {}
-        lift = self._plan_lift(q0)
+        try:
+            lift = self._plan_lift(q0)
+        except LiftBranchError:
+            if not allow_direct_fallback:
+                raise
+            # 离线/人工 staging：不抬高，直接关节空间到收拢位
+            tuck = self._plan_move(q0, poses["tuck"], "收拢（无抬高兜底）")
+            pre = self._plan_move(poses["tuck"], poses["pre"], "J2/J3 到预停机点")
+            down = (self._plan_move(poses["pre"], poses["park"], "下降到 P")
+                    if include_down else [])
+            return {"lift": [], "tuck": tuck, "pre": pre, "park": down,
+                    "poses": poses, "direct_fallback": True}
         cur = lift[-1]["q_target"] if lift else list(q0)
         tuck = self._plan_move(cur, poses["tuck"], "收拢+折腕+转 J1")
         pre = self._plan_move(poses["tuck"], poses["pre"], "J2/J3 到预停机点")
@@ -427,6 +529,7 @@ class Motion:
         consec = 0
         err_ref = {n: None for n in self.order}
         err_ref_t = {n: t0 for n in self.order}
+        err0 = {n: None for n in self.order}
         while True:
             if self._stop.is_set():
                 self._abort(self._stop_reason)
@@ -447,6 +550,8 @@ class Motion:
                 last_ok[n] = now
                 q.append(st.out_deg)
                 errs[n] = abs(st.out_deg - q_target[i])
+                if err0[n] is None:
+                    err0[n] = errs[n]
                 lo_s, hi_s = self.bus.cfg[n].safe_limits_deg
                 if st.out_deg < lo_s - 1.0 or st.out_deg > hi_s + 1.0:
                     self._abort(
@@ -482,6 +587,16 @@ class Motion:
                 for n in self.order:
                     e = errs.get(n)
                     if e is None:
+                        continue
+                    if err0[n] is None:
+                        err0[n] = e
+                    # 起步容忍：只对“起始误差 >5°”的关节生效，最多 1 s / 3° 反向。
+                    # 目的是容忍 J3 的机械反向空程，不是放宽全部跟踪保护。
+                    if now - t0 <= START_GRACE_S and err0[n] > 5.0:
+                        if e > err0[n] + START_REVERSE_DEG:
+                            self._abort(
+                                f"{n} 启动反向 {e - err0[n]:.1f}° >"
+                                f"{START_REVERSE_DEG:g}°（起始误差 {err0[n]:.1f}°）")
                         continue
                     if e > 5.0:
                         ref = err_ref.get(n)
