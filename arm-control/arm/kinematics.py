@@ -228,6 +228,42 @@ class RobotModel:
         Tt[:3, 3] = f[:3, 3] + f[:3, :3] @ np.array([0.0, 0.0, L])
         return Tt
 
+    def _jacobian(self, q_deg, preset: str, yaw_deg, R_target, axis):
+        """TCP 位置/姿态误差的解析雅可比（每度），供 `_dls` 用。
+
+        e_pos = target - p_tcp；e_rot = rotvec(Re^T R_target)（完整姿态）
+        或 cross(z_tcp, axis)（只约束工具轴、偏航自由）。
+        返回 (p_tcp, Re, J)，J 已含 50 mm/rad 的姿态权重并按度缩放。
+        """
+        qs = list(q_deg)
+        if len(qs) != 6:
+            raise ValueError("需要 6 个关节角")
+        Tcur = np.eye(4)
+        cols: list[tuple[np.ndarray, np.ndarray]] = []
+        qi = 0
+        for j in self.chain:
+            Tcur = Tcur @ j.origin
+            if j.type in ("revolute", "continuous"):
+                cols.append((Tcur[:3, :3] @ j.axis, Tcur[:3, 3].copy()))
+                Tcur = Tcur @ T(axis_rot(j.axis, math.radians(qs[qi])))
+                qi += 1
+        cfg = self.tcp_presets[preset]
+        L = float(cfg["L_mm"])
+        yaw = yaw_deg if yaw_deg is not None else cfg.get("yaw_deg")
+        Re = Tcur[:3, :3] @ rot_z(math.radians(yaw)) if yaw is not None \
+            else Tcur[:3, :3].copy()
+        pe = Tcur[:3, 3] + Tcur[:3, :3] @ np.array([0.0, 0.0, L])
+        z = Re[:, 2]
+        J = np.zeros((6, 6))
+        for i, (a, p_i) in enumerate(cols):
+            J[:3, i] = -np.cross(a, pe - p_i)
+            if R_target is not None:
+                J[3:, i] = -50.0 * (Re.T @ a)
+            else:
+                J[3:, i] = 50.0 * np.cross(np.cross(a, z), axis)
+        J *= math.pi / 180.0
+        return pe, Re, J
+
     # ---------------- IK ----------------
     def ik(self, target_mm: Iterable[float], tool_axis_b=(0.0, 0.0, -1.0),
            yaw_deg: float | None = 0.0, seed_deg: Iterable[float] | None = None,
@@ -287,6 +323,21 @@ class RobotModel:
                 re = math.degrees(math.acos(cos))
             return pe, re
 
+        # 轴方向约束（yaw=None）在 180° 附近解析雅可比会退化，继续用数值差分。
+        # 完整姿态约束在误差还很大时，rotvec 的解析导数不等于 -Re^T a；
+        # 只有接近目标（<2°）才切解析雅可比，省掉每步 6 次 FK。
+        def jac_fn(q):
+            pe, Re, J = self._jacobian(q, preset, yaw_deg, R_target, axis)
+            if R_target is not None:
+                c = max(-1.0, min(1.0,
+                                  (float(np.trace(Re.T @ R_target)) - 1.0) / 2.0))
+                if math.acos(c) > math.radians(2.0):
+                    return None
+            return J
+
+        if R_target is None:
+            jac_fn = None
+
         seeds: list[np.ndarray] = [np.clip(seed, lo, hi)]
         if structured_seeds:
             seeds += self._structured_seeds(seed, target, axis, lo, hi)
@@ -296,7 +347,8 @@ class RobotModel:
         for si, s in enumerate(seeds):
             if time_budget_s is not None and time.monotonic() - t_start > time_budget_s:
                 break
-            q, pe, re = self._dls(s, err, err_raw, lo, hi, max_iters)
+            q, pe, re = self._dls(s, err, err_raw, lo, hi, max_iters,
+                                  jac=jac_fn)
             # 评分：位置误差为主，姿态误差折算成 mm，另外偏好 q3≥0、靠近种子
             score = pe + re * 0.5
             score += 0.01 * float(np.linalg.norm(q - seed))
@@ -342,7 +394,7 @@ class RobotModel:
                 uniq.append(q)
         return uniq
 
-    def _dls(self, q0, err, err_raw, lo, hi, max_iters):
+    def _dls(self, q0, err, err_raw, lo, hi, max_iters, jac=None):
         q = np.clip(np.asarray(q0, dtype=float).copy(), lo, hi)
         lam = 2.0
         best_q = q.copy()
@@ -355,14 +407,16 @@ class RobotModel:
             pe, re = err_raw(q)
             if pe <= 0.005 and re <= 0.01:
                 return q, pe, re
-            J = np.zeros((6, 6))
-            h = 1e-4  # deg
-            for k in range(6):
-                qp = q.copy()
-                qp[k] = min(hi[k], q[k] + h)
-                if qp[k] == q[k]:
-                    qp[k] = max(lo[k], q[k] - h)
-                J[:, k] = (err(qp) - e) / (qp[k] - q[k])
+            J = jac(q) if jac is not None else None
+            if J is None:
+                J = np.zeros((6, 6))
+                h = 1e-4  # deg
+                for k in range(6):
+                    qp = q.copy()
+                    qp[k] = min(hi[k], q[k] + h)
+                    if qp[k] == q[k]:
+                        qp[k] = max(lo[k], q[k] - h)
+                    J[:, k] = (err(qp) - e) / (qp[k] - q[k])
             A = J @ J.T + (lam ** 2) * np.eye(6)
             try:
                 dq = -J.T @ np.linalg.solve(A, e)

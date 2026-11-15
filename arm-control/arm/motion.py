@@ -39,6 +39,19 @@ START_REVERSE_DEG = 3.0
 # 5° 与已实测可用的 J3/J2 ±5° 点动一致；大动作自动拆成多段。
 MAX_TARGET_STEP_DEG = 5.0
 
+# 抬高（回零/停机共用）：目标 TCP z=150。
+# 随机姿态的工具轴不一定朝下；强行把工具轴转成 (0,0,-1) 会让腕部大角度重排，
+# 甚至在同一 XY 上无解（2026-11-15 的 10000 点扫描：1850 个失败里 1162 个是
+# “残余”，450/734 个合法起点的工具轴是水平的）。所以抬高保留当前工具轴。
+# 同一 XY 抬到 150 超出可达范围时，先向底座方向收一点（最多 10%），
+# 再允许工具轴朝 -z 倾斜；最后才降低抬高高度。
+LIFT_Z_MM = 150.0
+LIFT_GOOD_JUMP_DEG = 45.0
+LIFT_MAX_JUMP_DEG = 75.0
+LIFT_SCALES = (1.0, 0.99, 0.98, 0.96, 0.94, 0.92, 0.90, 0.88, 0.85, 0.80)
+LIFT_TILTS = (15.0, 30.0, 45.0, 60.0, 75.0, 90.0)
+LIFT_LOWER_Z_MM = (148.0, 145.0, 140.0, 135.0, 130.0)
+
 
 class TorqueError(MotionError):
     """18.2 重力力矩预检不通过（可以尝试“远端先收”重试）。"""
@@ -46,6 +59,24 @@ class TorqueError(MotionError):
 
 class StartFenceError(MotionError):
     """16.4 第 11 条：起点在围栏外；只允许零扭矩拖动或先抬高再回零。"""
+
+
+def _axis_toward(axis, target, deg: float) -> np.ndarray:
+    """把单位轴 axis 朝 target 转 deg（球面插值），用于抬高的工具轴候选。"""
+    a = np.asarray(axis, dtype=float)
+    b = np.asarray(target, dtype=float)
+    a = a / max(float(np.linalg.norm(a)), 1e-12)
+    b = b / max(float(np.linalg.norm(b)), 1e-12)
+    cos = max(-1.0, min(1.0, float(np.dot(a, b))))
+    ang = math.acos(cos)
+    if ang < 1e-9:
+        return a.copy()
+    if ang > math.pi - 1e-9:
+        return b.copy()
+    t = min(1.0, math.radians(float(deg)) / ang)
+    s = math.sin(ang)
+    return (math.sin((1.0 - t) * ang) * a
+            + math.sin(t * ang) * b) / s
 
 
 class LiftBranchError(MotionError):
@@ -359,63 +390,136 @@ class Motion:
         }
 
     def _plan_lift(self, q0) -> list[dict]:
-        """抬高到 TCP z ≥ 150（回零和停机共用）；先做分支枚举 + 自由偏航。
+        """抬高到 TCP z ≈ 150（回零和停机共用）。
 
-        2026-11-14：必须和当前 q 连续；单关节跳 >30° 的解不能用。
-        先试锁定偏航，再试自由偏航；每种都试当前 q 和几个镜像种子。
+        2026-11-15：保留当前工具轴，不再强行把工具轴转成 (0,0,-1)。
+        随机姿态的工具轴可能水平/朝上；强行朝下会让腕部大幅重排，
+        在同一 XY 上经常无解（10000 点扫描里 1162 个“残余”失败）。
+        目标按以下顺序枚举，取代价最小的连续解：
+          1. 同一 XY、当前工具轴，竖直抬到 150；
+          2. 向底座方向收 1%..10%（同一 XY 超出可达范围时）；
+          3. 工具轴朝 -z 倾斜 15°..90°；
+          4. 最后降低抬高高度 148..130 mm。
+        单关节跳 >75° 视为换分支，拒绝；45° 以内的正常抬升直接采用。
         """
-        tcp = self.robot.tcp(q0, self.preset, self.yaw_deg)[:3, 3]
-        if tcp[2] >= 150.0 - 0.5:
+        t0 = self.robot.tcp(q0, self.preset, self.yaw_deg)
+        p0 = t0[:3, 3]
+        if p0[2] >= LIFT_Z_MM - 0.5:
             return []
-        target = [float(tcp[0]), float(tcp[1]), 150.0]
+        axis0 = t0[:3, 2].copy()
         q0a = np.asarray(q0, float)
         lo = np.asarray(self.limits[0], float)
         hi = np.asarray(self.limits[1], float)
-        # 分支种子：当前 q，以及 J1/J3/J5 翻 180° 的镜像
-        seeds = [q0a.copy()]
-        for i, delta in ((0, 180.0), (0, -180.0), (2, 180.0),
-                         (2, -180.0), (4, 180.0), (4, -180.0)):
-            s = q0a.copy()
-            s[i] += delta
-            seeds.append(np.clip(s, lo, hi))
-        last_reason = ""
-        best = None
-        for free in (False, True):
+        limits = (self.limits[0], self.limits[1])
+
+        def tilted(deg):
+            return _axis_toward(axis0, (0.0, 0.0, -1.0), deg)
+
+        candidates: list[tuple[float, float, np.ndarray, str]] = []
+        for s in LIFT_SCALES:
+            candidates.append((s, LIFT_Z_MM, axis0,
+                               "收 " + f"{(1 - s) * 100:.0f}%" if s < 1 else "保持姿态"))
+        for deg in LIFT_TILTS:
+            candidates.append((1.0, LIFT_Z_MM, tilted(deg),
+                               f"转腕 {deg:.0f}°"))
+        for deg in (60.0, 90.0):
+            candidates.append((0.96, LIFT_Z_MM, tilted(deg),
+                               f"收 4% + 转腕 {deg:.0f}°"))
+        for z in LIFT_LOWER_Z_MM:
+            candidates.append((1.0, z, axis0, f"抬到 z={z:.0f}"))
+
+        def attempt(scale, z, axis, seeds):
+            """返回 (最小跳的解, 最小跳, 最近一次不达标的原因)。"""
+            best = None
+            worst = None
             for seed in seeds:
                 try:
                     res = self.robot.ik(
-                        target, (0, 0, -1),
-                        None if free else self.yaw_deg,
-                        seed, self.preset,
-                        (self.limits[0], self.limits[1]),
+                        [scale * float(p0[0]), scale * float(p0[1]), z],
+                        axis, None, seed, self.preset, limits,
                         pos_tol_mm=0.5, axis_tol_deg=0.5,
-                        structured_seeds=False, max_iters=80)
+                        structured_seeds=False, max_iters=100,
+                        time_budget_s=0.10)
                 except Exception as exc:  # noqa: BLE001
-                    last_reason = str(exc)
+                    worst = str(exc)
                     continue
                 if not res.ok:
-                    last_reason = (f"残余 {res.pos_err_mm:.2f} mm / "
-                                   f"轴 {res.axis_err_deg:.2f}°")
+                    worst = (f"残余 {res.pos_err_mm:.2f} mm / "
+                             f"轴 {res.axis_err_deg:.2f}°")
                     continue
-                d = np.abs(np.asarray(res.q_deg, float) - q0a)
-                i = int(np.argmax(d))
-                if d[i] > 30.0:
-                    last_reason = (f"{self.order[i]} 跳 {d[i]:.1f}° >30°"
-                                   f"（{'自由' if free else '锁定'}偏航）")
+                jump = float(np.max(np.abs(
+                    np.asarray(res.q_deg, float) - q0a)))
+                if jump > LIFT_MAX_JUMP_DEG + 1e-9:
+                    worst = f"{self.order[int(np.argmax(np.abs(
+                        np.asarray(res.q_deg, float) - q0a)))]} 跳 {jump:.1f}°"
                     continue
-                score = (float(d[i]), 0 if free else 1)
-                if best is None or score < best[0]:
-                    best = (score, res, free)
-            if best is not None:
+                if best is None or jump < best[0]:
+                    best = (jump, res)
+            return best, worst
+
+        best = None     # (cost, jump, scale, z, axis, label, res)
+        worst_reason = ""
+        for scale, z, axis, label in candidates:
+            found, worst = attempt(scale, z, axis, [q0a])
+            if worst:
+                worst_reason = worst
+            if found is None:
+                continue
+            jump, res = found
+            axis_chg = math.degrees(math.acos(max(
+                -1.0, min(1.0, float(np.dot(axis0, axis))))))
+            cost = (jump + 0.6 * axis_chg
+                    + 25.0 * (1.0 - scale)
+                    + 8.0 * max(0.0, LIFT_Z_MM - z))
+            if best is None or cost < best[0]:
+                best = (cost, jump, scale, z, axis, label, res)
+            # 同一 XY、原工具轴、跳 ≤45°：正常情况，不必再找
+            if (scale >= 1.0 - 1e-9 and z >= LIFT_Z_MM - 1e-9
+                    and axis_chg < 1e-6
+                    and jump <= LIFT_GOOD_JUMP_DEG):
+                best = (cost, jump, scale, z, axis, label, res)
                 break
+
+        # 第一轮都没找到时，再试 J1/J3/J5 翻 180° 的镜像分支
+        if best is None:
+            seeds = []
+            for i, delta in ((0, 180.0), (0, -180.0), (2, 180.0),
+                             (2, -180.0), (4, 180.0), (4, -180.0)):
+                sig = q0a.copy()
+                sig[i] += delta
+                seeds.append(np.clip(sig, lo, hi))
+            for scale, z, axis, label in candidates[:9]:
+                found, worst = attempt(scale, z, axis, seeds)
+                if worst:
+                    worst_reason = worst
+                if found is None:
+                    continue
+                jump, res = found
+                axis_chg = math.degrees(math.acos(max(
+                    -1.0, min(1.0, float(np.dot(axis0, axis))))))
+                cost = (jump + 0.6 * axis_chg
+                        + 25.0 * (1.0 - scale)
+                        + 8.0 * max(0.0, LIFT_Z_MM - z))
+                best = (cost, jump, scale, z, axis, label, res)
+                break
+
         if best is None:
             raise LiftBranchError(
-                f"抬高无连续解：{last_reason or '无可用分支'}；"
+                f"抬高无连续解：{worst_reason or '无可用分支'}；"
                 "请先支撑/手动抬高或分段点动")
-        _, res, free = best
+        _, jump, scale, z, axis, label, res = best
         lift = self._plan_move(
-            q0, res.q_deg, "抬高" + ("（自由偏航）" if free else ""),
+            q0, res.q_deg, f"抬高（{label}）",
             allow_outside_start=True, relax_below_z=100.0)
+        if lift:
+            lift[-1]["lift"] = {
+                "scale": round(float(scale), 4),
+                "target_z_mm": round(float(z), 2),
+                "axis": [round(float(v), 4) for v in axis],
+                "jump_deg": round(float(jump), 3),
+                "pos_err_mm": round(float(res.pos_err_mm), 4),
+                "axis_err_deg": round(float(res.axis_err_deg), 4),
+            }
         return lift
 
     def plan_park(self, q_from=None, park: dict | None = None,

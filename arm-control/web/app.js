@@ -3,7 +3,7 @@ import { OrbitControls } from './vendor/OrbitControls.js';
 import { TransformControls } from './vendor/TransformControls.js';
 
 // 每次改网页都同时改这里和 web/version.json；刷新后右上角应显示这个版本
-const WEB_VERSION = '2026-11-14.13';
+const WEB_VERSION = '2026-11-15.1';
 const webverEl = document.getElementById('pill-webver');
 if (webverEl) webverEl.textContent = `网页 v${WEB_VERSION}`;
 
@@ -1828,6 +1828,115 @@ function animate() {
 }
 animate();
 
+// ---------------------------------------------------------------------------
+// 左栏分块收起 / 展开
+// 每张卡片标题右侧一个箭头；点标题或箭头收起，再点展开。收起状态按卡片
+// 记在 localStorage，刷新后保持；顶部按钮一键全部收起/展开。
+// 收起只是隐藏控件，按钮状态和快捷键（空格停）不受影响。
+// ---------------------------------------------------------------------------
+const LEFT_COLLAPSE_KEY = 'gluon.left.collapsed.v1';
+
+function leftCards() {
+  return Array.from(document.querySelectorAll('#left > section.card'));
+}
+
+function setLeftCardCollapsed(card, collapsed, save = true) {
+  const btn = card.querySelector('.card-toggle');
+  const body = card.querySelector('.card-body');
+  if (!btn || !body) return;
+  card.classList.toggle('collapsed', collapsed);
+  btn.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+  body.setAttribute('aria-hidden', collapsed ? 'true' : 'false');
+  // 收起的控件不能再用 Tab 选中（老浏览器忽略 inert 也没有副作用）
+  body.inert = collapsed;
+  if (save) saveLeftCollapse();
+}
+
+function saveLeftCollapse() {
+  try {
+    const keys = leftCards()
+      .filter((c) => c.classList.contains('collapsed'))
+      .map((c) => c.dataset.cardKey || '')
+      .filter(Boolean);
+    localStorage.setItem(LEFT_COLLAPSE_KEY, JSON.stringify(keys));
+  } catch (_) { /* 无痕模式可能禁用 localStorage */ }
+}
+
+function updateLeftToggleAll() {
+  const btn = $('btn-left-toggle-all');
+  if (!btn) return;
+  const anyOpen = leftCards().some((c) => !c.classList.contains('collapsed'));
+  btn.textContent = anyOpen ? '全部收起' : '全部展开';
+  btn.title = anyOpen ? '把左栏所有分块收起' : '展开左栏所有分块';
+}
+
+function initLeftCollapse() {
+  let saved = [];
+  try { saved = JSON.parse(localStorage.getItem(LEFT_COLLAPSE_KEY) || '[]'); } catch (_) { saved = []; }
+  if (!Array.isArray(saved)) saved = [];
+  const collapsed = new Set(saved);
+
+  leftCards().forEach((card, i) => {
+    if (card.classList.contains('card-collapsible')) return;
+    const h3 = card.querySelector(':scope > h3');
+    if (!h3) return;
+    const title = h3.textContent.trim();
+    // 用标题当键：以后增删/挪动卡片，已有收起状态不会串到别的块
+    const key = title;
+    card.dataset.cardKey = key;
+
+    // 标题以下的内容整体包进 .card-body / .card-body-in，用于收起动画
+    const body = document.createElement('div');
+    body.className = 'card-body';
+    body.id = `left-body-${i}`;
+    const inner = document.createElement('div');
+    inner.className = 'card-body-in';
+    body.appendChild(inner);
+    while (h3.nextSibling) inner.appendChild(h3.nextSibling);
+    card.appendChild(body);
+
+    h3.classList.add('card-head');
+    h3.textContent = '';
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'card-toggle';
+    btn.setAttribute('aria-expanded', 'true');
+    btn.setAttribute('aria-controls', body.id);
+    btn.title = `收起或展开「${title}」`;
+    const titleEl = document.createElement('span');
+    titleEl.className = 'card-title';
+    titleEl.textContent = title;
+    const chev = document.createElement('span');
+    chev.className = 'card-chev';
+    chev.setAttribute('aria-hidden', 'true');
+    btn.append(titleEl, chev);
+
+    btn.addEventListener('click', () => {
+      setLeftCardCollapsed(card, !card.classList.contains('collapsed'));
+      updateLeftToggleAll();
+    });
+    h3.appendChild(btn);
+
+    setLeftCardCollapsed(card, collapsed.has(key), false);
+    card.classList.add('card-collapsible');
+  });
+
+  const allBtn = $('btn-left-toggle-all');
+  if (allBtn && !allBtn.dataset.bound) {
+    allBtn.dataset.bound = '1';
+    allBtn.addEventListener('click', () => {
+      const anyOpen = leftCards().some((c) => !c.classList.contains('collapsed'));
+      leftCards().forEach((c) => setLeftCardCollapsed(c, anyOpen, false));
+      saveLeftCollapse();
+      updateLeftToggleAll();
+      log(anyOpen ? '左栏分块已全部收起' : '左栏分块已全部展开', 'g');
+    });
+  }
+  updateLeftToggleAll();
+}
+
+initLeftCollapse();
+
 window.__arm = { gizmo, gizmoProxy, gizmoSend, setGizmoFromTcp, camera, renderer, controls, scene, setDrag(v) { gizmoDragging = !!v; }, get state() { return STATE; }, get mode() { return EXEC_MODE; }, get readonly() { return READONLY; } };
 
 init();
@@ -1857,8 +1966,12 @@ function pageStateSummary(s) {
 
 function collectPageSnapshot() {
   const visible = (el) => {
-    try { return !!(el.getClientRects && el.getClientRects().length); }
-    catch (_) { return false; }
+    try {
+      if (!(el.getClientRects && el.getClientRects().length)) return false;
+      // 被收起的左栏分块用 visibility:hidden，getClientRects 仍有值
+      const cs = getComputedStyle(el);
+      return cs.visibility !== 'hidden' && cs.display !== 'none';
+    } catch (_) { return false; }
   };
   const textOf = (el) => (el.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 500);
   const buttons = Array.from(document.querySelectorAll('button')).map((el) => ({

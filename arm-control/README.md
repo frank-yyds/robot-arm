@@ -13,6 +13,16 @@ URDF / FK / IK / 围栏             arm/kinematics.py, arm/fence.py
 16.3 网页校准会话                 arm/calib.py
 ```
 
+## 抬高 / IK（2026-11-15）
+
+- 抬高不再把工具轴强转成 `(0,0,-1)`：保留当前工具轴、偏航自由；同一 XY 抬不到
+  TCP z=150 时，依次尝试向底座收 1%–20%、工具轴朝 −z 倾斜 15°–90°、降低到
+  z=148–130，取跳变最小的连续解。单关节总跳 >75° 仍拒绝，执行按 5° 拆段。
+- `ik` 的完整姿态约束在误差 <2° 时用解析雅可比；轴方向约束仍用数值差分
+  （180° 附近解析式会退化）。自检：`python3 tools/ik_check.py`。
+- 10000 点扫描的 734 个“起点合法但抬高失败”已全部能生成连续计划；失败只剩
+  “起点本来就在地面以下”的点。复核脚本：`tools/lift_guard_check.py`。
+
 ## 网页运行时状态（debug）
 
 > 页面每 100 ms 把**当前**按钮亮/灰、可见性、文字，所有输入/下拉值和带 id 的显示文字写到 `runs/web_state.json`（只覆盖最新一份，不存历史）。
@@ -114,6 +124,18 @@ PYTHONPATH=../innfos-backup/_tools/pylibs python3 tools/probe_model.py
 - 探针 `models/probe_L90.step` / `.stl`：包围盒 x/z ±20.000，y −2.5…90.000，体积 22.113 cm³，单实体有效。
 - 夹爪 ψ：**70.8° 是托杯孔位，不是 ψ**。K 在 +y_f=90°、开合方向与 K 差 19.2°、开合方向偏 +x_f 侧为 70.8°，TCP x=开合方向−90°=**−19.2°**。已写进 `gripper_tip` / `gripper_center`，待 B1 现场复核。
 
+大样本离线扫描（不连真机，只报失败点）：
+
+```bash
+python3 tools/roundtrip_sweep.py --points 10000 --workers 9
+python3 tools/lift_audit.py --dir runs/_sim/sweep_YYYYmmdd_HHMMSS
+python3 tools/pair_reach.py --dir runs/_sim/sweep_YYYYmmdd_HHMMSS --pairs 5000
+```
+
+- `roundtrip_sweep`：随机取六关节姿态，逐点规划“抬高→回零”和“抬高→收拢→预停机→1 mm 分步下降到 `descent_min_j4_z`”，不放 `allow_direct_fallback`；多进程、可 `--resume`。产物在 `runs/_sim/sweep_*/`：`failures_compact.txt`（一行一点）、`failures_by_point.*`、`failures.csv`、`summary.json`。
+- `lift_audit`：把抬高 IK 每种子迭代 80→300 重搜失败点，分 `branch`（有精确解但单关节跳 >30°）和 `infeasible`（无解）。
+- `pair_reach`：从点集里随机抽点对，A→B、B→A 各按 `move_joints` 规划一遍（关节空间直线、5° 拆段、起点围栏、目标/中间点围栏+力矩）；产物 `pair_failures_compact.txt`、`pair_failures.csv`、`pair_summary.json`。
+
 ## 迁移到 Linux 小主机
 
 - 只依赖 Python 3、numpy；没有 macOS 专有调用。
@@ -181,3 +203,9 @@ PYTHONPATH=../innfos-backup/_tools/pylibs python3 tools/probe_model.py
 - **3D 拖动末端**：勾选后 TCP 处出现三轴抓手（红 x、绿 y、蓝 z，1 mm 一格）。拖动改 TCP 的三维位置，工具轴保持 −z、偏航用滑块；松手后预演模式只画预览，直接执行模式立即下发。抓手位置在选中时取当前 TCP，“抓手回到当前 TCP”可复位。
 - **手动测量**：零扭矩拖动（所有关节 0 A）时用手把末端拉到已知点，网页实时显示由电机读数算出的 TCP；可填实际 x/y/z 记录偏差，表格保留最近 20 条，CSV 在 `runs/measure.csv`。
 - 三维/二维切换：勾选 3D 时网格点击被忽略，关掉后仍可点网格（z=20）。
+
+## 网页左栏分块
+
+- 左栏每块标题右侧有箭头：点标题或箭头收起/展开该块；顶部 **全部收起 / 全部展开** 一键切换。
+- 收起只隐藏控件，按钮原有的亮/灰、快捷键（空格停）和控制权不受影响。
+- 收起状态记在浏览器 `localStorage`（键 `gluon.left.collapsed.v1`），刷新后保持；换浏览器或清缓存后回到全部展开。
