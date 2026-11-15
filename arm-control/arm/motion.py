@@ -25,6 +25,7 @@ from . import gravity
 from .fence import Fence
 from .kinematics import RobotModel
 from .recorder import Recorder
+from .sca import MODE_POSITION, MODE_PROFILE_POSITION
 
 
 class MotionError(RuntimeError):
@@ -801,7 +802,11 @@ class Motion:
             v = min(float(self.bus.cfg[n].motion_speed_deg_s), v)
             vel[n] = v
             acc[n] = v / max(self.bus.cfg[n].motion_accel_time_s, 0.05)
-        self.bus.set_profiles_q(vel, acc)
+        stream_pos = False
+        if hasattr(self.bus, "set_stream_mode"):
+            stream_pos = bool(self.bus.set_stream_mode(MODE_POSITION))
+        if not stream_pos:
+            self.bus.set_profiles_q(vel, acc)
         with self._lock:
             self.status.update({"phase": "moving", "label": label,
                                 "target_q": [round(float(v), 4) for v in qf],
@@ -934,6 +939,10 @@ class Motion:
                                 f"{float(q[i]) - float(qf[i]):+.3f}°",
                                 n, float(qf[i]), pos_deg=float(q[i]),
                                 error=states[n].error)
+                    if stream_pos:
+                        # 回到 S 曲线位置模式，后续单段/保持仍按原逻辑
+                        self.bus.set_stream_mode(MODE_PROFILE_POSITION)
+                        self.bus.set_profiles_q(vel, acc)
                     return
             if now - t_start > timeout:
                 self._abort(f"到达超时（{timeout:.1f} s）")

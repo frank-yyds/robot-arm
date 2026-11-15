@@ -59,6 +59,10 @@ class VirtualJointBus:
     def set_profiles_q(self, vel, acc=None):
         return None
 
+    def set_stream_mode(self, mode: int) -> bool:
+        self.force_mode = {n: mode for n in self.order}
+        return True
+
     def hold_all(self):
         return {"ok": True, "held": dict(self.q),
                 "unconfirmed": [], "unreadable": []}

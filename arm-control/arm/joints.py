@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 
 from . import config as cfgmod
 from .sca import (DEG_PER_MOTOR_TURN, GEAR, IQ8, IQ10, IQ24,
-                  MODE_CURRENT, MODE_PROFILE_POSITION,
+                  MODE_CURRENT, MODE_POSITION, MODE_PROFILE_POSITION,
                   R_CURRENT, R_CURRENT_LIMIT, R_CURRENT_MAX, R_ERROR,
                   R_MODE, R_POSITION, R_POS_LIMIT_H, R_POS_LIMIT_L, R_POWER,
                   R_TEMP_MOTOR, R_VEL_LIMIT, R_VOLTAGE,
@@ -574,11 +574,11 @@ class JointBus:
                 bad.append((name, "读不到电源(0x2B)"))
             elif m is None:
                 bad.append((name, "读不到模式(0x55)"))
-            elif p != 1 and m != MODE_PROFILE_POSITION:
+            elif p != 1 and m not in (MODE_PROFILE_POSITION, MODE_POSITION):
                 bad.append((name, f"读到了但 power={p},mode={m}"))
             elif p != 1:
                 bad.append((name, f"读到了但 power={p}"))
-            elif m != MODE_PROFILE_POSITION:
+            elif m not in (MODE_PROFILE_POSITION, MODE_POSITION):
                 bad.append((name, f"读到了但 mode={m}"))
         return bad
 
@@ -633,6 +633,32 @@ class JointBus:
             return self.motors[name].current_max_a()
         except Exception:  # noqa: BLE001
             return None
+
+    def set_stream_mode(self, mode: int) -> bool:
+        """切位置模式（3）或 S 曲线位置模式（6），用于流式目标。
+
+        官方 SDK 的 MoveJointPath 用 Mode_Pos 3 + 外部插补；这里在长动作
+        开始前切 3，结束/中止时 hold_all 会切回 6。
+        先把目标写成当前位置，再切模式，避免切换瞬间阶跃。
+        """
+        try:
+            with self._lock:
+                for name in self.order:
+                    m = self.motors[name]
+                    pos = m.pos_turns(timeout=0.15, retries=2)
+                    if pos is None:
+                        return False
+                    m.set_target_turns(pos)
+                    m.set_mode(mode)
+                    m.set_target_turns(pos)
+                time.sleep(0.2)
+                for name in self.order:
+                    now = self.motors[name].mode()
+                    if now != mode:
+                        return False
+            return True
+        except Exception:  # noqa: BLE001
+            return False
 
     def hold_all(self) -> dict:
         """逐颗尽力把目标改写成当前位置，并切回 S 曲线位置模式。
