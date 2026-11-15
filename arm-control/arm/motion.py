@@ -832,6 +832,17 @@ class Motion:
                 if maxerr is not None:
                     with self._lock:
                         self.status["current_q"] = [round(v, 4) for v in q]
+                    # 起步 1 s 内仍抓“反向空程”：实际往目标反方向走 >3° 立即停
+                    if now - t_start <= START_GRACE_S:
+                        for i, n in enumerate(self.order):
+                            if q[i] is None or abs(float(delta[i])) < 1.0:
+                                continue
+                            sign = 1.0 if float(delta[i]) > 0 else -1.0
+                            back = (float(q[i]) - float(q0[i])) * sign
+                            if back < -START_REVERSE_DEG:
+                                self._abort(
+                                    f"{n} 启动反向 {(-back):.1f}° >"
+                                    f"{START_REVERSE_DEG:g}°")
                     if maxerr > 5.0:
                         for i, n in enumerate(self.order):
                             e = (abs(float(q[i]) - float(cmd[i]))
