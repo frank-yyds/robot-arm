@@ -795,7 +795,10 @@ class Motion:
         vel = {}
         acc = {}
         for i, n in enumerate(self.order):
-            v = max(0.25, abs(float(delta[i])) / T)
+            # 余弦插补的峰值速度是平均值的 π/2≈1.57 倍；驱动 profile 的
+            # 最大速度要按峰值给，否则目标会一直跑在实际前面。
+            v = max(0.25, 1.6 * abs(float(delta[i])) / T)
+            v = min(float(self.bus.cfg[n].motion_speed_deg_s), v)
             vel[n] = v
             acc[n] = v / max(self.bus.cfg[n].motion_accel_time_s, 0.05)
         self.bus.set_profiles_q(vel, acc)
@@ -812,12 +815,17 @@ class Motion:
         last_ok = {n: t_start for n in self.order}
         err_ref = {n: None for n in self.order}
         err_ref_t = {n: t_start for n in self.order}
+        last_poll = 0.0
         # 会动的关节允许更大的“目标领先”误差；保持不动的关节 5° 就够。
         stall_lim = [12.0 if abs(float(delta[i])) > 10.0
                      else 8.0 if abs(float(delta[i])) > 2.0
                      else 5.0
                      for i in range(6)]
-        DT = 0.10
+        # 官方 gluon SDK 的 MoveJointPath 是 4 ms 插补一次（Mode_Pos 3），
+        # 不是每 100 ms 丢一个 1° 目标；这里先按 10 ms 流式，状态回读降到 20 Hz，
+        # 避免回读占用把目标流拖成一顿一顿。
+        DT = 0.01
+        POLL_DT = 0.05
         nsteps = max(1, int(math.ceil(T / DT)))
 
         def read_once(cmd):
@@ -851,18 +859,21 @@ class Motion:
         for k in range(1, nsteps + 1):
             if self._stop.is_set():
                 self._abort(self._stop_reason)
-            cmd = q0 + delta * min(1.0, k * DT / T)
+            # 余弦插补：首尾速度为 0，避免每步目标阶跃
+            u = min(1.0, k * DT / T)
+            sfrac = 0.5 - 0.5 * math.cos(math.pi * u)
+            cmd = q0 + delta * sfrac
             self.bus.set_targets_q(self.q_dict(cmd))
             t_loop = time.monotonic()
-            while True:
-                if self._stop.is_set():
-                    self._abort(self._stop_reason)
+            now = t_loop
+            if now - last_poll >= POLL_DT:
+                last_poll = now
                 q, maxerr, _ = read_once(cmd)
                 now = time.monotonic()
                 if maxerr is not None:
                     with self._lock:
                         self.status["current_q"] = [round(v, 4) for v in q]
-                    # 起步 1 s 内仍抓“反向空程”：实际往目标反方向走 >3° 立即停
+                    # 起步 1 s 内仍抓“反向空程”：实际往目标反方向走 >5° 立即停
                     if now - t_start <= START_GRACE_S:
                         for i, n in enumerate(self.order):
                             if q[i] is None or abs(float(delta[i])) < 1.0:
@@ -896,10 +907,10 @@ class Motion:
                             err_ref_t[n] = now
                 if now - t_start > timeout:
                     self._abort(f"到达超时（{timeout:.1f} s）")
-                if now - t_loop >= DT:
-                    break
-                time.sleep(max(0.0, 1.0 / self.poll_hz
-                               - (time.monotonic() - now)))
+            # 按 10 ms 节拍推进；读回读那一步可能已经超过 DT
+            sleep = DT - (time.monotonic() - t_loop)
+            if sleep > 0:
+                time.sleep(sleep)
             with self._lock:
                 self.status["progress"] = round(min(0.95, k / nsteps), 3)
 
