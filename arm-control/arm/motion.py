@@ -536,11 +536,13 @@ class Motion:
         pk = park or self.default_park()
         self.park_side = int(pk.get("park_side", getattr(self, "park_side", -1)))
         poses = dict(pk.get("poses") or {})
-        q5, q6 = self._park_wrist(pk, poses)
+        q4, q5, q6 = self._park_wrist(pk, poses)
         pre_pose = list(poses["pre"])
+        pre_pose[3] = q4
         pre_pose[4] = q5
         pre_pose[5] = q6
         park_pose = list(poses["park"])
+        park_pose[3] = q4
         park_pose[4] = q5
         park_pose[5] = q6
         poses["pre"] = pre_pose
@@ -566,12 +568,14 @@ class Motion:
                 "poses": poses}
 
     @staticmethod
-    def _park_wrist(pk: dict, poses: dict) -> tuple[float, float]:
-        """停机下降用的 J5/J6：默认用教的 park 点，可被 descent_j5/j6_deg 覆盖。"""
+    def _park_wrist(pk: dict, poses: dict) -> tuple[float, float, float]:
+        """停机下降用的 J4/J5/J6：默认用教的 park 点，可被 descent_q4/j5/j6_deg 覆盖。"""
         p = list(poses.get("park") or [0.0] * 6)
+        q4 = pk.get("descent_q4_deg")
         q5 = pk.get("descent_j5_deg")
         q6 = pk.get("descent_j6_deg")
-        return (float(p[4]) if q5 is None else float(q5),
+        return (float(p[3]) if q4 is None else float(q4),
+                float(p[4]) if q5 is None else float(q5),
                 float(p[5]) if q6 is None else float(q6))
 
     def plan_unpark(self, q_from=None, park: dict | None = None) -> list[dict]:
@@ -580,8 +584,9 @@ class Motion:
         pk = park or self.default_park()
         self.park_side = int(pk.get("park_side", getattr(self, "park_side", -1)))
         poses = dict(pk.get("poses") or {})
-        q5, q6 = self._park_wrist(pk, poses)
+        q4, q5, q6 = self._park_wrist(pk, poses)
         pre = list(poses["pre"])
+        pre[3] = q4
         pre[4] = q5
         pre[5] = q6
         return self._plan_move(q0, pre, "抬回预停机点")

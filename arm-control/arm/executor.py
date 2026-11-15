@@ -1111,27 +1111,33 @@ class Executor:
         return {k: (round(sum(v) / len(v), 4) if v else None) for k, v in acc.items()}
 
     def _park_q_at_z(self, z: float, q1: float,
+                     q4: float | None = None,
                      q5: float | None = None,
                      q6: float | None = None) -> list[float]:
-        """实际分步下降用的固定公式（20.8：预演和实际共用）。
+        """实际分步下降用的公式（20.8：预演和实际共用）。
 
-        J5/J6 不再固定 0：默认用教的 park 点 ``poses.park[4]/[5]``
-        （J5 是教停机姿态时的斜角，避免电机线卡搁架）；也可用
-        ``descent_j5_deg`` / ``descent_j6_deg`` 覆盖。
+        q2/q3 保证 J4 轴按 z 下降；腕部 q4/q5/q6 默认用教的
+        ``poses.park[3:6]``，复现教停机姿态时的斜腕/线缆方向；
+        也可用 ``descent_q4_deg`` / ``descent_j5_deg`` / ``descent_j6_deg``
+        单独覆盖。
         """
         c = max(-1.0, min(1.0, (z - 120.5) / 203.5))
         q2 = math.degrees(math.acos(c))
+        pk = self.park_cfg
+        park_pose = (pk.get("poses") or {}).get("park", [0.0] * 6)
+        if q4 is None:
+            q4 = pk.get("descent_q4_deg")
+            if q4 is None:
+                q4 = float(park_pose[3])
         if q5 is None:
-            q5 = self.park_cfg.get("descent_j5_deg")
+            q5 = pk.get("descent_j5_deg")
             if q5 is None:
-                q5 = float((self.park_cfg.get("poses") or {}).get(
-                    "park", [0.0] * 6)[4])
+                q5 = float(park_pose[4])
         if q6 is None:
-            q6 = self.park_cfg.get("descent_j6_deg")
+            q6 = pk.get("descent_j6_deg")
             if q6 is None:
-                q6 = float((self.park_cfg.get("poses") or {}).get(
-                    "park", [0.0] * 6)[5])
-        return [q1, q2, 90.0 - q2, 90.0, float(q5), float(q6)]
+                q6 = float(park_pose[5])
+        return [q1, q2, 90.0 - q2, float(q4), float(q5), float(q6)]
 
     def park(self, preview: bool = False, prereq: dict | None = None) -> dict:
         self._reject_if_parking()
