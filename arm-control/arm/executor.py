@@ -921,7 +921,7 @@ class Executor:
         return self._start_exec(segs, preview, "执行", motion=m)
 
     def _start_exec(self, segments, preview: bool, what: str,
-                    motion: Motion | None = None):
+                    motion: Motion | None = None, already_begun: bool = False):
         m = motion or self.motion
         if m is None:
             raise MotionError("还没连接，不能执行")
@@ -961,9 +961,10 @@ class Executor:
                 raise MotionError("停机流程正在跑：先按停，等它结束")
             if self._exec_thread and self._exec_thread.is_alive():
                 raise MotionError("已经在执行")
-            if m.status.get("busy"):
-                raise MotionError("正在运动")
-            m.begin_command()          # 接受命令即 busy，按停立刻有效
+            if not already_begun:
+                if m.status.get("busy"):
+                    raise MotionError("正在运动")
+                m.begin_command()      # 接受命令即 busy，按停立刻有效
             self._exec_thread = threading.Thread(target=worker, daemon=True)
             self._exec_thread.start()
         return {"ok": True, "started": True, "preview": preview}
@@ -984,14 +985,25 @@ class Executor:
         i = self.robot.joint_names.index(joint)
         q2 = list(q)
         q2[i] += float(delta)
-        segs = m._plan_move(q, q2, f"点动 {joint}{delta:+.0f}°", False)
+        # 20.3：命令一接受就置 busy，规划本身可能 0.5–3 s；这期间心跳断
+        # 也必须能被 watchdog 按停，不能等规划完才开始判忙。
+        if not preview:
+            m.begin_command()
+        try:
+            segs = m._plan_move(q, q2, f"点动 {joint}{delta:+.0f}°", False)
+        except Exception as exc:
+            with m._lock:
+                m.status.update({"busy": False, "phase": "error",
+                                 "reason": str(exc)})
+            raise
         self.pending = segs
         self.preview = preview_payload(segs[-1], self.robot, self.fence,
                                        self.tcp_preset, self.yaw_deg)
         self.preview["offline"] = not self.use_actual()
         if preview:
             return {"ok": True, "preview": self.preview, "started": False}
-        return self._start_exec(segs, False, f"点动 {joint}", motion=self.motion)
+        return self._start_exec(segs, False, f"点动 {joint}", motion=self.motion,
+                                already_begun=True)
 
     def home(self, preview: bool = False) -> dict:
         self._reject_if_parking()

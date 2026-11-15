@@ -211,9 +211,9 @@ close_exec(e)
 e = mk_exec()
 e.start_watchdog()
 e.acquire("a", e.config_version)
-e.jog("J2", 30, preview=False)
 t0 = time.time()
-while time.time() - t0 < 1.2:
+e.jog("J2", 30, preview=False)
+while time.time() - t0 < 8.0:
     e.touch("a")
     time.sleep(0.05)
 check("20.4 touch/SSE 不续心跳，运动被中止",
