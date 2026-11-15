@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import math
+import re
 import threading
 import time
 
@@ -614,6 +615,12 @@ class Motion:
 
     def _run_segment(self, seg: dict):
         q_target = np.asarray(seg["q_target"], float)
+        q_from = np.asarray(seg["q_from"], float)
+        step_deg = float(np.max(np.abs(q_target - q_from)))
+        # 5° 拆段时，目标一次前进 5°，启动/加速瞬间实际误差到 6–8° 是正常的。
+        # 允许误差按本段步长放宽（上限 15°），但仍要求 0.3–0.4 s 内至少降 1°，
+        # 真卡住（电流顶住/机械挡死）照样中止。
+        err_limit = min(15.0, max(5.0, 1.5 * step_deg + 2.0))
         bad = self.bus.verify_ready()
         if bad:
             self._abort("这些关节没有真正使能/不在位置模式，拒绝发目标："
@@ -702,15 +709,15 @@ class Motion:
                                 f"{n} 启动反向 {e - err0[n]:.1f}° >"
                                 f"{START_REVERSE_DEG:g}°（起始误差 {err0[n]:.1f}°）")
                         continue
-                    if e > 5.0:
+                    if e > err_limit:
                         ref = err_ref.get(n)
                         if ref is None or e <= ref - 1.0:
                             err_ref[n] = e
                             err_ref_t[n] = now
                         elif now - err_ref_t.get(n, t0) > 0.3:
                             self._abort(
-                                f"{n} 实际位置和目标差 {e:.1f}° >5°，"
-                                "且 0.3 s 内下降不到 1°")
+                                f"{n} 实际位置和目标差 {e:.1f}° "
+                                f"> {err_limit:.1f}°，且 0.3 s 内下降不到 1°")
                     else:
                         err_ref[n] = None
                         err_ref_t[n] = now
@@ -723,8 +730,171 @@ class Motion:
                     self.status["progress"] = round(min(0.99, (now - t0) / denom), 3)
             time.sleep(max(0.0, 1.0 / self.poll_hz - (time.monotonic() - now)))
 
+    @staticmethod
+    def _group_segments(segments: list[dict]) -> list[list[dict]]:
+        """把同一条长动作拆出来的 “xxx 1/19” 段归成一组，组内连续走。"""
+        groups: list[tuple[str, list[dict]]] = []
+        for seg in segments:
+            key = re.sub(r"\s+\d+/\d+$", "", str(seg.get("label", "")))
+            if groups and groups[-1][0] == key:
+                groups[-1][1].append(seg)
+            else:
+                groups.append((key, [seg]))
+        return [g for _, g in groups]
+
+    def _run_chunks(self, segs: list[dict]):
+        """连续执行一组 5° 拆段：沿同一条直线按时间流式下发小目标。
+
+        2026-11-15：旧做法每段都等 <0.8° 三拍、再 sleep 0.2 s，长动作会
+        走一步停一下。这里把整组当成一条直线，每 0.1 s 把目标推进 0.5–1°
+        （远小于驱动的 5° 阶跃上限），驱动看到的是连续移动的目标；
+        仍逐轮检查停止/报警/限位，误差 >8° 且 0.4 s 内降不到 1° → 中止。
+        """
+        label = re.sub(r"\s+\d+/\d+$", "", str(segs[0].get("label", "")))
+        bad = self.bus.verify_ready()
+        if bad:
+            self._abort("这些关节没有真正使能/不在位置模式，拒绝发目标："
+                        + "，".join(f"{n}({m})" for n, m in bad))
+        q0 = np.asarray(segs[0]["q_from"], float)
+        qf = np.asarray(segs[-1]["q_target"], float)
+        delta = qf - q0
+        T = 0.5
+        for i, n in enumerate(self.order):
+            v = max(0.25, float(segs[0]["vel_deg_s"].get(n, 10.0)))
+            T = max(T, abs(float(delta[i])) / v)
+        vel = {}
+        acc = {}
+        for i, n in enumerate(self.order):
+            v = max(0.25, abs(float(delta[i])) / T)
+            vel[n] = v
+            acc[n] = v / max(self.bus.cfg[n].motion_accel_time_s, 0.05)
+        self.bus.set_profiles_q(vel, acc)
+        with self._lock:
+            self.status.update({"phase": "moving", "label": label,
+                                "target_q": [round(float(v), 4) for v in qf],
+                                "progress": 0.0})
+        if self.recorder:
+            for n, q in zip(self.order, qf):
+                self.recorder.command("command_move", label, n, float(q))
+
+        t_start = time.monotonic()
+        timeout = max(8.0, T * 1.5 + 5.0)
+        last_ok = {n: t_start for n in self.order}
+        err_ref = {n: None for n in self.order}
+        err_ref_t = {n: t_start for n in self.order}
+        # 会动的关节允许更大的“目标领先”误差；保持不动的关节 5° 就够。
+        stall_lim = [12.0 if abs(float(delta[i])) > 10.0
+                     else 8.0 if abs(float(delta[i])) > 2.0
+                     else 5.0
+                     for i in range(6)]
+        DT = 0.10
+        nsteps = max(1, int(math.ceil(T / DT)))
+
+        def read_once(cmd):
+            states = self.bus.read_all(full=False)
+            if self.recorder:
+                self.recorder.poll(states)
+            now = time.monotonic()
+            q = []
+            errs: dict[str, float | None] = {}
+            for i, n in enumerate(self.order):
+                st = states[n]
+                if st.out_deg is None:
+                    q.append(None)
+                    errs[n] = None
+                    if now - last_ok[n] > 0.5:
+                        self._abort(f"{n} 0.5 s 没应答")
+                    continue
+                last_ok[n] = now
+                q.append(st.out_deg)
+                errs[n] = abs(st.out_deg - float(cmd[i]))
+                lo_s, hi_s = self.bus.cfg[n].safe_limits_deg
+                if st.out_deg < lo_s - 1.0 or st.out_deg > hi_s + 1.0:
+                    self._abort(
+                        f"{n} 实际位置 {st.out_deg:.1f}° 超出安全限位 "
+                        f"{lo_s:.0f}..{hi_s:.0f}°（撞限位）")
+                if st.error:
+                    self._abort(f"{n} 报警 0x{st.error:04X} {st.error_text}")
+            maxerr = None if None in errs.values() else max(errs.values())
+            return q, maxerr, states
+
+        for k in range(1, nsteps + 1):
+            if self._stop.is_set():
+                self._abort(self._stop_reason)
+            cmd = q0 + delta * min(1.0, k * DT / T)
+            self.bus.set_targets_q(self.q_dict(cmd))
+            t_loop = time.monotonic()
+            while True:
+                if self._stop.is_set():
+                    self._abort(self._stop_reason)
+                q, maxerr, _ = read_once(cmd)
+                now = time.monotonic()
+                if maxerr is not None:
+                    with self._lock:
+                        self.status["current_q"] = [round(v, 4) for v in q]
+                    if maxerr > 5.0:
+                        for i, n in enumerate(self.order):
+                            e = (abs(float(q[i]) - float(cmd[i]))
+                                 if q[i] is not None else None)
+                            lim = stall_lim[i]
+                            if e is None or e <= lim:
+                                err_ref[n] = None
+                                err_ref_t[n] = now
+                                continue
+                            ref = err_ref[n]
+                            if ref is None or e <= ref - 1.0:
+                                err_ref[n] = e
+                                err_ref_t[n] = now
+                            elif now - err_ref_t.get(n, t_start) > 0.4:
+                                self._abort(
+                                    f"{n} 实际位置和目标差 {e:.1f}° >{lim:g}°，"
+                                    "且 0.4 s 内下降不到 1°")
+                    else:
+                        for n in self.order:
+                            err_ref[n] = None
+                            err_ref_t[n] = now
+                if now - t_start > timeout:
+                    self._abort(f"到达超时（{timeout:.1f} s）")
+                if now - t_loop >= DT:
+                    break
+                time.sleep(max(0.0, 1.0 / self.poll_hz
+                               - (time.monotonic() - now)))
+            with self._lock:
+                self.status["progress"] = round(min(0.95, k / nsteps), 3)
+
+        # 最后精确下发终点并等真正到位
+        self.bus.set_targets_q(self.q_dict(qf))
+        consec = 0
+        while True:
+            if self._stop.is_set():
+                self._abort(self._stop_reason)
+            q, maxerr, states = read_once(qf)
+            now = time.monotonic()
+            if maxerr is not None:
+                if maxerr < 0.8:
+                    consec += 1
+                else:
+                    consec = 0
+                if consec >= 3:
+                    with self._lock:
+                        self.status["phase"] = "arrived"
+                        self.status["progress"] = 1.0
+                        self.status["current_q"] = [round(v, 4) for v in q]
+                    if self.recorder:
+                        for i, n in enumerate(self.order):
+                            self.recorder.command(
+                                "arrived_error", f"{label} 到位误差 "
+                                f"{float(q[i]) - float(qf[i]):+.3f}°",
+                                n, float(qf[i]), pos_deg=float(q[i]),
+                                error=states[n].error)
+                    return
+            if now - t_start > timeout:
+                self._abort(f"到达超时（{timeout:.1f} s）")
+            time.sleep(max(0.0, 1.0 / self.poll_hz
+                           - (time.monotonic() - now)))
+
     def execute(self, segments: list[dict], preview: bool = False,
-                pause_between: float = 0.2, clear_stop: bool = True) -> dict:
+                pause_between: float = 0.0, clear_stop: bool = True) -> dict:
         """执行（或预演）一组已规划好的段。预演绝不写电机。
 
         clear_stop=False 用于“命令已在接受时 begin_command() 过”，
@@ -751,12 +921,16 @@ class Motion:
                 self.status.update({"busy": False, "phase": "preview_done"})
             return {"preview": True, "segments": segments}
         try:
-            for i, seg in enumerate(segments):
+            groups = self._group_segments(segments)
+            for i, group in enumerate(groups):
                 with self._lock:
                     self.status["index"] = i
-                self._run_segment(seg)
-                if i < len(segments) - 1:
-                    time.sleep(max(0.0, pause_between))
+                if len(group) > 1:
+                    self._run_chunks(group)
+                else:
+                    self._run_segment(group[0])
+                if i < len(groups) - 1 and pause_between > 0:
+                    time.sleep(pause_between)
             with self._lock:
                 self.status.update({"busy": False, "phase": "done",
                                     "finished": time.time(), "progress": 1.0})

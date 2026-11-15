@@ -3,7 +3,7 @@ import { OrbitControls } from './vendor/OrbitControls.js';
 import { TransformControls } from './vendor/TransformControls.js';
 
 // 每次改网页都同时改这里和 web/version.json；刷新后右上角应显示这个版本
-const WEB_VERSION = '2026-11-15.1';
+const WEB_VERSION = '2026-11-15.2';
 const webverEl = document.getElementById('pill-webver');
 if (webverEl) webverEl.textContent = `网页 v${WEB_VERSION}`;
 
@@ -1230,6 +1230,10 @@ $('btn-park').addEventListener('click', async () => {
     (p.segments || []).forEach((s) => log(`  ${s.label}  T=${s.T}s`));
     if (p.preview && p.preview.park && p.preview.park.note) log(p.preview.park.note, 'w');
     if (p.descent && p.descent.note) log('下降路径：' + p.descent.note, 'w');
+    if (EXEC_MODE === 'preview') {
+      log('停机预演完成，未动电机。要执行：先切“直接执行”，再点一次“停机（18.3）”。', 'g');
+      return;
+    }
     if (!confirm('停机预演已生成（见日志）。执行停机？\n\n抬高 → 收拢+折腕+转 J1 → 预停机点（读 I₀）\n→ 下降到 P（读 I₁）→ 搁架接住判定 → 按 J6→J1 失能。\n\n全程人不碰臂。')) return;
     await apiPost('/api/park', { preview: false, prereq });
     log('停机流程已启动', 'w');

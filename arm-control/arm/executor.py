@@ -1110,11 +1110,21 @@ class Executor:
             time.sleep(0.02)
         return {k: (round(sum(v) / len(v), 4) if v else None) for k, v in acc.items()}
 
-    def _park_q_at_z(self, z: float, q1: float) -> list[float]:
-        """实际分步下降用的固定公式（20.8：预演和实际共用）。"""
+    def _park_q_at_z(self, z: float, q1: float,
+                     q5: float | None = None,
+                     q6: float | None = None) -> list[float]:
+        """实际分步下降用的固定公式（20.8：预演和实际共用）。
+
+        J5 不再固定 0：下降前把 J5 转到 ``descent_j5_deg``（默认 −90°），
+        让 J5 电机线离开搁架；J6 同理取 ``descent_j6_deg``（默认 0）。
+        """
         c = max(-1.0, min(1.0, (z - 120.5) / 203.5))
         q2 = math.degrees(math.acos(c))
-        return [q1, q2, 90.0 - q2, 90.0, 0.0, 0.0]
+        if q5 is None:
+            q5 = float(self.park_cfg.get("descent_j5_deg", -90.0))
+        if q6 is None:
+            q6 = float(self.park_cfg.get("descent_j6_deg", 0.0))
+        return [q1, q2, 90.0 - q2, 90.0, q5, q6]
 
     def park(self, preview: bool = False, prereq: dict | None = None) -> dict:
         self._reject_if_parking()

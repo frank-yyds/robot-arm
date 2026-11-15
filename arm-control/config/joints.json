@@ -86,7 +86,7 @@
       "current_check_max_a": null,
       "factory_current_limit_a": 8.0,
       "factory_current_limit_note": "8 A 是出厂值（16.5 A 满量程的 48%），不动",
-      "zero_date": "2026-11-14",
+      "zero_date": "2026-11-15",
       "note": "J3 限流保持出厂 8 A",
       "sign_checked": true,
       "safe_limits_deg": [
@@ -113,7 +113,7 @@
       "motion_accel_time_s": 0.5,
       "required_current_limit_a": null,
       "current_check_max_a": null,
-      "zero_date": "2026-11-07",
+      "zero_date": "2026-11-15",
       "note": "Lite NE30；满量程自报不可信，限流一律不动",
       "sign_checked": true,
       "safe_limits_deg": [
@@ -140,7 +140,7 @@
       "motion_accel_time_s": 0.5,
       "required_current_limit_a": null,
       "current_check_max_a": null,
-      "zero_date": "2026-11-07",
+      "zero_date": "2026-11-15",
       "note": "Lite NE30；限流不动",
       "sign_checked": true,
       "safe_limits_deg": [
