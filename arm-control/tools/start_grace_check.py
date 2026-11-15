@@ -1,4 +1,4 @@
-"""启动容忍自检：1.9° 反向空程应通过；5° 反向应中止。"""
+"""启动容忍自检：1.9°/3.2° 反向空程应通过；6° 反向应中止。"""
 from __future__ import annotations
 
 import sys
@@ -83,10 +83,12 @@ def run(reverse_deg: float):
 def main():
     ok, detail = run(1.9)
     print(("PASS" if ok else "FAIL"), "J3 反向 1.9° 空程后正向 →", detail)
-    bad_ok, bad_detail = run(5.0)
+    ok32, detail32 = run(3.2)
+    print(("PASS" if ok32 else "FAIL"), "J3 反向 3.2° 空程后正向 →", detail32)
+    bad_ok, bad_detail = run(6.0)
     print(("PASS" if not bad_ok else "FAIL"),
-          "J3 反向 5° 应中止 →", bad_detail)
-    return 0 if ok and not bad_ok else 1
+          "J3 反向 6° 应中止 →", bad_detail)
+    return 0 if ok and ok32 and not bad_ok else 1
 
 
 if __name__ == "__main__":
