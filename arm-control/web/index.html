@@ -176,7 +176,7 @@
           <button id="btn-disable-all" class="btn danger" style="width:100%" disabled>紧急全部失能（立即断使能，臂会掉）</button>
         </div>
         <div class="hint" style="color:#ff8a8a">紧急失能不走搁架停机，任何姿态都立即断使能；必须先把臂支撑/扶住。能用停机/扶持停机时优先用它们。</div>
-        <div class="hint" id="park-hint">停机 = 搁架接住 → 按 J6→J1 失能。预演模式只算不动，切“直接执行”再点停机才会动；下降前 J5 自动转到 −90° 把电机线转开（方向不对改 config/park.json 的 descent_j5_deg）。扶持停机是备用（要人扶住零位）。</div>
+        <div class="hint" id="park-hint">停机 = 搁架接住 → 按 J6→J1 失能。预演模式只算不动，切“直接执行”再点停机才会动；下降前 J5 自动转到你教的停机角（poses.park[4]，现在约 −6.3°；要固定别的角度就填 config/park.json 的 descent_j5_deg）。扶持停机是备用（要人扶住零位）。</div>
         <div class="hint" id="motion-hint">空格键 = 停（任何状态）。</div>
       </section>
 

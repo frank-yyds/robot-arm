@@ -1115,16 +1115,23 @@ class Executor:
                      q6: float | None = None) -> list[float]:
         """实际分步下降用的固定公式（20.8：预演和实际共用）。
 
-        J5 不再固定 0：下降前把 J5 转到 ``descent_j5_deg``（默认 −90°），
-        让 J5 电机线离开搁架；J6 同理取 ``descent_j6_deg``（默认 0）。
+        J5/J6 不再固定 0：默认用教的 park 点 ``poses.park[4]/[5]``
+        （J5 是教停机姿态时的斜角，避免电机线卡搁架）；也可用
+        ``descent_j5_deg`` / ``descent_j6_deg`` 覆盖。
         """
         c = max(-1.0, min(1.0, (z - 120.5) / 203.5))
         q2 = math.degrees(math.acos(c))
         if q5 is None:
-            q5 = float(self.park_cfg.get("descent_j5_deg", -90.0))
+            q5 = self.park_cfg.get("descent_j5_deg")
+            if q5 is None:
+                q5 = float((self.park_cfg.get("poses") or {}).get(
+                    "park", [0.0] * 6)[4])
         if q6 is None:
-            q6 = float(self.park_cfg.get("descent_j6_deg", 0.0))
-        return [q1, q2, 90.0 - q2, 90.0, q5, q6]
+            q6 = self.park_cfg.get("descent_j6_deg")
+            if q6 is None:
+                q6 = float((self.park_cfg.get("poses") or {}).get(
+                    "park", [0.0] * 6)[5])
+        return [q1, q2, 90.0 - q2, 90.0, float(q5), float(q6)]
 
     def park(self, preview: bool = False, prereq: dict | None = None) -> dict:
         self._reject_if_parking()

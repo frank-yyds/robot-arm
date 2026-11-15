@@ -533,7 +533,16 @@ class Motion:
         q0 = self.read_q() if q_from is None else list(q_from)
         pk = park or self.default_park()
         self.park_side = int(pk.get("park_side", getattr(self, "park_side", -1)))
-        poses = pk.get("poses") or {}
+        poses = dict(pk.get("poses") or {})
+        q5, q6 = self._park_wrist(pk, poses)
+        pre_pose = list(poses["pre"])
+        pre_pose[4] = q5
+        pre_pose[5] = q6
+        park_pose = list(poses["park"])
+        park_pose[4] = q5
+        park_pose[5] = q6
+        poses["pre"] = pre_pose
+        poses["park"] = park_pose
         try:
             lift = self._plan_lift(q0)
         except LiftBranchError:
@@ -554,12 +563,26 @@ class Motion:
         return {"lift": lift, "tuck": tuck, "pre": pre, "park": down,
                 "poses": poses}
 
+    @staticmethod
+    def _park_wrist(pk: dict, poses: dict) -> tuple[float, float]:
+        """停机下降用的 J5/J6：默认用教的 park 点，可被 descent_j5/j6_deg 覆盖。"""
+        p = list(poses.get("park") or [0.0] * 6)
+        q5 = pk.get("descent_j5_deg")
+        q6 = pk.get("descent_j6_deg")
+        return (float(p[4]) if q5 is None else float(q5),
+                float(p[5]) if q6 is None else float(q6))
+
     def plan_unpark(self, q_from=None, park: dict | None = None) -> list[dict]:
         """18.3 从停机启动：J2/J3 同步抬回预停机点（离开搁架）。"""
         q0 = self.read_q() if q_from is None else list(q_from)
         pk = park or self.default_park()
         self.park_side = int(pk.get("park_side", getattr(self, "park_side", -1)))
-        return self._plan_move(q0, (pk.get("poses") or {})["pre"], "抬回预停机点")
+        poses = dict(pk.get("poses") or {})
+        q5, q6 = self._park_wrist(pk, poses)
+        pre = list(poses["pre"])
+        pre[4] = q5
+        pre[5] = q6
+        return self._plan_move(q0, pre, "抬回预停机点")
 
     # ---------------- 执行 ----------------
     def begin_command(self):

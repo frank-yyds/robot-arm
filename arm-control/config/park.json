@@ -53,8 +53,8 @@
       76.5,
       13.5,
       90.0,
-      -90.0,
-      0.0
+      -6.3019,
+      0.0043
     ],
     "park": [
       92.1731,
@@ -85,11 +85,11 @@
   },
   "descent_step_mm": 1.0,
   "descent_min_j4_z": 130.5,
-  "descent_note": "18.3 第 4/5 步：从预停机点按 1 mm/步下降（q2+q3=90，J4=90，J5=-90 把电机线转开，J6=0）；J2 电流 ≤0.5·I₀ 算接住；最低 z=130.5（J2≈87.3°，安全限位 ±88°）。",
+  "descent_note": "18.3 第 4/5 步：从预停机点按 1 mm/步下降（q2+q3=90，J4=90）；J5/J6 用教的 park 点（poses.park[4]/[5]，现在 J5≈-6.3°）收线，也可用 descent_j5_deg/descent_j6_deg 覆盖；J2 电流 ≤0.5·I₀ 算接住；最低 z=130.5（J2≈87.3°，安全限位 ±88°）。",
   "park_taught": true,
   "park_taught_at": "2026-11-15T21:58:27",
   "park_taught_source": "web: current actual q",
   "version": "2026-11-12.1",
-  "descent_j5_deg": -90.0,
-  "descent_j6_deg": 0.0
+  "descent_j5_deg": null,
+  "descent_j6_deg": null
 }
