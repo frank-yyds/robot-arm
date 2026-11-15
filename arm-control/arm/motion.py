@@ -810,23 +810,22 @@ class Motion:
             for n, q in zip(self.order, qf):
                 self.recorder.command("command_move", label, n, float(q))
 
+        # 官方 gluon SDK 的 MoveJointPath 是 4 ms 插补一次（Mode_Pos 3）；
+        # Python + ECB 做不到 250 Hz，这里按“墙上时间”推进目标（不是按步数），
+        # 每次最多 20 ms 发一次，目标步长 ≤ 约 0.2–0.3°；状态回读 20 Hz。
+        POLL_DT = 0.05
+        TARGET_DT = 0.02
         t_start = time.monotonic()
-        timeout = max(8.0, T * 1.5 + 5.0)
+        timeout = max(10.0, T * 0.8 + 8.0)   # 只用于“目标流结束后等真正到位”
         last_ok = {n: t_start for n in self.order}
         err_ref = {n: None for n in self.order}
         err_ref_t = {n: t_start for n in self.order}
         last_poll = 0.0
-        # 会动的关节允许更大的“目标领先”误差；保持不动的关节 5° 就够。
+        last_send = 0.0
         stall_lim = [12.0 if abs(float(delta[i])) > 10.0
                      else 8.0 if abs(float(delta[i])) > 2.0
                      else 5.0
                      for i in range(6)]
-        # 官方 gluon SDK 的 MoveJointPath 是 4 ms 插补一次（Mode_Pos 3），
-        # 不是每 100 ms 丢一个 1° 目标；这里先按 10 ms 流式，状态回读降到 20 Hz，
-        # 避免回读占用把目标流拖成一顿一顿。
-        DT = 0.01
-        POLL_DT = 0.05
-        nsteps = max(1, int(math.ceil(T / DT)))
 
         def read_once(cmd):
             states = self.bus.read_all(full=False)
@@ -856,16 +855,13 @@ class Motion:
             maxerr = None if None in errs.values() else max(errs.values())
             return q, maxerr, states
 
-        for k in range(1, nsteps + 1):
-            if self._stop.is_set():
-                self._abort(self._stop_reason)
-            # 余弦插补：首尾速度为 0，避免每步目标阶跃
-            u = min(1.0, k * DT / T)
+        while True:
+            now = time.monotonic()
+            u = min(1.0, (now - t_start) / T)
             sfrac = 0.5 - 0.5 * math.cos(math.pi * u)
             cmd = q0 + delta * sfrac
             self.bus.set_targets_q(self.q_dict(cmd))
-            t_loop = time.monotonic()
-            now = t_loop
+            last_send = time.monotonic()
             if now - last_poll >= POLL_DT:
                 last_poll = now
                 q, maxerr, _ = read_once(cmd)
@@ -873,7 +869,7 @@ class Motion:
                 if maxerr is not None:
                     with self._lock:
                         self.status["current_q"] = [round(v, 4) for v in q]
-                    # 起步 1 s 内仍抓“反向空程”：实际往目标反方向走 >5° 立即停
+                    # 起步 1 s 内抓反向空程（>5° 才停）
                     if now - t_start <= START_GRACE_S:
                         for i, n in enumerate(self.order):
                             if q[i] is None or abs(float(delta[i])) < 1.0:
@@ -905,14 +901,13 @@ class Motion:
                         for n in self.order:
                             err_ref[n] = None
                             err_ref_t[n] = now
-                if now - t_start > timeout:
-                    self._abort(f"到达超时（{timeout:.1f} s）")
-            # 按 10 ms 节拍推进；读回读那一步可能已经超过 DT
-            sleep = DT - (time.monotonic() - t_loop)
+            if u >= 1.0:
+                break
+            sleep = TARGET_DT - (time.monotonic() - last_send)
             if sleep > 0:
                 time.sleep(sleep)
             with self._lock:
-                self.status["progress"] = round(min(0.95, k / nsteps), 3)
+                self.status["progress"] = round(min(0.95, u), 3)
 
         # 最后精确下发终点并等真正到位
         self.bus.set_targets_q(self.q_dict(qf))
