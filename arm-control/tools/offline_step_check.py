@@ -1,10 +1,10 @@
-"""离线仿真：驱动 0x0200“位置模式阶跃过大”。
+"""离线仿真：21.4 后普通动作不再按 5° 拆段。
 
 不连 ECB、不连网页、不控电机；只用 MockJointBus + 规划器。
 验证：
-1. 事故姿态下，旧式“一步回零”目标步长会超限；
-2. 新式 ≤5° 拆段每段都不超限；
-3. MockJointBus 能跟完拆段回零。
+1. 事故姿态下 plan_home 只产生“抬高 + 回零”段，没有“n/n”5° 拆段；
+2. 单段目标可以大于 5°（21.3 已实测模式 6 下 8/12/20/40° 不报 0x0200）；
+3. MockJointBus 能跟完计划回到零位。
 """
 from __future__ import annotations
 
@@ -22,21 +22,6 @@ from arm.motion import Motion
 # 2026-11-14 22:53 J2 0x0200 时的实际姿态
 Q0 = [84.6566, 46.9116, -24.7754, 92.0697, 60.0208, 17.8320]
 NAMES = ["J1", "J2", "J3", "J4", "J5", "J6"]
-STEP_LIMIT = 5.0
-
-
-class StepDrive:
-    def __init__(self, q):
-        self.q = list(q)
-        self.max_step = 0.0
-
-    def command(self, q_target):
-        step = max(abs(a - b) for a, b in zip(q_target, self.q))
-        self.max_step = max(self.max_step, step)
-        if step > STEP_LIMIT + 1e-9:
-            return False, step
-        self.q = list(q_target)
-        return True, step
 
 
 def make_motion(q0):
@@ -52,34 +37,22 @@ def make_motion(q0):
 def main():
     m = make_motion(Q0)
     segs = m.plan_home(Q0)
-    print("计划段数:", len(segs))
-
-    old = StepDrive(Q0)
-    ok, step = old.command([0.0] * 6)
-    print(f"旧式一步目标: 最大步长 {step:.2f}° -> {'接受' if ok else '0x0200'}")
-    if ok or step <= STEP_LIMIT:
-        print("FAIL 旧式一步居然没触发")
+    chunked = [s for s in segs if "/" in str(s.get("label", ""))]
+    print("计划段数:", len(segs), [s["label"] for s in segs])
+    if chunked:
+        print(f"FAIL 仍有 {len(chunked)} 段 5° 拆段")
         return 1
+    max_step = max(max(abs(a - b) for a, b in zip(s["q_target"], s["q_from"]))
+                   for s in segs)
+    print(f"单段最大目标步长 {max_step:.2f}°（21.4 允许 >5°）")
 
-    new = StepDrive(Q0)
-    for s in segs:
-        ok, step = new.command(s["q_target"])
-        if not ok:
-            print(f"FAIL {s['label']} 步长 {step:.2f}° 仍超 {STEP_LIMIT}°")
-            return 1
-    print(f"新式拆段: 最大步长 {new.max_step:.2f}°，无 0x0200")
-    for i, n in enumerate(NAMES):
-        old_step = abs(Q0[i])
-        print(f"  {n}: 旧一步 {old_step:.2f}°；新拆段最大 "
-              f"{max(abs(s['q_target'][i] - s['q_from'][i]) for s in segs):.2f}°")
-
-    # 让 MockJointBus 真正走完拆段，验证不是只检查数字
+    # 让 MockJointBus 真正走完计划
     m2 = make_motion(Q0)
     segs2 = m2.plan_home(Q0)
     try:
         m2.execute(segs2, preview=False)
     except Exception as exc:  # noqa: BLE001
-        print("FAIL Mock 执行拆段失败:", exc)
+        print("FAIL Mock 执行失败:", exc)
         return 1
     q_end = [m2.bus.q[n] for n in NAMES]
     err = max(abs(v) for v in q_end)
@@ -87,7 +60,7 @@ def main():
     if err > 0.8:
         print("FAIL Mock 没有走到零位")
         return 1
-    print("PASS 离线仿真通过")
+    print("PASS 离线仿真通过（21.4 不拆段）")
     return 0
 
 

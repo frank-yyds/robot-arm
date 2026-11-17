@@ -273,9 +273,10 @@ p = e.park(preview=True, prereq=park_prereq())
 q_expected = e._park_q_at_z(130.5, 90.0)
 check("20.8 预演画实际下降终点", [round(v, 3) for v in p["preview"]["q"]] ==
       [round(v, 3) for v in q_expected], str(p["preview"]["q"]))
-check("20.8 网页说明教的点只决定左右侧",
-      "只决定左右侧" in p["descent"]["note"] and
-      "只决定左右侧" in e.state()["park"]["descent"]["note"])
+check("20.8 网页说明教的点的作用（J1 左右侧 / J4–J6 腕姿）",
+      "J1 决定左右侧" in p["descent"]["note"] and
+      "J4–J6" in p["descent"]["note"] and
+      "J1 决定左右侧" in e.state()["park"]["descent"]["note"])
 path = p["preview"]["park"]["descent_path"]
 check("20.8 预演路径是实际下降轨迹", len(path) > 2 and path[0][2] > path[-1][2],
       f"{len(path)} 点，z {path[0][2]:.1f}→{path[-1][2]:.1f}")

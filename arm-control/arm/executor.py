@@ -49,7 +49,10 @@ from urllib.parse import parse_qs, urlparse
 
 from . import config as cfgmod
 from . import gravity
+from . import programs as progmod
+from . import sweep as sweepmod
 from .calib import CalibSession
+from .collision import CollisionMonitor
 from .fence import Fence
 from .joints import JointBus, StartupRefused, load_joint_configs
 from .kinematics import RobotModel
@@ -86,6 +89,9 @@ class Executor:
         self.hb_timeout = float(self.cfg.get("heartbeat_timeout_s", 0.5))
         self.control_stale = float(self.cfg.get("control_stale_s", 3.0))
         self.exec_mode = self.cfg.get("default_exec_mode", "preview")
+        # 21.4.4：全局速度倍率；第一次上真机默认 50%，网页可调
+        self.speed_scale = max(0.05, min(1.0, float(
+            self.cfg.get("motion_speed_scale", 0.5))))
         self.config_version = cfgmod.config_version()
         self.config_info = cfgmod.config_versions()
         self.web_version = self._read_web_version()
@@ -147,6 +153,22 @@ class Executor:
         self.drag_active = False
         self.measurements: list[dict] = []
         self._measure_path = self.runs_dir / "measure.csv"
+
+        # 22.2 往返扫描标定 / 22.4 关键点录放 / 22.3 碰撞残差记录
+        self.sweep_runner = None
+        self.program_store = progmod.ProgramStore(
+            self._path(self.cfg.get("programs_dir", "programs")))
+        # state 是 20 Hz 推送，不能每拍扫 programs/*.json
+        try:
+            self._program_names_cache = self.program_store.list()
+        except Exception:  # noqa: BLE001
+            self._program_names_cache = []
+        self.program_points: list[dict] = []
+        self.program_loaded: dict | None = None
+        self.program_status = {"active": False, "phase": "idle", "name": "",
+                               "loops": 0, "loop": 0, "point": 0,
+                               "reason": "", "started": None, "finished": None}
+        self.collision: CollisionMonitor | None = None
         self._measure_header = False
         self._web_state_lock = threading.Lock()
 
@@ -235,6 +257,7 @@ class Executor:
             **self.config_info,
             "exec_mode": self.exec_mode,
             "default_exec_mode": self.cfg.get("default_exec_mode", "preview"),
+            "speed_scale": round(float(self.speed_scale), 3),
             "state_push_hz": self.push_hz,
             "trace_hz": self.trace_hz,
             "trace_seconds": self.trace_seconds,
@@ -324,6 +347,10 @@ class Executor:
         if self._park_thread and self._park_thread.is_alive():
             return True
         if self._exec_thread and self._exec_thread.is_alive():
+            return True
+        if self.sweep_runner and self.sweep_runner.status.get("active"):
+            return True
+        if self.program_status.get("active"):
             return True
         return bool(self.motion and self.motion.status.get("busy"))
 
@@ -427,6 +454,10 @@ class Executor:
                                  note=f"connect {self.mode} {self.ip}")
         self.motion = Motion(self.bus, self.robot, self.fence, self.limits,
                              recorder=self.recorder)
+        # 22.3 第一阶段：只记录，不参与中止；钩子只入队，计算在后台线程
+        self.collision = CollisionMonitor(self)
+        self.collision.start()
+        self.motion.add_hook(self.collision.feed)
         self.motion.preset = self.tcp_preset
         self.motion.yaw_deg = self.yaw_deg
         self.preview_motion.preset = self.tcp_preset
@@ -436,12 +467,14 @@ class Executor:
         return {"ok": self.connected, "mode": self.mode, "report": rep,
                 "msg": self.msg, "config_version": self.config_version}
 
-    def start_trace(self, hz: float = 100.0, seconds: float = 10.0) -> dict:
+    def start_trace(self, hz: float = 100.0, seconds: float = 10.0,
+                    joints=None, status_hz: float = 5.0) -> dict:
         if self.trace and self.trace.status().get("active"):
             raise MotionError("高频采样已经在跑")
         if not isinstance(self.bus, JointBus) or not self.connected:
             raise MotionError("高频采样需要真机连接（模拟模式没有真实 ECB 总线）")
-        self.trace = TraceSampler(self, hz=hz, seconds=seconds)
+        self.trace = TraceSampler(self, hz=hz, seconds=seconds, joints=joints,
+                                  status_hz=status_hz)
         self.trace.start()
         self.msg = f"高频采样开始：{hz:g} Hz / {seconds:g} s"
         return self.trace.status()
@@ -455,6 +488,17 @@ class Executor:
 
     def disconnect(self):
         self._park_stop.set()
+        if self.sweep_runner and self.sweep_runner.status.get("active"):
+            try:
+                self.sweep_runner.stop()
+            except Exception:  # noqa: BLE001
+                pass
+        if self.collision:
+            try:
+                self.collision.close()
+            except Exception:  # noqa: BLE001
+                pass
+            self.collision = None
         if self.trace:
             try:
                 self.trace.stop()
@@ -660,6 +704,20 @@ class Executor:
                      "check": self._park_check(q),
                      "block": self.park_block},
             "kt": {"rows": self.kt_rows, "kt": self.kt},
+            "sweep": (dict(getattr(self.sweep_runner, "status", {}))
+                      if self.sweep_runner else
+                      {"active": False, "phase": "idle", "joint": None,
+                       "samples": 0, "fit": None}),
+            "programs": {"names": list(self._program_names_cache),
+                         "recorded": self.program_points,
+                         "loaded": (None if not self.program_loaded else
+                                    {"name": self.program_loaded.get("name"),
+                                     "points": len(self.program_loaded.get("points") or []),
+                                     "end_effector": self.program_loaded.get("end_effector"),
+                                     "payload_kg": self.program_loaded.get("payload_kg")}),
+                         "replay": dict(self.program_status)},
+            "collision": (dict(self.collision.status) if self.collision else
+                          {"enabled": False, "phase": "idle", "flags": 0}),
             "control": {
                 "owner": self.owner,
                 "age_s": None if not self.owner else round(now - self.last_hb, 2),
@@ -686,6 +744,10 @@ class Executor:
             raise MotionError(self.config_stale_msg or "配置已变，请重新连接")
         if self.drag_active:
             raise MotionError("零扭矩拖动中，先“锁定保持”再执行")
+        if self.sweep_runner and self.sweep_runner.status.get("active"):
+            raise MotionError("22.2 扫描标定进行中，先按停")
+        if self.program_status.get("active"):
+            raise MotionError("22.4 程序回放进行中，先按停")
         if self.calib.active:
             raise MotionError("校准会话进行中，先结束校准")
         if not self.motion or not self.connected:
@@ -737,7 +799,7 @@ class Executor:
         step = float(pk.get("descent_step_mm") or 1.0)
         pk["descent"] = {
             "start_z": 168.0, "min_z": z_min, "step_mm": step,
-            "note": ("教的点目前只决定左右侧；实际下降按固定公式从 z=168 到 "
+            "note": ("教的点：J1 决定左右侧、J4–J6 决定腕姿；下降高度按固定公式从 z=168 到 "
                      f"{z_min:.1f}，每 {step:g} mm 一步"),
         }
         return pk
@@ -786,6 +848,7 @@ class Executor:
             m.limit_a = {k: v for k, v in limits.items() if v is not None}
             m.kt = self.kt
             m.j2_bracket = self.j2_bracket
+            m.speed_scale = float(self.speed_scale)
 
     def capacities(self) -> dict:
         cap = gravity.capacities(
@@ -860,6 +923,46 @@ class Executor:
                     (self.park_cfg.get("restart_check_deg") or 2.0)),
                 "max_diff_deg": round(d, 2), "diffs": diffs, "parked_q": parked,
                 "ts": (self.park_state or {}).get("ts", "")}
+
+    def ik_all(self, target, axis=(0.0, 0.0, -1.0), yaw=None,
+               preset=None, free_yaw: bool = False) -> dict:
+        """22.1：列出解析逆解（法兰位姿精修后），并过滤围栏/力矩。
+
+        返回项带 branch（肩 A/B、肘 ±、腕 ±）、q、残差、相对当前角变化。
+        """
+        m = self.planning_motion()
+        q0 = m.read_q()
+        preset = preset or self.tcp_preset
+        use_yaw = None if free_yaw else (self.yaw_deg if yaw is None else yaw)
+        sols = self.robot.ik_all(
+            target, axis, use_yaw, seed_deg=q0, preset=preset,
+            limits=self.limits, time_budget_s=4.0)
+        out = []
+        for sol in sols:
+            q = sol["q_deg"]
+            reason = ""
+            try:
+                fr = self.fence.check(q, preset, 0.0 if free_yaw else float(use_yaw or 0.0),
+                                      False, self.limits)
+                if not fr.ok:
+                    reason = "围栏：" + "；".join(fr.reasons)
+            except Exception as exc:  # noqa: BLE001
+                reason = f"围栏检查失败：{exc}"
+            try:
+                bad = gravity.check_q(
+                    self.robot, q, self.end_effector, self.payload_kg,
+                    {k: v for k, v in self.current_limits().items() if v},
+                    self.kt, j2_bracket=self.j2_bracket)
+                if bad and not reason:
+                    b0 = bad[0]
+                    reason = (f"力矩：{b0['joint']} {b0['tau']:+.2f} N·m "
+                              f"> 0.8×{b0['capacity']:.2f}")
+            except Exception as exc:  # noqa: BLE001
+                reason = reason or f"力矩检查失败：{exc}"
+            if reason:
+                continue
+            out.append({**sol, "ok": True})
+        return {"ok": True, "solutions": out, "selected": (out[0] if out else None)}
 
     def plan_click(self, x: float, y: float, z: float = 20.0,
                    yaw: float | None = None) -> dict:
@@ -969,7 +1072,9 @@ class Executor:
             self._exec_thread.start()
         return {"ok": True, "started": True, "preview": preview}
 
-    def jog(self, joint: str, delta: float, preview: bool = False) -> dict:
+    def jog(self, joint: str, delta: float, preview: bool = False,
+            speed_deg_s: float | None = None,
+            single_target: bool = False) -> dict:
         self._reject_if_parking()
         if not preview:
             self._ready_for_motion()
@@ -990,7 +1095,11 @@ class Executor:
         if not preview:
             m.begin_command()
         try:
-            segs = m._plan_move(q, q2, f"点动 {joint}{delta:+.0f}°", False)
+            segs = m._plan_move(
+                q, q2, f"点动 {joint}{delta:+.0f}°", False,
+                max_step_deg=(180.0 if single_target else None))
+            if speed_deg_s is not None:
+                m.cap_speeds(segs, speed_deg_s)
         except Exception as exc:
             with m._lock:
                 m.status.update({"busy": False, "phase": "error",
@@ -1192,7 +1301,7 @@ class Executor:
         self.preview = preview_payload(pseudo, self.robot, self.fence,
                                        self.tcp_preset, self.yaw_deg)
         self.preview["offline"] = not self.use_actual()
-        note = ("教的点目前只决定左右侧；实际下降按固定公式从 z=168 到 "
+        note = ("教的点：J1 决定左右侧、J4–J6 决定腕姿；下降高度按固定公式从 z=168 到 "
                 f"{z_min:.1f}，每 {float(self.park_cfg.get('descent_step_mm') or 1.0):g} mm 一步")
         # 20.8：给网页画一条实际会走的下降路径（TCP 点，z 每 4 mm 一个）
         path = []
@@ -1251,7 +1360,7 @@ class Executor:
             pk["version"] = "2026-11-12.1"
         cfgmod.save_park(pk)
         self.park_cfg = pk
-        self.msg = ("停机位置已记录（教的点目前只决定左右侧；实际下降按固定公式）："
+        self.msg = ("停机位置已记录（教的点：J1 决定左右侧、J4–J6 决定腕姿；下降高度按公式）："
                     + " ".join(f"{n}{v:+.1f}" for n, v in zip(self.robot.joint_names, q)))
         return {"ok": True, "q": [round(float(v), 4) for v in q],
                 "park_side": int(pk["park_side"]),
@@ -1519,6 +1628,17 @@ class Executor:
         return {"ok": True, "started": True,
                 "msg": "抬回预停机点；离开搁架后可以把搁架拿走"}
 
+    def set_speed_scale(self, scale: float) -> dict:
+        """21.4.4：全局速度倍率（0.05…1.0）；只影响之后的规划。"""
+        v = max(0.05, min(1.0, float(scale)))
+        self.speed_scale = v
+        self._sync_motion_params()
+        self.pending = None
+        self.preview = None
+        self._home_preview = None
+        self.msg = f"全局速度倍率 {v * 100:.0f}%（之后规划生效）"
+        return {"ok": True, "speed_scale": v, "msg": self.msg}
+
     def recover(self) -> dict:
         """16.4 第 7 条：中止后保持状态的出口“恢复”。"""
         self._reject_if_parking()
@@ -1560,6 +1680,202 @@ class Executor:
         self.preview = None
         self.msg = "扶持停机：已六颗一起失能"
         return {"ok": bool(ok)}
+
+    # ---------------- 22.2 往返扫描标定 ----------------
+    def sweep_plan(self, joint: str) -> dict:
+        """只规划不运动：明天真机先用这个确认三条扫描路径都不会被拦。"""
+        if not self.motion:
+            raise MotionError("还没连接")
+        return sweepmod.plan_sweep(self.motion, str(joint).upper())
+
+    def sweep_status(self) -> dict:
+        return {"ok": True, **(dict(self.sweep_runner.status)
+                               if self.sweep_runner else
+                               {"active": False, "phase": "idle"})}
+
+    def start_sweep(self, joint: str, speed_deg_s: float = 3.0,
+                    save: bool = True) -> dict:
+        self._reject_if_parking()
+        j = str(joint).upper()
+        if j not in sweepmod.SWEEP_JOBS:
+            raise MotionError("扫描只支持 J2 / J3 / J4（J5 等夹爪装回）")
+        if sweepmod.SWEEP_JOBS[j].get("defer"):
+            raise MotionError(f"{j}：{sweepmod.SWEEP_JOBS[j]['note']}")
+        self._ready_for_motion()
+        if self.sweep_runner and self.sweep_runner.status.get("active"):
+            raise MotionError("22.2 扫描已经在跑")
+        with self._exec_lock:
+            if self._exec_thread and self._exec_thread.is_alive():
+                raise MotionError("另一个执行线程还在跑，先按停")
+            runner = sweepmod.SweepRunner(self, j, speed_deg_s, save)
+            self.sweep_runner = runner
+            self.motion.begin_command()
+            th = runner.start()
+            self._exec_thread = th
+        self.msg = f"22.2 {j} 扫描开始：{speed_deg_s:g}°/s"
+        return {"ok": True, "sweep": self.sweep_status()}
+
+    def stop_sweep(self) -> dict:
+        if not self.sweep_runner:
+            return {"ok": True, "sweep": self.sweep_status()}
+        self.sweep_runner.stop()
+        self.msg = "22.2 扫描按停"
+        return {"ok": True, "sweep": self.sweep_status()}
+
+    def sweep_save_fit(self) -> dict:
+        """把当前 runner 的拟合结果写进 config/kt.json（判据不过也允许存，标 ok=false）。"""
+        if not self.sweep_runner or not self.sweep_runner.status.get("fit"):
+            raise MotionError("还没有扫描拟合结果")
+        fit = dict(self.sweep_runner.status["fit"])
+        j = fit.get("joint") or self.sweep_runner.joint
+        data = dict(self.kt or {})
+        data[j] = {k: v for k, v in fit.items() if k != "checks"}
+        data["date"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        gravity.save_kt(data)
+        self.kt = gravity.load_kt()
+        self._sync_motion_params()
+        return {"ok": bool(fit.get("ok")), "kt": self.kt.get(j),
+                "fit": fit, "capacities": self.capacities()}
+
+    # ---------------- 22.4 关键点示教录放 ----------------
+    def program_record(self, name: str = "", dwell_s: float = 0.0) -> dict:
+        if not self.motion or not self.connected:
+            raise MotionError("还没连接")
+        if not getattr(self.bus, "startup_done", False):
+            raise MotionError("还没使能，不能读关节角")
+        if self.park_active or self.program_status.get("active"):
+            raise MotionError("停机/回放进行中，不能记点")
+        q = self.motion.read_q()
+        i = len(self.program_points)
+        pt = {"name": str(name or f"p{i + 1}"), "q_deg": [round(float(v), 5) for v in q],
+              "speed_scale": 1.0, "dwell_s": max(0.0, float(dwell_s)),
+              "gripper": None}
+        self.program_points.append(pt)
+        self.msg = f"22.4 已记第 {i + 1} 点 {pt['name']}"
+        return {"ok": True, "point": pt, "recorded": self.program_points}
+
+    def program_clear(self) -> dict:
+        self.program_points = []
+        return {"ok": True, "recorded": []}
+
+    def _refresh_program_names(self):
+        try:
+            self._program_names_cache = self.program_store.list()
+        except Exception:  # noqa: BLE001
+            self._program_names_cache = []
+        return self._program_names_cache
+
+    def program_list(self) -> dict:
+        return {"ok": True, "names": self._refresh_program_names(),
+                "recorded": self.program_points}
+
+    def program_save(self, name: str, overwrite: bool = True) -> dict:
+        if not self.program_points:
+            raise MotionError("还没有记点")
+        r = self.program_store.save(name, self.program_points,
+                                    self.end_effector, float(self.payload_kg or 0.0),
+                                    overwrite=overwrite)
+        self.msg = f"22.4 程序已存：{r['name']}（{r['points']} 点）"
+        return {**r, "names": self._refresh_program_names()}
+
+    def program_load(self, name: str) -> dict:
+        d = self.program_store.load(name)
+        fails = progmod.validate_program(self.motion, d) if self.motion else []
+        if fails:
+            self.program_loaded = None
+            detail = "；".join(f"第 {f['index']} 点：{f['reason']}" for f in fails[:6])
+            raise MotionError(f"载入被拒：{detail}")
+        self.program_loaded = d
+        self.msg = f"22.4 已载入 {d.get('name')}（{len(d.get('points') or [])} 点）"
+        warn = ""
+        if (d.get("end_effector") != self.end_effector
+                or abs(float(d.get("payload_kg") or 0.0)
+                       - float(self.payload_kg or 0.0)) > 1e-9):
+            warn = (f"程序和当前末端/载荷不同：录制时 {d.get('end_effector')} "
+                    f"+{d.get('payload_kg')} kg，现在 {self.end_effector} "
+                    f"+{self.payload_kg} kg；回放要确认")
+        return {"ok": True, "program": {
+            "name": d.get("name"), "points": len(d.get("points") or []),
+            "end_effector": d.get("end_effector"),
+            "payload_kg": d.get("payload_kg")},
+            "warn": warn, "names": self._refresh_program_names()}
+
+    def program_replay(self, name: str = "", loops: int = 1,
+                       preview: bool = False, confirmed: bool = False,
+                       only_index: int | None = None) -> dict:
+        self._reject_if_parking()
+        self._ready_for_motion(allow_hold=True)
+        if self.program_status.get("active"):
+            raise MotionError("22.4 回放已经在跑")
+        prog = self.program_loaded
+        if not name and prog:
+            name = prog.get("name")
+        if not name:
+            raise MotionError("缺程序名")
+        if not prog or prog.get("name") != name:
+            prog = self.program_store.load(name)
+            fails = progmod.validate_program(self.motion, prog)
+            if fails:
+                detail = "；".join(f"第 {f['index']} 点：{f['reason']}" for f in fails[:6])
+                raise MotionError(f"载入被拒：{detail}")
+            self.program_loaded = prog
+        mismatch = (prog.get("end_effector") != self.end_effector
+                    or abs(float(prog.get("payload_kg") or 0.0)
+                           - float(self.payload_kg or 0.0)) > 1e-9)
+        if mismatch and not confirmed:
+            raise MotionError("程序和当前末端/载荷不同；确认后加 confirmed=true 再回放")
+        q_now = self.motion.read_q()
+        steps = progmod.plan_replay(self.motion, prog, q_now,
+                                    float(self.speed_scale),
+                                    None if only_index is None else int(only_index) - 1)
+        if not steps:
+            raise MotionError("程序没有可回放的点")
+        if preview:
+            return {"ok": True, "preview": True, "name": name, "loops": loops,
+                    "steps": [{"point": s["point_index"], "name": s["point_name"],
+                               "segments": len(s["segments"])} for s in steps]}
+        with self._exec_lock:
+            if self._exec_thread and self._exec_thread.is_alive():
+                raise MotionError("另一个执行线程还在跑，先按停")
+            self.program_status.update({
+                "active": True, "phase": "running", "name": name,
+                "loops": max(1, int(loops)), "loop": 0, "point": 0,
+                "reason": "", "started": time.time(), "finished": None})
+            self.motion.begin_command()
+            th = threading.Thread(target=self._run_program,
+                                  args=(steps, max(1, int(loops)), name),
+                                  daemon=True, name="program-replay")
+            self._exec_thread = th
+            th.start()
+        self.msg = f"22.4 回放开始：{name}（{len(steps)} 点 × {max(1, int(loops))} 遍）"
+        return {"ok": True, "replay": dict(self.program_status)}
+
+    def _run_program(self, steps, loops, name):
+        m = self.motion
+        st = self.program_status
+        try:
+            for loop in range(loops):
+                st["loop"] = loop + 1
+                for step in steps:
+                    st["point"] = step["point_index"]
+                    for seg in step["segments"]:
+                        if m._stop.is_set():
+                            m._abort("22.4 回放按停")
+                        m.execute([seg], preview=False, clear_stop=False)
+                    dwell = float(step.get("dwell_s") or 0.0)
+                    if dwell > 0:
+                        end = time.monotonic() + dwell
+                        while time.monotonic() < end:
+                            if m._stop.is_set():
+                                m._abort("22.4 回放按停")
+                            time.sleep(0.05)
+            st.update({"active": False, "phase": "done", "finished": time.time(),
+                       "reason": ""})
+            self.msg = f"22.4 回放完成：{name}"
+        except Exception as exc:  # noqa: BLE001
+            st.update({"active": False, "phase": "aborted",
+                       "reason": str(exc), "finished": time.time()})
+            self.msg = f"22.4 回放中止：{exc}"
 
     # ---------------- 18.4 Kt 标定 ----------------
     def kt_points(self) -> dict:
@@ -2123,6 +2439,10 @@ class Handler(BaseHTTPRequestHandler):
             if p == "/api/trace/status":
                 return self._json(200, {"ok": True,
                                         "trace": (EXEC.trace.status() if EXEC.trace else None)})
+            if p == "/api/sweep/status":
+                return self._json(200, EXEC.sweep_status())
+            if p == "/api/program/list":
+                return self._json(200, EXEC.program_list())
             return self._static(p)
         except Exception as exc:  # noqa: BLE001
             return self._json(500, {"ok": False, "error": str(exc)})
@@ -2160,7 +2480,9 @@ class Handler(BaseHTTPRequestHandler):
                 except (TypeError, ValueError) as exc:
                     raise MotionError(f"hz/seconds 不是数字：{exc}")
                 return self._json(200, {"ok": True,
-                                        "trace": EXEC.start_trace(hz, sec)})
+                                        "trace": EXEC.start_trace(
+                                            hz, sec, body.get("joints"),
+                                            float(body.get("status_hz") or 5.0))})
             if p == "/api/trace/stop":
                 EXEC.require_control(body)
                 return self._json(200, {"ok": True, "trace": EXEC.stop_trace()})
@@ -2286,6 +2608,12 @@ class Handler(BaseHTTPRequestHandler):
                     EXEC.msg = f"已使能，但读姿态失败：{exc}"
                 return self._json(200, {"ok": True, "report": rep, "msg": EXEC.msg,
                                         "park_check": check})
+            if p == "/api/ik_all":
+                b = body
+                return self._json(200, EXEC.ik_all(
+                    b.get("target"), b.get("axis", (0, 0, -1)),
+                    b.get("yaw"), b.get("preset"),
+                    bool(b.get("free_yaw", False))))
             if p == "/api/plan_click":
                 EXEC.require_control(body)
                 return self._json(200, EXEC.plan_click(
@@ -2301,9 +2629,12 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, EXEC.execute(body.get("preview")))
             if p == "/api/jog":
                 EXEC.require_control(body)
-                return self._json(200, EXEC.jog(body["joint"],
-                                                float(body.get("delta", 1.0)),
-                                                bool(body.get("preview", False))))
+                sp = body.get("speed_deg_s")
+                return self._json(200, EXEC.jog(
+                    body["joint"], float(body.get("delta", 1.0)),
+                    bool(body.get("preview", False)),
+                    speed_deg_s=(None if sp is None else float(sp)),
+                    single_target=bool(body.get("single_target", False))))
             if p == "/api/home":
                 EXEC.require_control(body)
                 return self._json(200, EXEC.home(bool(body.get("preview", False))))
@@ -2369,6 +2700,40 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, EXEC.support_park(bool(body.get("confirmed"))))
             if p == "/api/debug/page_state":
                 return self._json(200, EXEC.load_web_state())
+            if p == "/api/sweep/plan":
+                return self._json(200, {"ok": True,
+                                        "plan": EXEC.sweep_plan(body.get("joint"))})
+            if p == "/api/sweep/start":
+                EXEC.require_control(body)
+                return self._json(200, EXEC.start_sweep(
+                    body.get("joint"), float(body.get("speed_deg_s", 3.0)),
+                    bool(body.get("save", True))))
+            if p == "/api/sweep/stop":
+                EXEC.require_control(body)
+                return self._json(200, EXEC.stop_sweep())
+            if p == "/api/sweep/save":
+                EXEC.require_control(body)
+                return self._json(200, EXEC.sweep_save_fit())
+            if p == "/api/program/record":
+                EXEC.require_control(body)
+                return self._json(200, EXEC.program_record(
+                    str(body.get("name") or ""), float(body.get("dwell_s", 0.0))))
+            if p == "/api/program/clear":
+                EXEC.require_control(body)
+                return self._json(200, EXEC.program_clear())
+            if p == "/api/program/save":
+                EXEC.require_control(body)
+                return self._json(200, EXEC.program_save(
+                    str(body.get("name") or ""), bool(body.get("overwrite", True))))
+            if p == "/api/program/load":
+                EXEC.require_control(body)
+                return self._json(200, EXEC.program_load(str(body.get("name") or "")))
+            if p == "/api/program/replay":
+                EXEC.require_control(body)
+                return self._json(200, EXEC.program_replay(
+                    str(body.get("name") or ""), int(body.get("loops", 1)),
+                    bool(body.get("preview", False)), bool(body.get("confirmed")),
+                    body.get("point") if body.get("point") is not None else None))
             if p == "/api/kt/points":
                 return self._json(200, EXEC.kt_points())
             if p == "/api/kt/goto":
@@ -2418,6 +2783,10 @@ class Handler(BaseHTTPRequestHandler):
                     EXEC.motion.yaw_deg = EXEC.yaw_deg
                 EXEC.preview_motion.yaw_deg = EXEC.yaw_deg
                 return self._json(200, {"ok": True, "yaw": EXEC.yaw_deg})
+            if p == "/api/speed_scale":
+                EXEC.require_control(body)
+                return self._json(200, EXEC.set_speed_scale(
+                    float(body.get("scale", 0.5))))
             if p == "/api/exec_mode":
                 EXEC.require_control(body)
                 EXEC._reject_if_parking()

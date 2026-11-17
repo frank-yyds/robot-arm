@@ -3,7 +3,7 @@ import { OrbitControls } from './vendor/OrbitControls.js';
 import { TransformControls } from './vendor/TransformControls.js';
 
 // 每次改网页都同时改这里和 web/version.json；刷新后右上角应显示这个版本
-const WEB_VERSION = '2026-11-15.10';
+const WEB_VERSION = '2026-11-16.5';
 const webverEl = document.getElementById('pill-webver');
 if (webverEl) webverEl.textContent = `网页 v${WEB_VERSION}`;
 
@@ -581,6 +581,8 @@ async function init() {
       }
     } catch (_) { /* 没有 version.json 就算了 */ }
     EXEC_MODE = CONFIG.exec_mode || 'preview';
+    const sc = document.getElementById('speed-scale');
+    if (sc && CONFIG.speed_scale != null) sc.value = String(CONFIG.speed_scale);
     if (CONFIG.park && CONFIG.park.shelf) buildPark(CONFIG.park.shelf);
     log(`执行器 config_version = ${CONFIG_VERSION}`, 'g');
   } catch (e) {
@@ -941,10 +943,14 @@ function updateUI(s) {
     else ps.textContent = '还没有计划：拖到可达点或点网格。';
     ps.style.color = s.has_plan && owner ? '#6bffb0' : '#8a9bb0';
   }
+  const ikb = document.getElementById('btn-ik-all');
+  if (ikb) ikb.disabled = !owner || !s.preview || !(s.preview.target);
   $('btn-home').disabled = busy || !owner || unsafe || stale;
   $('btn-home-plan').disabled = !s.connected || !owner || busy || unsafe || !s.startup_done || stale;
   $('mode-preview').disabled = !owner;
   $('mode-direct').disabled = !owner || !s.connected;
+  const ss = document.getElementById('speed-scale');
+  if (ss) ss.disabled = !owner;
   document.querySelectorAll('#jog button').forEach((b) => { b.disabled = !owner || unsafe; });
 
   const tb = document.querySelector('#joints tbody');
@@ -1060,7 +1066,130 @@ function updateUI(s) {
   } else {
     holdWarnAt = null;
   }
+  updateSweep(s);
+  updatePrograms(s);
 }
+
+// ---------------------------------------------------------------------------
+// 22.2 / 22.4 面板
+// ---------------------------------------------------------------------------
+function updateSweep(s) {
+  const w = s.sweep || {};
+  const owner = isOwner(s);
+  const active = !!w.active;
+  const el = document.getElementById('sweep-status');
+  if (el) {
+    let t = '未运行';
+    if (active) t = `扫描中 · ${w.joint || ''} · ${w.phase || ''} · ${w.samples || 0} 样本`;
+    else if (w.phase === 'done') t = `完成 · ${w.joint} · ${w.samples} 样本`;
+    else if (w.phase === 'aborted') t = `中止 · ${w.reason || ''}`;
+    if (w.warnings && w.warnings.length) t += ` · ${w.warnings.join('；')}`;
+    if (w.fit) t += ` · Kt ${w.fit.kt_eff} / f ${w.fit.i_fric} / δ ${w.fit.zero_offset_deg}° / R² ${w.fit.r2}`;
+    el.textContent = t;
+    el.style.color = w.phase === 'aborted' ? '#ff8a8a' : (active ? '#ffd166' : '#8a9bb0');
+  }
+  const bp = $('btn-sweep-plan'), bs = $('btn-sweep-start'), bst = $('btn-sweep-stop');
+  if (bp) bp.disabled = !s.connected || active || !owner;
+  if (bs) bs.disabled = !s.connected || !s.startup_done || active || !owner || s.config_stale;
+  if (bst) bst.disabled = !active;
+}
+
+function updatePrograms(s) {
+  const p = s.programs || {};
+  const owner = isOwner(s);
+  const active = !!(p.replay && p.replay.active);
+  const sel = document.getElementById('program-list');
+  if (sel) {
+    const cur = sel.value;
+    const names = (p.names || []).map((x) => x.name);
+    sel.innerHTML = names.length ? names.map((n) =>
+      `<option value="${n}">${n}</option>`).join('') : '<option value="">（还没有程序）</option>';
+    if (cur && names.includes(cur)) sel.value = cur;
+  }
+  const rec = (p.recorded || []).length;
+  const el = document.getElementById('program-status');
+  if (el) {
+    let t = `本次已记 ${rec} 点`;
+    if (p.loaded) t += ` · 已载入 ${p.loaded.name}（${p.loaded.points} 点）`;
+    if (p.replay && p.replay.phase !== 'idle') t += ` · 回放 ${p.replay.phase} ${p.replay.name || ''} ${p.replay.loop || 0}/${p.replay.loops || 0} 第${p.replay.point || 0}点`;
+    if (p.replay && p.replay.reason) t += ` · ${p.replay.reason}`;
+    el.textContent = t;
+    el.style.color = (p.replay && p.replay.phase === 'aborted') ? '#ff8a8a' : (active ? '#ffd166' : '#8a9bb0');
+  }
+  const ok = s.connected && s.startup_done && owner && !active;
+  ['btn-prog-record', 'btn-prog-clear', 'btn-prog-save'].forEach((id) => {
+    const b = $(id); if (b) b.disabled = !ok || (id === 'btn-prog-save' && !rec);
+  });
+  ['btn-prog-load', 'btn-prog-preview', 'btn-prog-replay'].forEach((id) => {
+    const b = $(id); if (b) b.disabled = !ok;
+  });
+}
+
+$('btn-sweep-plan')?.addEventListener('click', async () => {
+  try {
+    const joint = document.getElementById('sweep-joint').value;
+    const r = await postRaw('/api/sweep/plan', { joint });
+    const p = r.plan || {};
+    const box = document.getElementById('sweep-plan');
+    if (box) box.innerHTML = kv([
+      ['结果', p.ok ? '两程都可规划' : '被拦（见下）', p.ok ? 'ok' : 'bad'],
+      ['起点→终点', p.ok ? `${p.start}° → ${p.end}°` : '—'],
+      ['段数', p.ok ? `去 ${p.checks.out_segments} / 回 ${p.checks.back_segments}` : '—'],
+      ['路径点最大间隔°', p.ok ? (p.checks.path_checks || []).map((x) => x.max_step_deg).join(' / ') : '—'],
+      ['最大力矩/容量', p.ok ? `${(p.checks.torque_max_ratio * 100).toFixed(1)}%` : '—'],
+      ['原因', p.reason || (p.warnings || []).join('；') || '—', p.ok ? '' : 'bad'],
+    ]);
+    log(p.ok ? `22.2 ${joint} 路径预检通过` : `22.2 ${joint} 路径被拦：${p.reason}`,
+      p.ok ? 'g' : 'b');
+  } catch (e) { log('22.2 预检失败：' + e.message, 'b'); }
+});
+
+$('btn-sweep-start')?.addEventListener('click', async () => {
+  const joint = document.getElementById('sweep-joint').value;
+  if (!confirm(`开始 22.2 ${joint} 扫描？其余关节会先摆到规定姿态，再以 3°/s 往返。`)) return;
+  try {
+    await apiPost('/api/sweep/start', { joint, speed_deg_s: 3.0, save: true });
+    log(`22.2 ${joint} 扫描开始`, 'g');
+  } catch (e) { log('扫描启动失败：' + e.message, 'b'); }
+});
+$('btn-sweep-stop')?.addEventListener('click', async () => {
+  try { await apiPost('/api/sweep/stop'); } catch (e) { log('停止失败：' + e.message, 'b'); }
+});
+
+$('btn-prog-record')?.addEventListener('click', async () => {
+  try {
+    const r = await apiPost('/api/program/record', {});
+    log(`已记第 ${r.recorded.length} 点`, 'g');
+  } catch (e) { log('记点失败：' + e.message, 'b'); }
+});
+$('btn-prog-clear')?.addEventListener('click', async () => {
+  try { await apiPost('/api/program/clear'); log('本次点已清空', 'g'); }
+  catch (e) { log('清空失败：' + e.message, 'b'); }
+});
+$('btn-prog-save')?.addEventListener('click', async () => {
+  const name = document.getElementById('program-name').value.trim();
+  if (!name) { log('先填程序名', 'w'); return; }
+  try { const r = await apiPost('/api/program/save', { name }); log(`已存 ${r.name}（${r.points} 点）`, 'g'); }
+  catch (e) { log('保存失败：' + e.message, 'b'); }
+});
+$('btn-prog-load')?.addEventListener('click', async () => {
+  const name = document.getElementById('program-list').value;
+  if (!name) return;
+  try { const r = await apiPost('/api/program/load', { name }); log(`已载入 ${name}`, 'g'); if (r.warn) log(r.warn, 'w'); }
+  catch (e) { log('载入被拒：' + e.message, 'b'); }
+});
+async function replayProgram(preview) {
+  const name = document.getElementById('program-list').value;
+  if (!name) { log('先选程序', 'w'); return; }
+  const loops = Math.max(1, Number(document.getElementById('program-loops').value || 1));
+  try {
+    const r = await apiPost('/api/program/replay',
+      { name, loops, preview, confirmed: true });
+    log(preview ? `预演 ${r.steps.length} 点` : `回放开始 ${name} ×${loops}`, 'g');
+  } catch (e) { log('回放失败：' + e.message, 'b'); }
+}
+$('btn-prog-preview')?.addEventListener('click', () => replayProgram(true));
+$('btn-prog-replay')?.addEventListener('click', () => replayProgram(false));
 
 // ---------------------------------------------------------------------------
 // 按钮
@@ -1430,6 +1559,47 @@ yawEl.addEventListener('change', async () => {
     $('yaw-val').textContent = `${yawEl.value}°`;
     lastReach = null;
     if (gizmoOn) scheduleReachCheck();
+  } catch (e) { log(e.message, 'b'); }
+});
+
+$('btn-ik-all')?.addEventListener('click', async () => {
+  const p = STATE && STATE.preview;
+  if (!p || !p.target) { log('先点网格或拖出一个目标', 'w'); return; }
+  try {
+    const r = await postRaw('/api/ik_all', {
+      target: p.target, axis: [0, 0, -1],
+      yaw: Number(document.getElementById('yaw').value),
+      preset: STATE.tcp_preset, free_yaw: false,
+    });
+    const sols = r.solutions || [];
+    if (!sols.length) { $('ik-solutions').innerHTML = '<span class="muted">没有通过筛选的解</span>'; return; }
+    $('ik-solutions').innerHTML = sols.map((x, i) => {
+      const b = x.branch || {};
+      const q = (x.q_deg || []).map((v) => Number(v).toFixed(1)).join(' ');
+      return `<div class="row" style="align-items:flex-start;gap:6px;margin:4px 0">` +
+        `<button class="btn" data-ik="${i}" style="flex:0 0 auto">预演</button>` +
+        `<div style="font-size:11px;line-height:1.5">` +
+        `<b>${i === 0 ? '默认 ' : ''}肩 ${b.shoulder} / 肘 ${b.elbow} / 腕 ${b.wrist}</b>` +
+        `，变化 ${x.max_change_deg}°，残差 ${x.pos_err_mm} mm<br>q = ${q}</div></div>`;
+    }).join('');
+    document.querySelectorAll('#ik-solutions [data-ik]').forEach((b) => {
+      b.addEventListener('click', async () => {
+        const x = sols[Number(b.dataset.ik)];
+        try {
+          await apiPost('/api/move_joints', { q: x.q_deg, preview: true });
+          log(`解析解 ${b.dataset.ik}：已生成预演`, 'g');
+        } catch (e) { log('预演失败：' + e.message, 'b'); }
+      });
+    });
+    log(`解析解 ${sols.length} 组，默认第 1 组`, 'g');
+  } catch (e) { log('解析解失败：' + e.message, 'b'); }
+});
+
+$('speed-scale')?.addEventListener('change', async () => {
+  const scale = Number(document.getElementById('speed-scale').value);
+  try {
+    const r = await apiPost('/api/speed_scale', { scale });
+    log(`全局速度倍率 → ${Math.round((r.speed_scale ?? scale) * 100)}%（之后规划生效）`, 'g');
   } catch (e) { log(e.message, 'b'); }
 });
 

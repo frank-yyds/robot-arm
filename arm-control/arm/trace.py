@@ -15,13 +15,17 @@ import threading
 import time
 from pathlib import Path
 
-from .sca import (DEG_PER_MOTOR_TURN, IQ24, R_CURRENT, R_ERROR,
-                  R_POSITION, R_VELOCITY, VELOCITY_FULL_RPM)
+from .sca import (DEG_PER_MOTOR_TURN, IQ24, R_CURRENT, R_ERROR, R_MODE,
+                  R_POSITION, R_POWER, R_VELOCITY, VELOCITY_FULL_RPM)
 
 
 class TraceSampler:
-    def __init__(self, ex, hz: float = 100.0, seconds: float = 10.0):
+    def __init__(self, ex, hz: float = 100.0, seconds: float = 10.0,
+                 joints=None, status_hz: float = 5.0):
         self.ex = ex
+        self.joints = ([str(x).upper() for x in joints] if joints else None)
+        # 0x2B power / 0x55 mode 的采样频率；默认 5 Hz，诊断掉使能时可调到 10 Hz
+        self.status_hz = max(0.5, min(float(status_hz or 5.0), float(hz)))
         self.hz = max(5.0, min(200.0, float(hz)))
         self.seconds = max(1.0, min(60.0, float(seconds)))
         self.path: Path | None = None
@@ -81,7 +85,7 @@ class TraceSampler:
 
     def _run(self):
         bus = self.ex.bus
-        order = list(bus.order)
+        order = [n for n in (self.joints or list(bus.order)) if n in bus.motors]
         cm: dict[str, float | None] = {}
         # 电流满量程 0x53 只读一次；读不到就记 None
         for n in order:
@@ -91,6 +95,7 @@ class TraceSampler:
                 cm[n] = None
         ids = {n: bus.motors[n].mid for n in order}
         period = 1.0 / self.hz
+        status_every = max(1, int(round(self.hz / self.status_hz)))
         t0 = time.monotonic()
         next_t = t0
         last_sample = t0
@@ -101,7 +106,7 @@ class TraceSampler:
                 w = csv.writer(f)
                 w.writerow(["time", "t_rel", "sample", "joint", "pos_deg",
                             "target_deg", "current_a", "velocity_deg_s",
-                            "error", "dt_s"])
+                            "error", "power", "mode", "dt_s"])
                 f.flush()
                 while not self._stop.is_set():
                     tick += 1
@@ -119,6 +124,9 @@ class TraceSampler:
                             items.append((mid, R_VELOCITY, 4))
                         if tick % 5 == 0:
                             items.append((mid, R_ERROR, 2))
+                        if tick % status_every == 0:
+                            items.append((mid, R_POWER, 1))
+                            items.append((mid, R_MODE, 1))
                     try:
                         got = bus.link.read_many(items, timeout=0.03, retries=1)
                     except Exception as exc:  # noqa: BLE001
@@ -147,6 +155,10 @@ class TraceSampler:
                         err = None
                         if e and len(e) >= 2:
                             err = struct.unpack(">H", e)[0]
+                        pw = got.get((mid, R_POWER))
+                        power = pw[0] if pw else None
+                        md = got.get((mid, R_MODE))
+                        mode = md[0] if md else None
                         w.writerow([tstamp, f"{tr:.4f}",
                                     tick, n,
                                     "" if pos is None else f"{pos:.4f}",
@@ -154,6 +166,8 @@ class TraceSampler:
                                     "" if cur is None else f"{cur:.4f}",
                                     "" if vel is None else f"{vel:.3f}",
                                     "" if err is None else f"0x{err:04X}",
+                                    "" if power is None else str(power),
+                                    "" if mode is None else str(mode),
                                     f"{dt:.4f}"])
                     self.samples = tick
                     if tick % 10 == 0:

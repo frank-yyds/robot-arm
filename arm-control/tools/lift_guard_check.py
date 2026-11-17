@@ -44,11 +44,14 @@ def main():
         if not vertical:
             print("FAIL 搁架姿态生成了非竖直/大跳计划:", lift)
             return 1
-        if step > 5.0 + 1e-6:
-            print(f"FAIL 搁架姿态单段 {step:.2f}° >5°")
+        # 21.4：普通动作不再按 5° 拆段；这里只要求没有“n/n”拆段标签，
+        # 且抬高解本身是原 XY/原工具轴/竖直 ≤5°。
+        chunked = [s for s in segs if "/" in str(s.get("label", ""))]
+        if chunked:
+            print(f"FAIL 搁架姿态仍有 {len(chunked)} 段 5° 拆段")
             return 1
         print(f"PASS 搁架姿态只做竖直抬高 {lift['jump_deg']:.2f}°，"
-              f"单段 ≤{step:.2f}°")
+              f"共 {len(segs)} 段，单段最大 {step:.2f}°（21.4 不再拆段）")
     try:
         segs = make_motion([0] * 6).plan_home([0] * 6)
     except Exception as exc:  # noqa: BLE001

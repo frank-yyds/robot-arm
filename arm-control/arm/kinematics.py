@@ -152,6 +152,21 @@ class RobotModel:
         # 零位时各 link 原点（B 系，mm）：用于把简化几何转成 link 局部坐标
         f = self.fk_frames([0.0] * 6)
         self.zero_origins = {k: v[:3, 3].copy() for k, v in f.items()}
+        # 22.1 解析逆解的长度，从 URDF 取，不抄名义值
+        self.ik_geo = self._ik_geometry()
+
+    def _ik_geometry(self) -> dict:
+        j = self.joints
+        return {
+            "d1": float(j["J1"].origin[2, 3]),
+            "a2": float(j["J3"].origin[2, 3]),
+            "a3": float(j["J4"].origin[2, 3]),
+            "d4": float(j["J2"].origin[1, 3] + j["J4"].origin[1, 3]
+                        + j["J5"].origin[1, 3]),
+            "d5": float(j["J6"].origin[2, 3]),
+            "d6": float(j["flange"].origin[1, 3]),
+            "R6F": j["flange"].origin[:3, :3].copy(),
+        }
 
     # ---------------- 解析 ----------------
     def _parse(self) -> None:
@@ -366,6 +381,159 @@ class RobotModel:
         if best is None:
             raise RuntimeError("IK 没有产生结果")
         return best
+
+    @staticmethod
+    def _norm_deg(a: float) -> float:
+        return (float(a) + 180.0) % 360.0 - 180.0
+
+    def ik_analytic_flange(self, p_flange, R_flange,
+                           limits=None) -> list[dict]:
+        """22.1：解析逆解（法兰位姿 → 最多 8 组关节角）。
+
+        公式按 16.1 的关节表/本模型几何推的，和 UR 的 DH 约定不同：
+        J2/J3/J4 轴平行于 y，J5 竖直，J6 平行于 J4；R_6F = flange 固定旋转。
+        返回原始解，不精修；branch 标注肩 A/B、肘 ±、腕 ±。
+        """
+        g = self.ik_geo
+        d1, a2, a3 = g["d1"], g["a2"], g["a3"]
+        d4, d5, d6, R6F = g["d4"], g["d5"], g["d6"], g["R6F"]
+        lo, hi = self._limit_arrays(limits)
+        p = np.asarray(p_flange, dtype=float)
+        R = np.asarray(R_flange, dtype=float)
+        R6 = R @ R6F.T
+        a = R6[:, 1]
+        p6 = p - d6 * a
+        r = math.hypot(float(p6[0]), float(p6[1]))
+        if r < d4 - 1e-9:
+            return []
+        ratio = min(1.0, max(-1.0, d4 / max(r, 1e-12)))
+        phi = math.atan2(float(p6[1]), float(p6[0]))
+        alpha = math.asin(ratio)
+        out: list[dict] = []
+        for si, q1 in enumerate((phi - alpha, phi - math.pi + alpha)):
+            R1 = rot_z(-q1) @ R6
+            c5 = min(1.0, max(-1.0, float(R1[1, 1])))
+            for wi, q5 in enumerate((math.acos(c5), -math.acos(c5))):
+                s5 = math.sin(q5)
+                if abs(s5) < 1e-6:
+                    continue   # 腕奇异，这一支跳过
+                q6 = math.atan2(float(R1[1, 2]) / s5, float(R1[1, 0]) / s5)
+                theta = math.atan2(float(R1[2, 1]) / s5,
+                                   -float(R1[0, 1]) / s5)
+                p6p = rot_z(-q1) @ p6
+                x = float(p6p[0]) - d5 * math.sin(theta)
+                z = float(p6p[2]) - d1 - d5 * math.cos(theta)
+                c3 = (x * x + z * z - a2 * a2 - a3 * a3) / (2.0 * a2 * a3)
+                if abs(c3) > 1.0 + 1e-9:
+                    continue
+                c3 = min(1.0, max(-1.0, c3))
+                for ei, q3 in enumerate((math.acos(c3), -math.acos(c3))):
+                    q2 = (math.atan2(x, z)
+                          - math.atan2(a3 * math.sin(q3),
+                                       a2 + a3 * math.cos(q3)))
+                    q4 = theta - q2 - q3
+                    q = [self._norm_deg(math.degrees(v)) for v in
+                         (q1, q2, q3, q4, q5, q6)]
+                    # 解析解只保留在软限位内的；边界允差 1e-6
+                    if any(q[i] < lo[i] - 1e-6 or q[i] > hi[i] + 1e-6
+                           for i in range(6)):
+                        continue
+                    out.append({
+                        "q_deg": q,
+                        "branch": {
+                            "shoulder": "A" if si == 0 else "B",
+                            "elbow": "+" if ei == 0 else "−",
+                            "wrist": "+" if wi == 0 else "−",
+                        },
+                    })
+        return out
+
+    def _refine_flange(self, p_f, R_f, q0, lo, hi, max_iters=30):
+        """把解析解按法兰位姿做数值精修（全姿态 6 维）。"""
+        target = np.asarray(p_f, dtype=float)
+        Rt = np.asarray(R_f, dtype=float)
+
+        def err(q):
+            T = self.flange(q)
+            ep = target - T[:3, 3]
+            er = rotvec(T[:3, :3].T @ Rt)
+            return np.concatenate([ep, er * 50.0])
+
+        def err_raw(q):
+            T = self.flange(q)
+            pe = float(np.linalg.norm(target - T[:3, 3]))
+            re = math.degrees(float(np.linalg.norm(
+                rotvec(T[:3, :3].T @ Rt))))
+            return pe, re
+
+        q, pe, re = self._dls(np.clip(np.asarray(q0, float), lo, hi),
+                              err, err_raw, lo, hi, max_iters, jac=None)
+        return q, pe, re
+
+    def ik_all(self, target_mm, tool_axis_b=(0.0, 0.0, -1.0),
+               yaw_deg: float | None = 0.0,
+               seed_deg: Iterable[float] | None = None,
+               preset: str = "probe",
+               limits: tuple[np.ndarray, np.ndarray] | None = None,
+               max_iters: int = 30, pos_tol_mm: float = 0.2,
+               axis_tol_deg: float = 0.5, sweep_step_deg: float = 10.0,
+               time_budget_s: float = 4.0) -> list[dict]:
+        """22.1：解析解当种子 → 法兰位姿精修 → 去重，返回全部可用解。
+
+        这里的 yaw 是**法兰绕工具轴的滚转**：R_f = orient_from_axis(axis, yaw)。
+        yaw=None 时每 sweep_step_deg 取一个滚转，所有解放一起；默认按
+        “相对当前关节角变化最大的那个最小”排序。preset 的 L 只平移目标点。
+        """
+        axis = np.asarray(tool_axis_b, dtype=float)
+        axis = axis / max(float(np.linalg.norm(axis)), 1e-12)
+        seed = np.asarray(seed_deg if seed_deg is not None else [0.0] * 6,
+                          dtype=float)
+        lo, hi = self._limit_arrays(limits)
+        L = float((self.tcp_presets.get(preset) or {}).get("L_mm", 0.0))
+        target = np.asarray(target_mm, dtype=float)
+        t_start = time.monotonic()
+        yaws = ([float(yaw_deg)] if yaw_deg is not None else
+                [float(v) for v in np.arange(0.0, 360.0,
+                                             max(1.0, sweep_step_deg))])
+        out: list[dict] = []
+        seen: list[np.ndarray] = []
+        for yaw in yaws:
+            R_f = orient_from_axis(axis, yaw)
+            p_f = target - R_f[:, 2] * L
+            for item in self.ik_analytic_flange(p_f, R_f, limits):
+                if time.monotonic() - t_start > float(time_budget_s):
+                    break
+                q0 = np.clip(np.asarray(item["q_deg"], float), lo, hi)
+                if any(float(np.max(np.abs(q0 - s))) < 0.5 for s in seen):
+                    continue
+                q, pe, re = self._refine_flange(p_f, R_f, q0, lo, hi,
+                                                max_iters=max_iters)
+                qn = np.asarray([self._norm_deg(v) for v in q], float)
+                if pe > float(pos_tol_mm) or re > float(axis_tol_deg):
+                    continue
+                if any(float(np.max(np.abs(qn - s))) < 0.5 for s in seen):
+                    continue
+                seen.append(qn)
+                out.append({
+                    "q_deg": [round(float(v), 4) for v in qn],
+                    "pos_err_mm": round(float(pe), 4),
+                    "axis_err_deg": round(float(re), 4),
+                    "branch": item["branch"],
+                    "yaw_deg": round(float(yaw), 1),
+                    "max_change_deg": round(float(np.max(np.abs(qn - seed))), 3),
+                })
+        # yaw 自由时绕工具轴的滚转主要由 q6 吸收；同一组 q1..q5 的 36 个
+        # 滚转等价，只保留“相对当前关节角变化最大”最小的那个 q6。
+        groups: dict[tuple, dict] = {}
+        for item in out:
+            key = tuple(round(float(v), 1) for v in item["q_deg"][:5])
+            old = groups.get(key)
+            if old is None or item["max_change_deg"] < old["max_change_deg"]:
+                groups[key] = item
+        out = list(groups.values())
+        out.sort(key=lambda x: (x["max_change_deg"], x["pos_err_mm"],
+                                x["axis_err_deg"]))
+        return out
 
     def _limit_arrays(self, limits):
         if limits is None:

@@ -100,6 +100,8 @@ class MockJointBus:
         self.error_bits: dict[str, int] = {}
         self.force_mode: dict[str, int] = {}
         self.current_override: dict[str, float] = {}
+        # 22.2 自检：按已知 Kt/摩擦/零偏生成电流。fn(name, q_dict, v_dict) -> A
+        self.current_fn = None
         self.current_limit_readback: dict[str, float | None] = {
             n: 3.0 for n in self.order}
         self.mock_fault_log: list[str] = []
@@ -173,13 +175,19 @@ class MockJointBus:
         key = (name, cmd)
         if self.delay_rounds.get(key, 0) > 0:
             self.delay_rounds[key] -= 1
-            self.mock_fault_log.append(f"delay {name} cmd=0x{cmd:02X}")
+            self._fault_log(f"delay {name} cmd=0x{cmd:02X}")
             return True
         p = float(self.drop_prob.get(cmd, 0.0))
         if p > 0 and random.random() < p:
-            self.mock_fault_log.append(f"drop {name} cmd=0x{cmd:02X}")
+            self._fault_log(f"drop {name} cmd=0x{cmd:02X}")
             return True
         return False
+
+    def _fault_log(self, msg: str):
+        # 长跑时每次丢包都记一条会无限涨内存；只留最近 2000 条
+        self.mock_fault_log.append(msg)
+        if len(self.mock_fault_log) > 2000:
+            del self.mock_fault_log[:-2000]
 
     def set_faults(self, silent=None, drop=None, delay=None, error_bits=None,
                    limits=None, mode=None, currents=None):
@@ -239,6 +247,15 @@ class MockJointBus:
                 mode_lost = self._lost(n, R_MODE)
                 error_lost = self._lost(n, R_ERROR)
                 enabled = (self.enabled and n not in self.off)
+                cur_a = self.current_override.get(n)
+                if cur_a is None and self.current_fn is not None:
+                    try:
+                        cur_a = float(self.current_fn(n, dict(self.q), dict(self.v)))
+                    except Exception:  # noqa: BLE001
+                        cur_a = 0.0
+                if cur_a is None:
+                    cur_a = 0.0
+                full_scale = 33.0
                 out[n] = JointState(
                     name=n, id=c.id,
                     enabled=None if power_lost else enabled,
@@ -248,7 +265,9 @@ class MockJointBus:
                     error=None if error_lost else err,
                     error_text="" if error_lost else ("报警" if err else "正常"),
                     current_a=(None if full and self._lost(n, R_CURRENT_LIMIT)
-                               else self.current_override.get(n, 0.0)),
+                               else cur_a),
+                    current_raw=int(round(cur_a / full_scale * (1 << 24))),
+                    current_full_scale_a=full_scale,
                     voltage_v=24.0, temp_c=30.0,
                     mode=None if mode_lost else self.force_mode.get(
                         n, MODE_PROFILE_POSITION),
@@ -342,20 +361,22 @@ class MockJointBus:
         names = list(names or self.order)
         if not self.enabled:
             return [(n, "读到了但 power=0") for n in names]
+
+        def read12(n, cmd):
+            # 20.2：和真机 JointBus 一样，单颗最多 12 次短重试
+            for _ in range(12):
+                if not self._lost(n, cmd):
+                    return 1 if cmd == R_POWER else self.force_mode.get(
+                        n, MODE_PROFILE_POSITION)
+            return None
+
         bad = []
         for n in names:
             if n in self.silent:
                 bad.append((n, "读不到电源(0x2B)和模式(0x55)"))
                 continue
-            p = None if self._lost(n, R_POWER) else 1
-            m = None if self._lost(n, R_MODE) else self.force_mode.get(
-                n, MODE_PROFILE_POSITION)
-            # 模拟“单独再问一次”
-            if p is None:
-                p = None if self._lost(n, R_POWER) else 1
-            if m is None:
-                m = None if self._lost(n, R_MODE) else self.force_mode.get(
-                    n, MODE_PROFILE_POSITION)
+            p = read12(n, R_POWER)
+            m = read12(n, R_MODE)
             if p is None and m is None:
                 bad.append((n, "读不到电源(0x2B)和模式(0x55)"))
             elif p is None:

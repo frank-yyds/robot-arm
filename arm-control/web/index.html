@@ -143,6 +143,16 @@
           <button id="mode-direct" class="btn">直接执行</button>
         </div>
         <div class="hint" id="mode-hint">预演：只算不发，点“执行”也只画预览。</div>
+        <div class="row">
+          <span class="muted" style="font-size:11px">速度倍率</span>
+          <select id="speed-scale" style="width:110px">
+            <option value="0.25">25%</option>
+            <option value="0.5" selected>50%</option>
+            <option value="0.75">75%</option>
+            <option value="1">100%</option>
+          </select>
+        </div>
+        <div class="hint">21.4：全局速度倍率，默认 50%。只影响之后的规划；实际速度还会受每关节 20°/s 上限约束。</div>
         <div class="row two">
           <button id="btn-exec" class="btn primary" disabled>执行</button>
           <button id="btn-stop" class="btn danger" disabled>停</button>
@@ -178,6 +188,48 @@
         <div class="hint" style="color:#ff8a8a">紧急失能不走搁架停机，任何姿态都立即断使能；必须先把臂支撑/扶住。能用停机/扶持停机时优先用它们。</div>
         <div class="hint" id="park-hint">停机 = 搁架接住 → 按 J6→J1 失能。预演模式只算不动，切“直接执行”再点停机才会动；下降前 J4/J5/J6 腕部自动转到你教的停机姿态（poses.park[3:6]，现在 J4≈45.5°、J5≈0°；要固定别的角度就填 descent_q4_deg/descent_j5_deg/descent_j6_deg）。扶持停机是备用（要人扶住零位）。</div>
         <div class="hint" id="motion-hint">空格键 = 停（任何状态）。</div>
+      </section>
+
+      <section class="card">
+        <h3>22.2 往返扫描标定</h3>
+        <div class="row">
+          <select id="sweep-joint" style="width:90px">
+            <option value="J2" selected>J2</option>
+            <option value="J3">J3</option>
+            <option value="J4">J4</option>
+          </select>
+          <button id="btn-sweep-plan" class="btn" disabled>只预检路径</button>
+        </div>
+        <div class="hint">3°/s 匀速往返；J2 首选 −30°→+80°，被拦就退回 0°。J5 等夹爪装回。</div>
+        <div class="row two">
+          <button id="btn-sweep-start" class="btn primary" disabled>开始扫描</button>
+          <button id="btn-sweep-stop" class="btn danger" disabled>停止扫描</button>
+        </div>
+        <div class="hint" id="sweep-status">未运行</div>
+        <div id="sweep-plan" class="kv"></div>
+      </section>
+
+      <section class="card">
+        <h3>22.4 关键点录放</h3>
+        <div class="row">
+          <input id="program-name" placeholder="程序名" spellcheck="false">
+          <button id="btn-prog-save" class="btn" disabled>保存</button>
+        </div>
+        <div class="row two">
+          <button id="btn-prog-record" class="btn" disabled>记当前点</button>
+          <button id="btn-prog-clear" class="btn" disabled>清空本次点</button>
+        </div>
+        <div class="row">
+          <select id="program-list" style="flex:1"></select>
+          <button id="btn-prog-load" class="btn" disabled>载入</button>
+        </div>
+        <div class="row">
+          <span class="muted" style="font-size:11px">回放遍数</span>
+          <input id="program-loops" type="number" min="1" max="20" value="1" style="width:64px">
+          <button id="btn-prog-preview" class="btn" disabled>预演</button>
+          <button id="btn-prog-replay" class="btn primary" disabled>回放</button>
+        </div>
+        <div class="hint" id="program-status">录 5 点 → 保存 → 载入 → 回放；载入前逐点过限位/围栏/力矩。</div>
       </section>
 
       <section class="card">
@@ -218,6 +270,9 @@
       <section class="card">
         <h3>本次点击</h3>
         <div id="target-info" class="kv"><span class="muted">还没有点击</span></div>
+        <button id="btn-ik-all" class="btn" style="width:100%;margin-top:6px" disabled>列出解析解（8 组）</button>
+        <div id="ik-solutions" class="kv" style="margin-top:6px"></div>
+        <div class="hint">解析解按“相对当前姿态变化最大的关节最小”排序；肩 A/B、肘 ±、腕 ± 是分支标记。点某组可只预演那组姿态。</div>
       </section>
 
       <section class="card">

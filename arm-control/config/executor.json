@@ -17,5 +17,7 @@
   "control_stale_s": 0.0,
   "control_stale_note": "0 = 不自动释放控制权；只有 /api/release（页面关闭）或重启执行器释放",
   "default_exec_mode": "preview",
-  "mock_on_start": false
+  "mock_on_start": false,
+  "motion_speed_scale": 0.5,
+  "motion_speed_scale_note": "21.4.4 全局速度倍率，第一次上真机默认 50%，网页可调（0.25/0.5/0.75/1.0）"
 }

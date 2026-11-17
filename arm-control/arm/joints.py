@@ -66,6 +66,8 @@ class JointState:
     error: int | None = None
     error_text: str = ""
     current_a: float | None = None
+    current_raw: int | None = None
+    current_full_scale_a: float | None = None
     voltage_v: float | None = None
     temp_c: float | None = None
     mode: int | None = None
@@ -82,6 +84,8 @@ class JointState:
             "out_deg": r(self.out_deg), "pos_turns": r(self.pos_turns, 5),
             "target_deg": r(self.target_deg), "error": self.error,
             "error_text": self.error_text, "current_a": r(self.current_a),
+            "current_raw": self.current_raw,
+            "current_full_scale_a": r(self.current_full_scale_a, 2),
             "voltage_v": r(self.voltage_v, 2), "temp_c": r(self.temp_c, 1),
             "mode": self.mode, "current_limit_a": r(self.current_limit_a, 2),
             "speed_limit_rpm": r(self.speed_limit_rpm, 1),
@@ -498,6 +502,8 @@ class JointBus:
                     md = u(R_MODE, ">B")
                     st.mode = md
                     cur = u(R_CURRENT, ">i")
+                    st.current_raw = cur
+                    st.current_full_scale_a = cm
                     st.current_a = None if cur is None or cm is None else cur / IQ24 * cm
                     cl = u(R_CURRENT_LIMIT, ">i")
                     if cl is not None and cm is not None:

@@ -117,6 +117,11 @@ python3 -m arm.executor --mock --port 8770   # 无硬件模拟
 
 ```bash
 python3 tools/kinematics_selfcheck.py
+python3 tools/gravity_selfcheck.py
+python3 tools/task21_selfcheck.py     # 21.1 运动循环按停回归（segment/chunks/到位等待/停机/心跳）
+python3 tools/task21_mode6_test.py --yes  # 21.3 真机模式 6 单目标大角度试验（用户在场）
+python3 tools/ik_analytic_check.py    # 22.1 解析逆解：2000 随机回代/漏解/数值对比
+python3 tools/j3_hold_stress.py --yes --cycles 20  # J3-HOLD 压测（真机）
 PYTHONPATH=../innfos-backup/_tools/pylibs python3 tools/probe_model.py
 ```
 

@@ -98,6 +98,12 @@ class Motion:
         self.limits = (np.asarray(limits[0], float), np.asarray(limits[1], float))
         self.recorder = recorder
         self.poll_hz = max(10.0, float(poll_hz))
+        # 21.4：全局速度倍率；第一次上真机默认 50%，网页可调
+        self.speed_scale = 1.0
+        # 22.2 / 22.3：回读后钩子（扫描采样、碰撞残差记录）。钩子异常一律吞掉，
+        # 不允许影响运动循环；真正的重活由钩子自己丢到后台线程。
+        self.hooks: list = []
+        self.brake_comp_enabled = False
         self.order = list(bus.order)
         self.preset = "probe"
         self.yaw_deg = 0.0
@@ -129,6 +135,29 @@ class Motion:
 
     def read_states(self):
         return self.bus.read_all(full=False)
+
+    def add_hook(self, fn):
+        """注册回读钩子：fn(states, cmd_q, cmd_vel, phase, label, elapsed, duration)。
+
+        phase = "run" / "end"。钩子必须自己保证不阻塞（22.3 用后台线程）。
+        """
+        if fn not in self.hooks:
+            self.hooks.append(fn)
+
+    def remove_hook(self, fn):
+        try:
+            self.hooks.remove(fn)
+        except ValueError:
+            pass
+
+    def _call_hooks(self, states, cmd_q, cmd_vel, phase: str, label: str = "",
+                    elapsed: float = 0.0, duration: float = 0.0):
+        for fn in list(self.hooks):
+            try:
+                fn(states, cmd_q, cmd_vel, phase, label, elapsed, duration)
+            except Exception:  # noqa: BLE001
+                # 22.3 的硬要求：任何残差/记录异常都不能影响运动循环
+                pass
 
     def q_dict(self, q) -> dict[str, float]:
         return {n: float(v) for n, v in zip(self.order, q)}
@@ -187,11 +216,19 @@ class Motion:
         q1 = np.asarray(q_target, float)
         # 目标先查
         fr = self._check_q(q1, descend, relax_below_z)
-        # 中间 10 点；起点另外由 _plan_move 的 start_problem 检查
-        for p in self._interp(q0, q1, 10)[1:]:
-            self._check_q(p, descend, relax_below_z)
+        # 21.4：取消 5° 拆段后，围栏/限位/力矩的中间点密度不能降：
+        # 按位移最大的关节 ≤0.5° 插点（原来固定 10 点，大动作只到几度一个点）。
         d = q1 - q0
-        vmax = np.array([self.bus.cfg[n].motion_speed_deg_s for n in self.order])
+        maxd = float(np.max(np.abs(d))) if np.max(np.abs(d)) > 0 else 0.0
+        n_int = max(1, int(math.ceil(maxd / 0.5)))
+        pts = self._interp(q0, q1, n_int)
+        for p in pts[1:]:
+            self._check_q(p, descend, relax_below_z)
+        steps = [float(np.max(np.abs(pts[k + 1] - pts[k])))
+                 for k in range(len(pts) - 1)]
+        max_step = max(steps) if steps else 0.0
+        scale = max(0.05, min(1.0, float(getattr(self, "speed_scale", 1.0))))
+        vmax = np.array([self.bus.cfg[n].motion_speed_deg_s for n in self.order]) * scale
         T = max(0.5, float(np.max(np.abs(d) / vmax))) if np.max(np.abs(d)) > 0 else 0.5
         vel = {}
         acc = {}
@@ -210,12 +247,20 @@ class Motion:
             "acc_deg_s2": {k: round(v, 3) for k, v in acc.items()},
             "fence": fr,
             "near_limit": self._near_limit(q1),
+            # 21.4.3：围栏/限位/力矩中间点密度的可核对记录（按位移最大关节
+            # ≤0.5° 插点，170° 的动作应有 ≥340 个间隔）。
+            "path_check": {
+                "n_points": len(pts),
+                "max_step_deg": round(float(max_step), 4),
+                "target_max_err_deg": round(float(maxd), 4),
+            },
         }
 
     # ---------------- 规划 ----------------
     def _plan_move(self, q0, q1, label: str, descend: bool = False,
                    allow_outside_start: bool = False,
-                   relax_below_z: float | None = None) -> list[dict]:
+                   relax_below_z: float | None = None,
+                   max_step_deg: float | None = None) -> list[dict]:
         """18.2 第 2 条：被力矩预检拒绝的路径自动重试一次（远端先收）。
 
         中间点 = q1 的 q4–q6 + q0 的 q1–q3：先把腕走到目标，再走大臂。
@@ -227,23 +272,26 @@ class Motion:
                 raise StartFenceError(
                     "起点在围栏外（" + problem + "）：只允许零扭矩拖动，"
                     "或先“竖直抬高”再回零；普通目标一律拒绝")
-        # 先按 5° 拆段：驱动对一次下发的目标阶跃有硬保护（0x0200），
-        # 不能把 0° 直接甩给 80° 外的关节。
-        q0a = np.asarray(q0, float)
-        q1a = np.asarray(q1, float)
-        maxd = float(np.max(np.abs(q1a - q0a)))
-        if maxd > MAX_TARGET_STEP_DEG + 1e-9:
-            n = int(math.ceil(maxd / MAX_TARGET_STEP_DEG))
-            out: list[dict] = []
-            prev = q0a.copy()
-            for k in range(1, n + 1):
-                qmid = q0a + (q1a - q0a) * (k / n)
-                out.extend(self._plan_move(
-                    prev, qmid, f"{label} {k}/{n}", descend,
-                    allow_outside_start=(allow_outside_start or k > 1),
-                    relax_below_z=relax_below_z))
-                prev = qmid
-            return out
+        # 21.4 主方案：不再按 5° 拆段。21.3 已实测模式 6 下单目标 8/12/20/40°
+        # 都不报 0x0200；普通动作一段、一次写终点，由驱动自己规划 S 曲线。
+        # max_step_deg 参数保留给旧的试验工具，不再默认拆段。
+        if max_step_deg is not None and float(max_step_deg) > 0:
+            q0a = np.asarray(q0, float)
+            q1a = np.asarray(q1, float)
+            maxd = float(np.max(np.abs(q1a - q0a)))
+            step = float(max_step_deg)
+            if maxd > step + 1e-9:
+                n = int(math.ceil(maxd / step))
+                out: list[dict] = []
+                prev = q0a.copy()
+                for k in range(1, n + 1):
+                    qmid = q0a + (q1a - q0a) * (k / n)
+                    out.extend(self._plan_move(
+                        prev, qmid, f"{label} {k}/{n}", descend,
+                        allow_outside_start=(allow_outside_start or k > 1),
+                        relax_below_z=relax_below_z, max_step_deg=step))
+                    prev = qmid
+                return out
         try:
             return [self._plan_joint(q0, q1, label, descend, relax_below_z)]
         except TorqueError as exc:
@@ -256,6 +304,30 @@ class Motion:
                 except TorqueError as e2:
                     last = e2
             raise last
+
+    def cap_speeds(self, segments: list[dict], speed_deg_s: float) -> list[dict]:
+        """把已规划段的速度上限压到 speed_deg_s（21.3 真机试验用 10°/s）。
+
+        只改 vel/acc/T，不改目标、围栏和力矩检查；网页正常点动不调用。
+        """
+        cap = abs(float(speed_deg_s))
+        if cap <= 0:
+            return segments
+        for seg in segments:
+            d = np.asarray(seg["q_target"], float) - np.asarray(seg["q_from"], float)
+            vel = dict(seg.get("vel_deg_s") or {})
+            acc = dict(seg.get("acc_deg_s2") or {})
+            for i, n in enumerate(self.order):
+                v = min(float(vel.get(n, cap)), cap)
+                vel[n] = v
+                acc[n] = min(float(acc.get(n, v / 0.5)),
+                             v / max(self.bus.cfg[n].motion_accel_time_s, 0.05))
+            seg["vel_deg_s"] = {k: round(float(v), 3) for k, v in vel.items()}
+            seg["acc_deg_s2"] = {k: round(float(v), 3) for k, v in acc.items()}
+            seg["T"] = round(max(0.5, max(
+                abs(float(d[i])) / max(float(vel[n]), 0.1)
+                for i, n in enumerate(self.order))), 3)
+        return segments
 
     def _split_move(self, q0, q1, label, descend, relax_below_z,
                     first: str, note: str) -> list[dict]:
@@ -298,20 +370,46 @@ class Motion:
         try:
             q0 = self.read_q() if q_from is None else list(q_from)
             use_yaw = None if free_yaw else self.yaw_deg
-            kw = {"max_iters": 60, "time_budget_s": 0.6} if fast else {}
-            res = self.robot.ik(target_mm, tool_axis, use_yaw, q0,
-                                self.preset, (self.limits[0], self.limits[1]),
-                                pos_tol_mm=pos_tol_mm, **kw)
-            if not res.ok:
-                tx, ty, tz = (round(float(v), 1) for v in target_mm)
-                raise MotionError(
-                    f"IK 无解（目标 {tx},{ty},{tz}；偏航{'自由' if free_yaw else '锁 0°'}）："
-                    f"残差 {res.pos_err_mm:.2f} mm / 轴 {res.axis_err_deg:.2f}°；"
-                    "往可达区拖，或勾“偏航自由”再试")
-            segs = self._plan_move(q0, res.q_deg, label, descend,
-                                   allow_outside_start, relax_below_z)
-            segs[-1]["ik"] = res.as_dict()
-            return segs
+            # 22.1：解析解当种子，按“相对当前姿态变化最大者最小”排序；
+            # 逐个过限位/围栏/力矩，第一个通过的就用它规划。
+            sols = self.robot.ik_all(
+                target_mm, tool_axis, use_yaw, seed_deg=q0, preset=self.preset,
+                limits=(self.limits[0], self.limits[1]),
+                pos_tol_mm=pos_tol_mm,
+                time_budget_s=(1.5 if fast else 4.0))
+            failures: list[str] = []
+            for sol in sols:
+                try:
+                    segs = self._plan_move(q0, sol["q_deg"], label, descend,
+                                           allow_outside_start, relax_below_z)
+                except MotionError as exc:
+                    failures.append(str(exc))
+                    continue
+                segs[-1]["ik"] = {
+                    **sol, "branch": sol.get("branch"),
+                    "selected_by": "解析解：变化最大关节最小",
+                }
+                return segs
+            if not sols:
+                kw = {"max_iters": 60, "time_budget_s": 0.6} if fast else {}
+                res = self.robot.ik(target_mm, tool_axis, use_yaw, q0,
+                                    self.preset,
+                                    (self.limits[0], self.limits[1]),
+                                    pos_tol_mm=pos_tol_mm, **kw)
+                if not res.ok:
+                    tx, ty, tz = (round(float(v), 1) for v in target_mm)
+                    raise MotionError(
+                        f"IK 无解（目标 {tx},{ty},{tz}；偏航{'自由' if free_yaw else '锁 0°'}）："
+                        f"残差 {res.pos_err_mm:.2f} mm / 轴 {res.axis_err_deg:.2f}°；"
+                        "往可达区拖，或勾“偏航自由”再试")
+                segs = self._plan_move(q0, res.q_deg, label, descend,
+                                       allow_outside_start, relax_below_z)
+                segs[-1]["ik"] = res.as_dict()
+                return segs
+            tx, ty, tz = (round(float(v), 1) for v in target_mm)
+            raise MotionError(
+                f"IK 解析解 {len(sols)} 组都过不了围栏/限位/力矩"
+                f"（目标 {tx},{ty},{tz}）：" + "；".join(failures[:3]))
         finally:
             self.preset, self.yaw_deg = old_preset, old_yaw
 
@@ -621,6 +719,12 @@ class Motion:
 
     def _abort(self, reason: str):
         """中止 = 原地保持；只有六颗全部读不到（通信完全断）才全部失能。"""
+        # 22.3：先给记录钩子一个结束信号（不允许它影响中止流程）
+        try:
+            self._call_hooks(None, None, None, "end",
+                             str(self.status.get("label") or ""))
+        except Exception:  # noqa: BLE001
+            pass
         res = None
         try:
             res = self.bus.hold_all()
@@ -644,14 +748,78 @@ class Motion:
             self.recorder.command("abort", reason)
         raise MotionError(reason)
 
+    @staticmethod
+    def _trap_pos(d: float, v: float, a: float, t: float) -> float:
+        """同一组梯形速度/加速度下，t 时刻应走的位移（带符号，deg）。"""
+        ad = abs(float(d))
+        if ad < 1e-9:
+            return 0.0
+        v = max(0.05, abs(float(v)))
+        a = max(0.05, abs(float(a)))
+        t = max(0.0, float(t))
+        t_acc = v / a
+        d_acc = 0.5 * a * t_acc * t_acc
+        sign = 1.0 if d >= 0 else -1.0
+        if ad <= 2.0 * d_acc:
+            t_total = 2.0 * math.sqrt(ad / a)
+            if t <= t_total / 2.0:
+                s = 0.5 * a * t * t
+            elif t <= t_total:
+                s = ad - 0.5 * a * (t_total - t) ** 2
+            else:
+                s = ad
+        else:
+            t_total = 2.0 * t_acc + (ad - 2.0 * d_acc) / v
+            if t <= t_acc:
+                s = 0.5 * a * t * t
+            elif t <= t_total - t_acc:
+                s = d_acc + v * (t - t_acc)
+            elif t <= t_total:
+                s = ad - 0.5 * a * (t_total - t) ** 2
+            else:
+                s = ad
+        return sign * s
+
+    @staticmethod
+    def _trap_vel(d: float, v: float, a: float, t: float) -> float:
+        """同一组梯形参数下，t 时刻的指令速度（带符号，deg/s）。"""
+        ad = abs(float(d))
+        if ad < 1e-9:
+            return 0.0
+        v = max(0.05, abs(float(v)))
+        a = max(0.05, abs(float(a)))
+        t = max(0.0, float(t))
+        t_acc = v / a
+        d_acc = 0.5 * a * t_acc * t_acc
+        sign = 1.0 if d >= 0 else -1.0
+        if ad <= 2.0 * d_acc:
+            t_total = 2.0 * math.sqrt(ad / a)
+            if t <= t_total / 2.0:
+                s = a * t
+            elif t <= t_total:
+                s = a * (t_total - t)
+            else:
+                s = 0.0
+        else:
+            t_total = 2.0 * t_acc + (ad - 2.0 * d_acc) / v
+            if t <= t_acc:
+                s = a * t
+            elif t <= t_total - t_acc:
+                s = v
+            elif t <= t_total:
+                s = a * (t_total - t)
+            else:
+                s = 0.0
+        return sign * s
+
     def _run_segment(self, seg: dict):
         q_target = np.asarray(seg["q_target"], float)
         q_from = np.asarray(seg["q_from"], float)
-        step_deg = float(np.max(np.abs(q_target - q_from)))
-        # 5° 拆段时，目标一次前进 5°，启动/加速瞬间实际误差到 6–8° 是正常的。
-        # 允许误差按本段步长放宽（上限 15°），但仍要求 0.3–0.4 s 内至少降 1°，
-        # 真卡住（电流顶住/机械挡死）照样中止。
-        err_limit = min(15.0, max(5.0, 1.5 * step_deg + 2.0))
+        d_all = q_target - q_from
+        v_all = np.array([float((seg.get("vel_deg_s") or {}).get(n, 10.0))
+                          for n in self.order])
+        a_all = np.array([float((seg.get("acc_deg_s2") or {}).get(n, 20.0))
+                          for n in self.order])
         bad = self.bus.verify_ready()
         if bad:
             self._abort("这些关节没有真正使能/不在位置模式，拒绝发目标："
@@ -660,22 +828,28 @@ class Motion:
         with self._lock:
             self.status.update({"phase": "moving", "label": seg["label"],
                                 "target_q": seg["q_target"], "progress": 0.0})
+        # 21.1：和 _run_chunks 同一口径，按停后不再补发新目标（段入口/
+        # verify_ready 读参数期间按的停也不会漏过去）。
+        if self._stop.is_set():
+            self._abort(self._stop_reason)
         self.bus.set_targets_q(self.q_dict(q_target))
         if self.recorder:
             for n, q in zip(self.order, q_target):
                 self.recorder.command("command_move", seg["label"], n, float(q))
         t0 = time.monotonic()
-        # 计划 T 只按 20°/s 匀速估，实际还有加速段/摩擦/轮询；给足余量
+        # 计划 T 只按匀速估，实际还有加速段/摩擦/轮询；给足余量
         timeout = max(5.0, seg["T"] * 1.5 + 3.0)
         last_ok = {n: t0 for n in self.order}
         consec = 0
-        err_ref = {n: None for n in self.order}
-        err_ref_t = {n: t0 for n in self.order}
+        # 21.4.5：跟踪保护改成和“主机算的应到位置”比，而不是和目标终点比。
+        # 起步反向空程（1 s / 5°）保留；d≈0 的关节按绝对偏差 3° 判。
+        lag_ref_t = {n: None for n in self.order}
         err0 = {n: None for n in self.order}
         while True:
             if self._stop.is_set():
                 self._abort(self._stop_reason)
-            states = self.bus.read_all(full=False)
+            # 22.2 扫描段要带电流/原始计数：read_full=True 时按全量回读。
+            states = self.bus.read_all(full=bool(seg.get("read_full")))
             if self.recorder:
                 self.recorder.poll(states)
             now = time.monotonic()
@@ -702,6 +876,16 @@ class Motion:
                 if st.error:
                     self._abort(f"{n} 报警 0x{st.error:04X} {st.error_text}")
             if None not in q:
+                # 22.2/22.3：把这一拍的指令位置/速度和实际回读交给钩子。
+                elapsed = now - t0
+                cmd_q = [float(q_from[i]) + self._trap_pos(
+                    float(d_all[i]), v_all[i], a_all[i], elapsed)
+                    for i in range(6)]
+                cmd_v = [self._trap_vel(
+                    float(d_all[i]), v_all[i], a_all[i], elapsed)
+                    for i in range(6)]
+                self._call_hooks(states, cmd_q, cmd_v, "run", seg["label"],
+                                 elapsed, float(seg.get("T") or 0.0))
                 maxerr = max(errs.values())
                 # 0.8° 以内算到位；J3 这种有摩擦/背隙的关节常停在 0.3~0.5°
                 if maxerr < 0.8:
@@ -721,44 +905,59 @@ class Motion:
                                 f"{seg['label']} 到位误差 {err:+.3f}°",
                                 n, float(q_target[i]), pos_deg=float(q[i]),
                                 error=states[n].error)
+                    self._call_hooks(states, q_target.tolist(), [0.0] * 6, "end",
+                                     seg["label"], elapsed,
+                                     float(seg.get("T") or 0.0))
                     return
-            # 16.4 第 7 条（P08-4 口径）：逐关节判，>5° 且连续 0.3 s 内
-            # 误差下降不到 1° → 中止。数值不动；一颗小关节卡住不会等到
-            # 大关节走完/超时才发现。
-            if now - t0 > 0.35:
-                for n in self.order:
-                    e = errs.get(n)
-                    if e is None:
-                        continue
+            # 21.4.5：每个关节按“同一组速度/加速度下 t 时刻应到位置”算滞后。
+            # lag>max(3°, v×0.5 s) 持续 0.3 s → 中止；起步 1 s/5° 反向空程保留。
+            if None not in q:
+                for i, n in enumerate(self.order):
                     if err0[n] is None:
-                        err0[n] = e
-                    # 起步容忍：只对“起始误差 >5°”的关节生效，最多 1 s / 3° 反向。
-                    # 目的是容忍 J3 的机械反向空程，不是放宽全部跟踪保护。
-                    if now - t0 <= START_GRACE_S and err0[n] > 5.0:
-                        if e > err0[n] + START_REVERSE_DEG:
-                            self._abort(
-                                f"{n} 启动反向 {e - err0[n]:.1f}° >"
-                                f"{START_REVERSE_DEG:g}°（起始误差 {err0[n]:.1f}°）")
-                        continue
-                    if e > err_limit:
-                        ref = err_ref.get(n)
-                        if ref is None or e <= ref - 1.0:
-                            err_ref[n] = e
-                            err_ref_t[n] = now
-                        elif now - err_ref_t.get(n, t0) > 0.3:
-                            self._abort(
-                                f"{n} 实际位置和目标差 {e:.1f}° "
-                                f"> {err_limit:.1f}°，且 0.3 s 内下降不到 1°")
+                        err0[n] = errs[n]
+                    d = float(d_all[i])
+                    if abs(d) > 0.1:
+                        expected = float(q_from[i]) + self._trap_pos(
+                            d, v_all[i], a_all[i], now - t0)
+                        lag = (expected - float(q[i])) * (1.0 if d > 0 else -1.0)
+                        lim = max(3.0, abs(float(v_all[i])) * 0.5)
                     else:
-                        err_ref[n] = None
-                        err_ref_t[n] = now
+                        expected = float(q_from[i])
+                        lag = abs(float(q[i]) - expected)
+                        lim = 3.0
+                    # 起步容忍：起始误差 >5° 的关节允许 1 s 内最多 5° 反向空程。
+                    if now - t0 <= START_GRACE_S and float(err0[n] or 0) >= 5.0 - 1e-6:
+                        back = ((float(q[i]) - float(q_from[i]))
+                                * (1.0 if d > 0 else -1.0))
+                        if back < -START_REVERSE_DEG:
+                            self._abort(
+                                f"{n} 启动反向 {-back:.1f}° >"
+                                f"{START_REVERSE_DEG:g}°（起始误差 {err0[n]:.1f}°）")
+                        lag_ref_t[n] = None
+                        continue
+                    if lag > lim:
+                        if lag_ref_t[n] is None:
+                            lag_ref_t[n] = now
+                        elif now - lag_ref_t[n] > 0.3:
+                            self._abort(
+                                f"{n} 实际位置比应到位置落后 {lag:.1f}° "
+                                f"> {lim:.1f}°（应到 {expected:.2f}°，实际 {q[i]:.2f}°）"
+                                "且持续 0.3 s")
+                    else:
+                        lag_ref_t[n] = None
             if now - t0 > timeout:
                 self._abort(f"到达超时（{timeout:.1f} s）")
             if None not in q:
                 with self._lock:
                     self.status["current_q"] = [round(v, 4) for v in q]
-                    denom = max(seg["T"], 0.2)
-                    self.status["progress"] = round(min(0.99, (now - t0) / denom), 3)
+                    # 21.4.7：进度条按实际位置（位移最大的关节）算，不按时间
+                    prog = 0.0
+                    for i in range(6):
+                        den = abs(float(d_all[i]))
+                        if den > 0.05:
+                            prog = max(prog, min(1.0, abs(
+                                float(q[i]) - float(q_from[i])) / den))
+                    self.status["progress"] = round(min(0.99, prog), 3)
             time.sleep(max(0.0, 1.0 / self.poll_hz - (time.monotonic() - now)))
 
     @staticmethod
@@ -832,8 +1031,8 @@ class Motion:
                      else 5.0
                      for i in range(6)]
 
-        def read_once(cmd):
-            states = self.bus.read_all(full=False)
+        def read_once(cmd, cmd_vel=None):
+            states = self.bus.read_all(full=bool(segs[0].get("read_full")))
             if self.recorder:
                 self.recorder.poll(states)
             now = time.monotonic()
@@ -858,9 +1057,18 @@ class Motion:
                 if st.error:
                     self._abort(f"{n} 报警 0x{st.error:04X} {st.error_text}")
             maxerr = None if None in errs.values() else max(errs.values())
+            if None not in q:
+                self._call_hooks(states, [float(v) for v in cmd],
+                                 (cmd_vel or [0.0] * 6), "run", label,
+                                 now - t_start, T)
             return q, maxerr, states
 
         while True:
+            # 21.1：目标流每一拍发目标之前先查停止标志。这一段以前没有检查
+            # （578fc36 把 for 改成 while True 时丢了），长动作十几秒内按“停”、
+            # 心跳断都不生效。置位后不再发新目标，按 _abort 原地保持。
+            if self._stop.is_set():
+                self._abort(self._stop_reason)
             now = time.monotonic()
             u = min(1.0, (now - t_start) / T)
             sfrac = 0.5 - 0.5 * math.cos(math.pi * u)
@@ -869,7 +1077,10 @@ class Motion:
             last_send = time.monotonic()
             if now - last_poll >= POLL_DT:
                 last_poll = now
-                q, maxerr, _ = read_once(cmd)
+                # 余弦插补的指令速度（仅给 22.3 残差记录用）
+                cv = (delta * (0.5 * math.pi / max(T, 1e-6))
+                      * math.sin(math.pi * u)).tolist()
+                q, maxerr, _ = read_once(cmd, cv)
                 now = time.monotonic()
                 if maxerr is not None:
                     with self._lock:
@@ -914,7 +1125,10 @@ class Motion:
             with self._lock:
                 self.status["progress"] = round(min(0.95, u), 3)
 
-        # 最后精确下发终点并等真正到位
+        # 最后精确下发终点并等真正到位（21.1：目标流末尾也要先看停止标志，
+        # 免得刚好在 u 到 1 的这一刻按停又被补发一次终点目标）
+        if self._stop.is_set():
+            self._abort(self._stop_reason)
         self.bus.set_targets_q(self.q_dict(qf))
         consec = 0
         while True:
@@ -939,6 +1153,8 @@ class Motion:
                                 f"{float(q[i]) - float(qf[i]):+.3f}°",
                                 n, float(qf[i]), pos_deg=float(q[i]),
                                 error=states[n].error)
+                    self._call_hooks(states, [float(v) for v in qf],
+                                     [0.0] * 6, "end", label, now - t_start, T)
                     if stream_pos:
                         # 回到 S 曲线位置模式，后续单段/保持仍按原逻辑
                         self.bus.set_stream_mode(MODE_PROFILE_POSITION)
