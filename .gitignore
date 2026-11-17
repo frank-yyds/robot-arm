@@ -1,0 +1,9 @@
+# 运行时记录（不入库）
+runs/
+programs/*.json
+__pycache__/
+*.pyc
+.DS_Store
+
+# 模型（体积大，单独留存）
+# models/ 保留入库
