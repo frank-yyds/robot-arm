@@ -484,13 +484,13 @@ class Executor:
                 "msg": self.msg, "config_version": self.config_version}
 
     def start_trace(self, hz: float = 100.0, seconds: float = 10.0,
-                    joints=None, status_hz: float = 5.0) -> dict:
+                    joints=None, status_hz: float = 5.0, light: bool = False) -> dict:
         if self.trace and self.trace.status().get("active"):
             raise MotionError("高频采样已经在跑")
         if not isinstance(self.bus, JointBus) or not self.connected:
             raise MotionError("高频采样需要真机连接（模拟模式没有真实 ECB 总线）")
         self.trace = TraceSampler(self, hz=hz, seconds=seconds, joints=joints,
-                                  status_hz=status_hz)
+                                  status_hz=status_hz, light=light)
         self.trace.start()
         self.msg = f"高频采样开始：{hz:g} Hz / {seconds:g} s"
         return self.trace.status()
@@ -1697,7 +1697,8 @@ class Executor:
         pk["park_side"] = -1 if float(q[0]) < 0 else 1
         if not pk.get("version"):
             pk["version"] = "2026-11-12.1"
-        cfgmod.save_park(pk)
+        if not getattr(self.bus, "is_mock", False):
+            cfgmod.save_park(pk)
         self.park_cfg = pk
         self.msg = ("停机位置已记录（教的点：J1 决定左右侧、J4–J6 决定腕姿；下降高度按公式）："
                     + " ".join(f"{n}{v:+.1f}" for n, v in zip(self.robot.joint_names, q)))
@@ -1856,6 +1857,8 @@ class Executor:
                         return
                     if verdict == "first":
                         try:
+                            if getattr(self.bus, "is_mock", False):
+                                raise RuntimeError("mock：不写真实 config/park.json")
                             pk2 = json.loads(json.dumps(self.park_cfg))
                             pk2["contact_j4_z"] = round(float(z), 2)
                             pk2["contact_j4_z_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
@@ -3064,7 +3067,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, {"ok": True,
                                         "trace": EXEC.start_trace(
                                             hz, sec, body.get("joints"),
-                                            float(body.get("status_hz") or 5.0))})
+                                            float(body.get("status_hz") or 5.0),
+                                            bool(body.get("light")))})
             if p == "/api/trace/stop":
                 EXEC.require_control(body)
                 return self._json(200, {"ok": True, "trace": EXEC.stop_trace()})

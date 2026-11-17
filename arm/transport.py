@@ -107,7 +107,7 @@ class EcbTransport:
         # 上一次事务超时：总线可能还有迟到回包，下一次事务先等一下再读空
         self._sync_lost = False
         self._resync_until = 0.0
-        self.dup_window_s = 0.02      # 收到一条应答后这段窗口内同 key 的包按重复丢弃
+        self.dup_window_s = 0.004     # 收到一条应答后这段窗口内同 key 的包按重复丢弃
         self.resync_wait_s = 0.03     # 超时之后先等这么久，再读空旧包
         self.repeat_dropped = 0
 
@@ -228,8 +228,8 @@ class EcbTransport:
                     if got_frame is not None:
                         break
                 if got_frame is not None:
-                    # A2：同一请求的重复/迟到回包不能留给下一次事务
-                    self._drain_dup(addr, cmd)
+                    # A2：单个请求不等重复窗口（总线串行，20 ms 会把 trace
+                    # 节拍压到 3 Hz）；重复包靠下一次 _drain_rx / _resync 清掉。
                     break
                 self.timeouts += 1
                 self._sync_lost = True
