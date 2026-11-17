@@ -2,9 +2,11 @@
 # -*- coding: utf-8 -*-
 """CSV 记录（原 B7）：每次运行一个文件。
 
-两类行：
-  * command_*：命令（含预演计划，kind=plan，不发写命令）
-  * poll：每次轮询（时间、关节、位置、电流、报警）
+行类型（24 节 A5 / 16.4 第 8 条）：
+  * cmd：每条发出去的写命令一行（时间、关节、指令、值、有没有回包）
+  * poll：每次回读（位置、电流、报警）
+  * status：电源 0x2B / 模式 0x55 / 报警（A5 要求每颗至少 5 Hz）
+  * note / plan / execute_* / abort / read_anomaly
 """
 from __future__ import annotations
 
@@ -14,6 +16,9 @@ import threading
 from pathlib import Path
 
 from . import config
+
+HEADER = ["time", "t_rel", "kind", "joint", "pos_deg", "target_deg",
+          "current_a", "error", "power", "mode", "note"]
 
 
 class Recorder:
@@ -26,8 +31,7 @@ class Recorder:
         self._lock = threading.Lock()
         self._fh = self.path.open("w", newline="", encoding="utf-8")
         self._w = csv.writer(self._fh)
-        self._w.writerow(["time", "t_rel", "kind", "joint", "pos_deg",
-                          "target_deg", "current_a", "error", "note"])
+        self._w.writerow(HEADER)
         self._t0 = _dt.datetime.now()
         if note:
             self.note(note)
@@ -37,21 +41,35 @@ class Recorder:
         now = _dt.datetime.now()
         return now.isoformat(timespec="milliseconds"), round((now - self._t0).total_seconds(), 3)
 
-    def note(self, text: str):
+    def _row(self, kind, joint="", pos="", target="", current="", error="",
+             power="", mode="", note=""):
         with self._lock:
             t, tr = self._ts()
-            self._w.writerow([t, tr, "note", "", "", "", "", "", text])
+            self._w.writerow([t, tr, kind, joint, pos, target, current,
+                              error, power, mode, note])
             self._fh.flush()
+
+    def note(self, text: str):
+        self._row("note", note=text)
 
     def command(self, kind: str, note: str = "", joint: str = "",
                 target_deg: float | None = None, **kw):
-        with self._lock:
-            t, tr = self._ts()
-            self._w.writerow([t, tr, kind, joint,
-                              "" if kw.get("pos_deg") is None else f"{kw['pos_deg']:.4f}",
-                              "" if target_deg is None else f"{target_deg:.4f}",
-                              kw.get("current_a", ""), kw.get("error", ""), note])
-            self._fh.flush()
+        self._row(kind, joint=joint,
+                  pos="" if kw.get("pos_deg") is None else f"{kw['pos_deg']:.4f}",
+                  target="" if target_deg is None else f"{target_deg:.4f}",
+                  current=kw.get("current_a", ""), error=kw.get("error", ""),
+                  power=kw.get("power", ""), mode=kw.get("mode", ""),
+                  note=note)
+
+    def write_cmd(self, joint: str, cmd: int, value: str, replied,
+                  note: str = ""):
+        """A5：一条写命令。replied：True/False，None = 该指令本身不等回包。"""
+        if replied is None:
+            rep = "回包=不等"
+        else:
+            rep = "回包=有" if replied else "回包=无"
+        self._row("cmd", joint=joint,
+                  note=f"0x{cmd:02X} 值 {value} {rep}" + (f"；{note}" if note else ""))
 
     def poll(self, states: dict):
         with self._lock:
@@ -63,6 +81,21 @@ class Recorder:
                     "" if st.target_deg is None else f"{st.target_deg:.4f}",
                     "" if st.current_a is None else f"{st.current_a:.3f}",
                     "" if st.error is None else f"0x{st.error:04X}",
+                    "", "",
+                    ("读数异常 原始 " + st.raw_pos_hex) if getattr(st, "pos_invalid", False) else "",
+                ])
+            self._fh.flush()
+
+    def status(self, rows: dict[str, dict]):
+        """A5：电源/模式/报警，每颗一行（位置由 poll 行覆盖）。"""
+        with self._lock:
+            t, tr = self._ts()
+            for name, r in rows.items():
+                self._w.writerow([
+                    t, tr, "status", name, "", "", "", 
+                    "" if r.get("error") is None else f"0x{int(r['error']):04X}",
+                    "" if r.get("power") is None else str(r["power"]),
+                    "" if r.get("mode") is None else str(r["mode"]),
                     "",
                 ])
             self._fh.flush()

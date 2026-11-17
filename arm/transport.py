@@ -101,6 +101,15 @@ class EcbTransport:
         self.tx_fail = 0
         self.timeouts = 0
         self.last_rx_time: float | None = None
+        # 24 节 A2/A5：执行器运行期间所有收发都从这里走；命令钩子供记录用
+        # fn(addr, cmd, data, ok) —— ok None 表示只发不等回包
+        self.event_hook = None
+        # 上一次事务超时：总线可能还有迟到回包，下一次事务先等一下再读空
+        self._sync_lost = False
+        self._resync_until = 0.0
+        self.dup_window_s = 0.02      # 收到一条应答后这段窗口内同 key 的包按重复丢弃
+        self.resync_wait_s = 0.03     # 超时之后先等这么久，再读空旧包
+        self.repeat_dropped = 0
 
     def local_ip(self) -> str:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -159,13 +168,51 @@ class EcbTransport:
         finally:
             self._sock.setblocking(True)
 
+    def _resync(self) -> None:
+        """上一次事务超时过：先等一段（让迟到回包落地），再读空。"""
+        if not self._sync_lost:
+            return
+        left = self._resync_until - time.monotonic()
+        if left > 0:
+            time.sleep(left)
+        self._drain_rx()
+        self._sync_lost = False
+
+    def _drain_dup(self, addr: int, cmd: int, window: float | None = None) -> int:
+        """收到一条应答后，把紧跟其后的同 (addr, cmd) 重复回包丢掉。
+
+        协议里回包不带序号，只能按“同一请求的重复/迟到回包”处理：
+        保留先到的一条，其余计入 repeat_dropped。
+        """
+        win = self.dup_window_s if window is None else window
+        dropped = 0
+        end = time.monotonic() + win
+        while True:
+            left = end - time.monotonic()
+            if left <= 0:
+                break
+            self._sock.settimeout(min(0.004, left))
+            try:
+                data, _ = self._sock.recvfrom(8192)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            for f in parse_frames(data):
+                if f.addr == addr and f.cmd == cmd:
+                    dropped += 1
+        self.repeat_dropped += dropped
+        return dropped
+
     def request(self, addr: int, cmd: int, data: bytes = b"",
                 timeout: float | None = None, retries: int | None = None) -> Frame | None:
         timeout = self.timeout if timeout is None else timeout
         retries = self.retries if retries is None else retries
         raw = make_frame(addr, cmd, data)
+        got_frame = None
         with self._lock:
             for _ in range(max(1, retries)):
+                self._resync()
                 self._drain_rx()
                 self._send(raw)
                 end = time.monotonic() + timeout
@@ -176,15 +223,52 @@ class EcbTransport:
                         if f.crc_ok is False and not (f.addr == 0 or f.cmd == 0x44):
                             continue
                         if f.addr == addr and f.cmd == cmd:
-                            # 清掉同批里的旧帧
-                            return f
+                            got_frame = f
+                            break
+                    if got_frame is not None:
+                        break
+                if got_frame is not None:
+                    # A2：同一请求的重复/迟到回包不能留给下一次事务
+                    self._drain_dup(addr, cmd)
+                    break
                 self.timeouts += 1
-        return None
+                self._sync_lost = True
+                self._resync_until = time.monotonic() + self.resync_wait_s
+        if self.event_hook is not None:
+            try:
+                self.event_hook(addr, cmd, data, got_frame is not None)
+            except Exception:  # noqa: BLE001
+                pass
+        return got_frame
+
 
     def send_cmd(self, addr: int, cmd: int, data: bytes = b"") -> None:
         """只发不等回（有些固件的使能/失能应答不可靠，但状态会变）。"""
         with self._lock:
+            self._resync()
             self._send(make_frame(addr, cmd, data))
+        if self.event_hook is not None:
+            try:
+                self.event_hook(addr, cmd, data, None)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _drain_dup_any(self, keys, window: float = 0.006) -> None:
+        end = time.monotonic() + window
+        while True:
+            left = end - time.monotonic()
+            if left <= 0:
+                break
+            self._sock.settimeout(min(0.004, left))
+            try:
+                data, _ = self._sock.recvfrom(8192)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            for f in parse_frames(data):
+                if (f.addr, f.cmd) in keys:
+                    self.repeat_dropped += 1
 
     def read_many(self, items, timeout: float = 0.05,
                   retries: int = 2) -> dict[tuple[int, int], bytes]:
@@ -195,14 +279,15 @@ class EcbTransport:
         """
         results: dict[tuple[int, int], bytes] = {}
         pending = list(items)
+        want = {(a, c): n for a, c, n in pending}
         with self._lock:
             for _ in range(max(1, retries)):
                 if not pending:
                     break
+                self._resync()
                 self._drain_rx()
                 for addr, cmd, _n in pending:
                     self._send(make_frame(addr, cmd))
-                want = {(a, c): n for a, c, n in pending}
                 end = time.monotonic() + timeout
                 got_round: set[tuple[int, int]] = set()
                 while time.monotonic() < end and len(got_round) < len(want):
@@ -214,7 +299,19 @@ class EcbTransport:
                 pending = [it for it in pending if (it[0], it[1]) not in results]
                 if pending:
                     self.timeouts += len(pending)
+                    self._sync_lost = True
+                    self._resync_until = time.monotonic() + self.resync_wait_s
+                else:
+                    # 这一轮要的都收到了；把紧跟着的重复回包丢掉
+                    self._drain_dup_any(set(want), 0.004)
+        if self.event_hook is not None:
+            for addr, cmd, _n in items:
+                try:
+                    self.event_hook(addr, cmd, b"", (addr, cmd) in results)
+                except Exception:  # noqa: BLE001
+                    pass
         return results
+
 
     def read(self, addr: int, cmd: int, n: int, **kw) -> bytes | None:
         f = self.request(addr, cmd, b"", **kw)

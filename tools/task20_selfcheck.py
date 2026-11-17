@@ -270,7 +270,7 @@ close_exec(e)
 # ---------------- 20.8 预演实际下降 ----------------
 e = mk_exec()
 p = e.park(preview=True, prereq=park_prereq())
-q_expected = e._park_q_at_z(130.5, 90.0)
+q_expected = e._park_q_at_z(130.5, p["preview"]["park"]["poses"]["pre"][0])
 check("20.8 预演画实际下降终点", [round(v, 3) for v in p["preview"]["q"]] ==
       [round(v, 3) for v in q_expected], str(p["preview"]["q"]))
 check("20.8 网页说明教的点的作用（J1 左右侧 / J4–J6 腕姿）",

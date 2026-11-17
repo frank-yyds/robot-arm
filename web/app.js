@@ -956,12 +956,22 @@ function updateUI(s) {
   const tb = document.querySelector('#joints tbody');
   const nearSet = new Set((s.near_limit || []).map((x) => x.joint));
   tb.innerHTML = (s.joints || []).map((j) => {
-    const cls = j.error ? 'err' : (nearSet.has(j.name) ? 'near' : '');
-    const state = j.enabled === false ? '失能' : (j.enabled ? (j.error ? '报警' : '使能') : '—');
+    const age = (j.pos_age_s === null || j.pos_age_s === undefined) ? null : Number(j.pos_age_s);
+    const mage = (j.mode_age_s === null || j.mode_age_s === undefined) ? null : Number(j.mode_age_s);
+    const stale = (age !== null && age > 0.5) || (mage !== null && mage > 0.5);
+    const cls = [j.error ? 'err' : '', j.pos_invalid ? 'invalid' : '',
+                 stale ? 'stale' : '', nearSet.has(j.name) ? 'near' : ''].filter(Boolean).join(' ');
+    let state = j.pos_invalid ? '读数异常'
+      : (j.enabled === false ? '失能' : (j.enabled ? (j.error ? '报警' : '使能') : '—'));
+    if (mage !== null && mage > 0.5) state += `·模式旧(${mage.toFixed(1)}s)`;
+    const ageTxt = j.pos_invalid ? '异常'
+      : (age === null ? '—' : (age > 0.5 ? `${age.toFixed(2)}s 前` : `${Math.round(age * 1000)}ms`));
     return `<tr class="${cls}"><td>${j.name}</td><td>${fmt(j.out_deg, 2)}</td>` +
       `<td>${fmt(j.target_deg, 2)}</td><td>${fmt(j.current_a, 2)}</td>` +
-      `<td>${fmt(j.temp_c, 0)}</td><td>${state}</td></tr>`;
+      `<td>${fmt(j.temp_c, 0)}</td><td>${state}</td>` +
+      `<td class="age-cell">${ageTxt}</td></tr>`;
   }).join('');
+  updateHoldFailure(s);
 
   if (s.preview) {
     const p = s.preview;
@@ -1073,6 +1083,50 @@ function updateUI(s) {
 // ---------------------------------------------------------------------------
 // 22.2 / 22.4 面板
 // ---------------------------------------------------------------------------
+// 24 节 A3b：保持失效横幅 + 声音 + 只失能这一颗
+let holdFailBeeped = null;
+function beepHoldFailure() {
+  try {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return;
+    const ctx = new AC();
+    const o = ctx.createOscillator();
+    const g = ctx.createGain();
+    o.type = 'square';
+    o.frequency.value = 880;
+    g.gain.value = 0.18;
+    o.connect(g).connect(ctx.destination);
+    o.start();
+    o.stop(ctx.currentTime + 0.45);
+    setTimeout(() => ctx.close && ctx.close(), 700);
+  } catch (e) { /* 浏览器不给声音就算了 */ }
+}
+
+function updateHoldFailure(s) {
+  const hf = s.hold_failure;
+  const el = document.getElementById('hold-fail-banner');
+  const txt = document.getElementById('hold-fail-text');
+  const btn = document.getElementById('btn-hold-disable');
+  if (!el || !txt) return;
+  if (!hf) {
+    el.style.display = 'none';
+    holdFailBeeped = null;
+    return;
+  }
+  el.style.display = 'flex';
+  txt.textContent = hf.msg || `保持失效：${hf.joint}`;
+  if (holdFailBeeped !== hf.since) {
+    holdFailBeeped = hf.since;
+    beepHoldFailure();
+    log(hf.msg || '保持失效', 'b');
+  }
+  if (btn) {
+    const done = (hf.disabled || []).includes(hf.joint);
+    btn.disabled = !!done;
+    btn.textContent = done ? `${hf.joint} 已单颗失能` : `只失能这一颗（${hf.joint}，二次确认）`;
+  }
+}
+
 function updateSweep(s) {
   const w = s.sweep || {};
   const owner = isOwner(s);
@@ -2201,3 +2255,19 @@ function pushPageSnapshot() {
   } catch (_) { /* 快照绝不干扰主流程 */ }
 }
 setInterval(pushPageSnapshot, 100);
+
+
+// 24 节 A3b：只失能报保持失效的那一颗（二次确认）
+document.getElementById('btn-hold-disable')?.addEventListener('click', async () => {
+  const hf = (STATE && STATE.hold_failure) || null;
+  if (!hf) return;
+  const j = hf.joint;
+  const a = confirm(`只失能 ${j}？\n其余关节保持使能；${j} 失能以后这一段会掉，先扶住。`);
+  if (!a) return;
+  const b = confirm(`再确认一次：${j} 失能后不会再自动保持。\n如果扶不住，先拉直流空开。`);
+  if (!b) return;
+  try {
+    const r = await apiPost('/api/hold_failure/disable_joint', { joint: j, confirmed: true });
+    log(r.msg || `${j} 已单颗失能`, 'b');
+  } catch (e) { log(`单颗失能失败：${e.message || e}`, 'b'); }
+});

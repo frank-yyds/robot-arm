@@ -75,6 +75,14 @@ class JointState:
     speed_limit_rpm: float | None = None
     pos_limit_lo_r: float | None = None
     pos_limit_hi_r: float | None = None
+    # 24 节 A3：读数时间戳 / 合理性
+    pos_read_at: float | None = None      # unix 时间，读到这一刻
+    pos_age_s: float | None = None        # 相对 state() 计算的时长由执行器填
+    pos_invalid: bool = False             # 合理性检查没过：不许拿来当保持目标/规划起点
+    pos_raw_deg: float | None = None      # 未通过时保留原始换算值，仅供显示/日志
+    raw_pos_hex: str = ""                 # 原始回包十六进制
+    mode_read_at: float | None = None
+    mode_age_s: float | None = None
 
     def as_dict(self) -> dict:
         def r(v, n=3):
@@ -92,7 +100,17 @@ class JointState:
             "pos_limit_deg": (None if self.pos_limit_hi_r is None else
                               [r(self.pos_limit_lo_r * DEG_PER_MOTOR_TURN, 1),
                                r(self.pos_limit_hi_r * DEG_PER_MOTOR_TURN, 1)]),
+            "pos_read_at": self.pos_read_at,
+            "pos_age_s": (None if self.pos_age_s is None
+                          else round(float(self.pos_age_s), 3)),
+            "pos_invalid": bool(self.pos_invalid),
+            "pos_raw_deg": r(self.pos_raw_deg),
+            "raw_pos_hex": self.raw_pos_hex,
+            "mode_read_at": self.mode_read_at,
+            "mode_age_s": (None if self.mode_age_s is None
+                           else round(float(self.mode_age_s), 3)),
         }
+
 
 
 def load_joint_configs(path=None) -> dict[str, JointConfig]:
@@ -148,6 +166,15 @@ class JointBus:
         self._targets: dict[str, float] = {}
         self._last_state: dict[str, JointState] = {}
         self._error_tick = 0
+        # 24 节 A3：上一次可信读数（name -> (out_deg, monotonic)）与异常回调
+        self._trust: dict[str, tuple[float, float]] = {}
+        self._invalid_streak: dict[str, int] = {}
+        self._invalid_candidate: dict[str, float] = {}
+        self._anomaly_at: dict[str, float] = {}
+        self.anomaly_hook = None      # fn(name, raw_hex, raw_deg, prev_deg, dt)
+        self.plausible_rate = 70.0    # °/s
+        self.plausible_margin = 2.0   # °
+        self.last_read_hz = 0.0
         # 20.5：启动/写限位/校准时真正回读的限流（A），不拿配置值冒充
         self.current_limit_readback: dict[str, float | None] = {}
 
@@ -223,8 +250,12 @@ class JointBus:
                 pass
             time.sleep(0.04)
             if not m.enable():
-                self._disable_all_quiet()
-                raise StartupRefused(f"{name} 使能无应答；已全部失能")
+                # A7：第一次没应答，单独再试这一颗；第二次还不行才判失败
+                report.setdefault("enable_retry", []).append(name)
+                time.sleep(0.2)
+                if not m.enable():
+                    self._disable_all_quiet()
+                    raise StartupRefused(f"{name} 使能两次都无应答；已全部失能")
             time.sleep(0.05)
             # 使能后立刻零扭矩，避免“使能那一下出力”
             m.set_mode(MODE_CURRENT)
@@ -239,6 +270,15 @@ class JointBus:
                 self._disable_all_quiet()
                 raise StartupRefused(f"{name} 零扭矩使能后读不到位置；已全部失能")
             tel = m.telemetry(full=True)
+            # A6：启动时逐颗核报警码；不是 0 先清一次再读，还不 0 就拒绝
+            if tel.error:
+                report.setdefault("alarm_clear", []).append(name)
+                try:
+                    m.clear_error()
+                except Exception:  # noqa: BLE001
+                    pass
+                time.sleep(0.12)
+                tel.error = m.error(timeout=0.1, retries=2)
             issues = self._validate_enabled(name, tel)
             out_now = c.out_deg(pos)
             lo_s, hi_s = c.safe_limits_deg
@@ -432,6 +472,26 @@ class JointBus:
         return ok
 
     # ---------------- 读 ----------------
+    def _plausible(self, name: str, val: float, now: float) -> tuple[bool, float]:
+        """A3：和上一次可信读数比，超过 70°/s×间隔 + 2° 就不可信。"""
+        prev = self._trust.get(name)
+        if prev is None:
+            return True, float("inf")
+        dt = max(1e-3, now - prev[1])
+        if dt > 5.0:
+            # 长时间没有可信读数（失能/断电/拖动过）：不拿旧值卡新值
+            return True, float("inf")
+        allowed = self.plausible_rate * dt + self.plausible_margin
+        return abs(val - prev[0]) <= allowed, allowed
+
+    def _record_anomaly(self, name: str, raw_hex: str, raw_deg: float,
+                        prev_deg: float | None, dt: float):
+        if self.anomaly_hook is not None:
+            try:
+                self.anomaly_hook(name, raw_hex, raw_deg, prev_deg, dt)
+            except Exception:  # noqa: BLE001
+                pass
+
     def read_all(self, full: bool = False, fast: bool = True) -> dict[str, JointState]:
         out: dict[str, JointState] = {}
         to = 0.07 if fast else 0.15
@@ -456,17 +516,19 @@ class JointBus:
                          (R_CURRENT_MAX, 2), (R_CURRENT, 4), (R_CURRENT_LIMIT, 4)]
                 for cmd, n in specs:
                     full_maps[cmd] = batch(cmd, n, size=2)
+            now = time.monotonic()
             for mid, name in ids:
                 m = self.motors[name]
                 c = self.cfg[name]
                 st = JointState(name=name, id=c.id)
                 d = pos.get((mid, R_POSITION))
+                raw_hex = "" if d is None else d.hex()
+                candidate = None
                 if d is not None:
                     p = struct.unpack(">i", d)[0] / IQ24
                     st.enabled = True
                     st.pos_turns = p
-                    st.out_deg = c.out_deg(p)
-                    self._enabled_cache[name] = True
+                    candidate = c.out_deg(p)
                 else:
                     p = m.pos_turns(timeout=to, retries=rt)
                     if p is None:
@@ -476,10 +538,67 @@ class JointBus:
                     else:
                         st.enabled = True
                         st.pos_turns = p
-                        st.out_deg = c.out_deg(p)
+                        candidate = c.out_deg(p)
                         self._enabled_cache[name] = True
+                if candidate is not None:
+                    ok, allowed = self._plausible(name, candidate, now)
+                    if ok and self._trust.get(name) is None:
+                        # 第一次读数：再单独读一次，两次一致才建立可信基准
+                        pchk = m.pos_turns(timeout=max(0.09, to), retries=3)
+                        if pchk is not None and abs(c.out_deg(pchk) - candidate) > 0.5:
+                            ok = False
+                    if not ok:
+                        # A3 第 1 条：立刻单独再读一次；还不合理就判读数异常
+                        p2 = m.pos_turns(timeout=max(0.09, to), retries=3)
+                        if p2 is not None:
+                            cand2 = c.out_deg(p2)
+                            ok2, _ = self._plausible(name, cand2, time.monotonic())
+                            if ok2:
+                                ok, candidate = True, cand2
+                                st.pos_turns, st.enabled = p2, True
+                                raw_hex = ""
+                        if not ok:
+                            prev = self._trust.get(name)
+                            # 连续多次“新值彼此一致、只是离旧可信值很远”：
+                            # 说明臂确实被移到了新位置（例如断电后手推过），
+                            # 重新锚定并大声记一笔；拖拽/乱跳时不会一致。
+                            last = self._invalid_candidate.get(name)
+                            if last is not None and abs(candidate - last) <= 0.5:
+                                self._invalid_streak[name] = \
+                                    self._invalid_streak.get(name, 0) + 1
+                            else:
+                                self._invalid_streak[name] = 1
+                            self._invalid_candidate[name] = candidate
+                            if self._invalid_streak[name] >= 5:
+                                self._trust[name] = (candidate, time.monotonic())
+                                self._invalid_streak[name] = 0
+                                st.out_deg = candidate
+                                self._record_anomaly(
+                                    name, raw_hex, candidate,
+                                    None if prev is None else prev[0], float("inf"))
+                            else:
+                                st.pos_invalid = True
+                                st.pos_raw_deg = candidate
+                                st.raw_pos_hex = raw_hex
+                                st.out_deg = None
+                                tprev = self._anomaly_at.get(name, 0.0)
+                                if time.monotonic() - tprev > 1.0:
+                                    self._anomaly_at[name] = time.monotonic()
+                                    self._record_anomaly(
+                                        name, raw_hex, candidate,
+                                        None if prev is None else prev[0],
+                                        float("inf") if prev is None else now - prev[1])
+                        else:
+                            self._trust[name] = (candidate, time.monotonic())
+                            st.out_deg = candidate
+                    else:
+                        self._trust[name] = (candidate, now)
+                        self._invalid_streak[name] = 0
+                        st.out_deg = candidate
+                st.pos_read_at = time.time()
                 st.target_deg = self._targets.get(name)
                 st.current_limit_a = self.current_limit_readback.get(name)
+
 
                 de = err.get((mid, R_ERROR))
                 if de is not None:
@@ -513,6 +632,43 @@ class JointBus:
                         st.current_limit_a = self.current_limit_readback.get(name)
                 out[name] = st
                 self._last_state[name] = st
+        return out
+
+    def read_many_raw(self, items, timeout: float = 0.05, retries: int = 2):
+        """A2：给 trace 用；和 read_all 走同一把总线锁，不另开收发路径。"""
+        with self._lock:
+            return self.link.read_many(items, timeout=timeout, retries=retries)
+
+    def read_status(self, timeout: float = 0.08) -> dict[str, dict]:
+        """A5：电源 0x2B、模式 0x55、报警 0xFF。六颗一起发，丢的按颗单独补。"""
+        with self._lock:
+            items = []
+            for n in self.order:
+                mid = self.motors[n].mid
+                items += [(mid, R_POWER, 1), (mid, R_MODE, 1), (mid, R_ERROR, 2)]
+            got = self.link.read_many(items, timeout=timeout, retries=2)
+            out: dict[str, dict] = {}
+            for n in self.order:
+                mid = self.motors[n].mid
+                row = {}
+                for key, cmd in (("power", R_POWER), ("mode", R_MODE),
+                                 ("error", R_ERROR)):
+                    d = got.get((mid, cmd))
+                    if d is None:
+                        try:
+                            if cmd == R_POWER:
+                                row[key] = self.motors[n].power(timeout=0.06, retries=2)
+                            elif cmd == R_MODE:
+                                row[key] = self.motors[n].mode(timeout=0.06, retries=2)
+                            else:
+                                row[key] = self.motors[n].error(timeout=0.06, retries=2)
+                        except Exception:  # noqa: BLE001
+                            row[key] = None
+                    elif cmd == R_ERROR:
+                        row[key] = struct.unpack(">H", d[:2])[0]
+                    else:
+                        row[key] = d[0]
+                out[n] = row
         return out
 
     # ---------------- 写 ----------------
@@ -695,6 +851,24 @@ class JointBus:
                     unreadable.append(name)
                     add(name, "读不到位置")
                     continue
+                # A3 第 2 条：保持目标只用刚读到、并且通过合理性检查的值
+                cand = self.cfg[name].out_deg(pos)
+                ok, _ = self._plausible(name, cand, time.monotonic())
+                if not ok:
+                    pos2 = m.pos_turns(timeout=0.12, retries=3)
+                    if pos2 is not None:
+                        cand2 = self.cfg[name].out_deg(pos2)
+                        ok2, _ = self._plausible(name, cand2, time.monotonic())
+                        if ok2:
+                            ok, pos, cand = True, pos2, cand2
+                if not ok:
+                    unreadable.append(name)
+                    add(name, "读数异常（不合理跳变），不当保持目标")
+                    self._record_anomaly(name, "", cand,
+                                         (self._trust.get(name) or (None,))[0],
+                                         float("inf"))
+                    continue
+                self._trust[name] = (cand, time.monotonic())
                 try:
                     m.set_target_turns(pos)
                     m.set_mode(MODE_PROFILE_POSITION)
@@ -702,8 +876,9 @@ class JointBus:
                 except Exception as exc:  # noqa: BLE001
                     add(name, f"写目标/切模式失败：{exc}")
                     continue
-                held[name] = self.cfg[name].out_deg(pos)
+                held[name] = cand
                 self._targets[name] = held[name]
+
         if held:
             for n, why in self.verify_ready(list(held)):
                 add(n, why)

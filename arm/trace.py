@@ -128,7 +128,10 @@ class TraceSampler:
                             items.append((mid, R_POWER, 1))
                             items.append((mid, R_MODE, 1))
                     try:
-                        got = bus.link.read_many(items, timeout=0.03, retries=1)
+                        # A2：走总线同一把锁（read_many_raw），不直接抢 link
+                        got = (bus.read_many_raw(items, timeout=0.03, retries=1)
+                               if hasattr(bus, "read_many_raw")
+                               else bus.link.read_many(items, timeout=0.03, retries=1))
                     except Exception as exc:  # noqa: BLE001
                         got = {}
                         self.error = f"读总线失败：{exc}"

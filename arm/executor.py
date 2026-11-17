@@ -39,6 +39,7 @@ import json
 import math
 import mimetypes
 import secrets
+import struct
 import threading
 import time
 import traceback
@@ -185,6 +186,14 @@ class Executor:
                           "I0": None, "I2": None, "I1": None, "contact_z": None}
         self.park_block: dict | None = None
         self.j2_bracket = str(getattr(self.joint_cfg.get("J2"), "j2_bracket", "PLA"))
+        # 24 节 A3b：保持失效检测 / A5：状态/命令记录
+        self.hold_guard = {"active": False, "hist": {}, "resent": {},
+                           "resend_dist": {}, "since": None}
+        self.hold_failure: dict | None = None
+        self._poll_tick_hz = 0.0
+        self._last_status_at = 0.0
+        self._status_period_s = 0.2          # 5 Hz
+        self._last_write_event = 0.0
         self._sync_motion_params()
 
     # ---------------- 路径/配置 ----------------
@@ -454,6 +463,13 @@ class Executor:
                                  note=f"connect {self.mode} {self.ip}")
         self.motion = Motion(self.bus, self.robot, self.fence, self.limits,
                              recorder=self.recorder)
+        # A2/A3/A5：读异常回调、写命令记录钩子（真机总线才有）
+        if isinstance(self.bus, JointBus):
+            self.bus.anomaly_hook = self._on_read_anomaly
+            self.bus.link.event_hook = self._on_bus_event
+        self.hold_failure = None
+        self.hold_guard = {"active": False, "hist": {}, "resent": {},
+                           "resend_dist": {}, "since": None}
         # 22.3 第一阶段：只记录，不参与中止；钩子只入队，计算在后台线程
         self.collision = CollisionMonitor(self)
         self.collision.start()
@@ -538,11 +554,17 @@ class Executor:
     # ---------------- 状态轮询 ----------------
     def _poll_loop(self):
         last_cfg_check = 0.0
+        last_tick = 0.0
         period = 1.0 / self.push_hz
         while not self._poll_stop.is_set():
             t0 = time.monotonic()
             try:
                 now = t0
+                if last_tick > 0:
+                    inst = 1.0 / max(1e-3, now - last_tick)
+                    self._poll_tick_hz = (inst if self._poll_tick_hz <= 0
+                                          else 0.8 * self._poll_tick_hz + 0.2 * inst)
+                last_tick = now
                 if now - last_cfg_check > 1.0:
                     last_cfg_check = now
                     if cfgmod.config_version() != self.config_version:
@@ -569,18 +591,42 @@ class Executor:
                 self._last_states = states
                 q = [states[n].out_deg for n in self.robot.joint_names]
                 if any(v is None for v in q):
-                    q = None
+                    # A3：读不到或读数异常时，不能拿零位预演姿态冒充实际
+                    q = None if getattr(self.bus, "startup_done", False) else None
             if q is None:
-                # 连接了但还没使能/读不到位置：退回零位预演模型
-                states = self.preview_bus.read_all()
-                q = [0.0] * 6
+                if getattr(self.bus, "startup_done", False):
+                    # 使能中读不到：保留上一帧画面，只报异常
+                    if self._last_states:
+                        states = self._last_states
+                    bad = [n for n in self.robot.joint_names
+                           if states.get(n) is not None
+                           and getattr(states[n], "pos_invalid", False)]
+                    if bad:
+                        self.msg = "读数异常（不合理跳变）：" + "、".join(bad) \
+                                   + "；已停止把它当保持目标/规划起点"
+                    q = None
+                else:
+                    # 连接了但还没使能/读不到位置：退回零位预演模型
+                    states = self.preview_bus.read_all()
+                    q = [0.0] * 6
         else:
             states = self.preview_bus.read_all()
             q = [0.0] * 6
+        now = time.monotonic()
+        pos_age = {}
+        for n in self.robot.joint_names:
+            st = states.get(n)
+            ts = getattr(st, "pos_read_at", None) if st is not None else None
+            age = None if ts is None else max(0.0, time.time() - ts)
+            if st is not None:
+                st.pos_age_s = age
+            pos_age[n] = age
         with self._lock:
-            self.cache = {"states": states, "q": q}
+            self.cache = {"states": states, "q": q, "pos_age": pos_age}
         self._sync_motion_params()
         self._hold_tick(q)
+        self._hold_guard_tick(states, q)
+        self._status_tick(states)
         if q is not None:
             try:
                 self.cache["scene"] = self.fence.scene(q, self.tcp_preset, self.yaw_deg)
@@ -591,6 +637,260 @@ class Executor:
                 self.cache["near_limit"] = fr.near_limit
             except Exception as exc:  # noqa: BLE001
                 self.msg = f"场景计算异常：{exc}"
+
+    # ---------------- 24 节 A2/A3/A3b/A5 辅助 ----------------
+    # 写命令（需要记录的那些）；读命令不记
+    WRITE_CMDS = {
+        0x07: "模式", 0x08: "电流", 0x09: "速度", 0x0A: "目标位置",
+        0x0E: "电流环P", 0x0F: "电流环I", 0x10: "速度环P", 0x11: "速度环I",
+        0x12: "位置环P", 0x13: "位置环I", 0x14: "位置环D",
+        0x1F: "梯形最大速度", 0x20: "梯形加速度", 0x21: "梯形减速度",
+        0x25: "速度梯形最大速度", 0x26: "速度梯形加速度", 0x27: "速度梯形减速度",
+        0x2A: "使能/失能", 0x2E: "电流环输出下限", 0x2F: "电流环输出上限",
+        0x30: "速度环输出下限", 0x31: "速度环输出上限",
+        0x32: "位置环输出下限", 0x33: "位置环输出上限",
+        0x0D: "存储参数", 0x70: "电流环滤波器开关", 0x74: "速度环滤波器开关",
+        0x78: "位置环滤波器开关", 0x72: "电流环滤波带宽",
+        0x76: "速度环滤波带宽", 0x7A: "位置环滤波带宽",
+        0x58: "电流限流", 0x5A: "速度限制", 0x7E: "堵转能量",
+        0x83: "位置上限", 0x84: "位置下限", 0x87: "Homing 值",
+        0x88: "清 Homing", 0x89: "位置偏置", 0x8C: "位置限位开关",
+        0x90: "归零电流下限", 0x91: "归零电流上限", 0xFE: "清报警",
+    }
+
+    def _decode_write(self, cmd: int, data: bytes, joint: str) -> str:
+        """把写命令的 data 解成便于回报的值；解不出就报原始十六进制。"""
+        hexs = data.hex() or "-"
+        if not data:
+            return "（无数据）"
+        try:
+            if cmd in (0x07, 0x2A, 0x70, 0x74, 0x78, 0x8C) and len(data) == 1:
+                return f"{data[0]}"
+            if cmd == 0x0A and len(data) == 4:
+                turns = struct.unpack(">i", data)[0] / (2.0 ** 24)
+                cfg = self.joint_cfg.get(joint)
+                deg = None if cfg is None else cfg.out_deg(turns)
+                return f"原始 {hexs} = {turns:.6f} 圈 = {deg:.3f}°" if deg is not None \
+                    else f"原始 {hexs} = {turns:.6f} 圈"
+            if cmd in (0x1F, 0x20, 0x21, 0x25, 0x26, 0x27) and len(data) == 4:
+                from .sca import PROFILE_SCALE
+                rpm = struct.unpack(">i", data)[0] / (2.0 ** 24) * PROFILE_SCALE
+                return f"原始 {hexs} = {rpm:.3f} RPM = {rpm * 10.0 / 60.0:.3f}°/s"
+            if cmd in (0x83, 0x84) and len(data) == 4:
+                turns = struct.unpack(">i", data)[0] / (2.0 ** 24)
+                return f"原始 {hexs} = {turns:.6f} 圈 = {turns * 10.0:.2f}°"
+            if cmd == 0xFE:
+                return f"0x{data.hex()}"
+            if len(data) == 4:
+                raw = struct.unpack(">i", data)[0]
+                return f"原始 {hexs} = int32 {raw} = IQ24 {raw / (2.0 ** 24):.6f}"
+        except Exception:  # noqa: BLE001
+            pass
+        return f"原始 {hexs}"
+
+    def _on_bus_event(self, addr: int, cmd: int, data: bytes, ok):
+        """A5：EcbTransport 的写命令钩子。只记写命令，读不回灌记录。"""
+        if cmd not in self.WRITE_CMDS:
+            return
+        if self.recorder is None:
+            return
+        joint = "?"
+        try:
+            for n, m in self.bus.motors.items():
+                if m.mid == addr:
+                    joint = n
+                    break
+        except Exception:  # noqa: BLE001
+            pass
+        if joint == "?":
+            joint = f"ID{addr}"
+        try:
+            self.recorder.write_cmd(joint, cmd, self._decode_write(cmd, data, joint),
+                                    ok, self.WRITE_CMDS.get(cmd, ""))
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _on_read_anomaly(self, name, raw_hex, raw_deg, prev_deg, dt):
+        """A3：把原始回包十六进制记进日志，并在网页提示。"""
+        txt = (f"{name} 读数异常：原始 {raw_hex or '（单条读回，无原始帧）'} "
+               f"换算 {raw_deg:.3f}°")
+        if prev_deg is not None:
+            txt += f"，上一次可信 {prev_deg:.3f}°"
+        if dt is not None and math.isfinite(dt):
+            txt += f"，间隔 {dt:.2f} s"
+        self.msg = txt
+        if self.recorder:
+            try:
+                self.recorder.command("read_anomaly", txt, joint=name,
+                                      target_deg=raw_deg)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _status_tick(self, states):
+        """A5：电源/模式/报警 5 Hz 落盘；回读节拍掉到 15 Hz 以下时降到 2 Hz。"""
+        if self.recorder is None or not isinstance(self.bus, JointBus):
+            return
+        if not getattr(self.bus, "startup_done", False):
+            return
+        now = time.monotonic()
+        period = self._status_period_s
+        if getattr(self, "_poll_tick_hz", 0.0) and self._poll_tick_hz < 15.0:
+            period = 0.5
+        if now - self._last_status_at < period:
+            return
+        self._last_status_at = now
+        try:
+            rows = self.bus.read_status()
+        except Exception as exc:  # noqa: BLE001
+            self.msg = f"状态回读（0x2B/0x55/0xFF）失败：{exc}"
+            return
+        for n, row in rows.items():
+            st = (states or {}).get(n) or self._last_states.get(n)
+            if st is None:
+                continue
+            if row.get("mode") is not None:
+                st.mode = row["mode"]
+                st.mode_read_at = time.time()
+            if row.get("error") is not None:
+                st.error = row["error"]
+            if row.get("power") is not None:
+                st.enabled = (row["power"] == 1)
+        try:
+            self.recorder.status(rows)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _hold_guard_reset(self):
+        self.hold_guard = {"active": False, "hist": {}, "resent": {},
+                           "resend_dist": {}, "since": None}
+
+    def _hold_guard_tick(self, states, q):
+        """A3b：保持失效检测。
+
+        保持状态（中止以后、到位以后、停机等待时）里，若可信读数离保持目标
+        超过 3° 并且在 0.3 s 内继续远离：先重发一次“模式 6 + 保持目标”；
+        0.5 s 后还在远离 → 判保持失效（红色横幅、停收新命令、不自动失能）。
+        """
+        if self.hold_failure:
+            return
+        if self.bus is None or self.motion is None:
+            return
+        busy = bool(self.motion.status.get("busy")) or self.park_active
+        if busy or self.drag_active or self.calib.active or self.park_block:
+            self._hold_guard_reset()
+            return
+        if not getattr(self.bus, "startup_done", False):
+            self._hold_guard_reset()
+            return
+        targets = dict(getattr(self.bus, "_targets", {}) or {})
+        if not targets:
+            self._hold_guard_reset()
+            return
+        g = self.hold_guard
+        now = time.monotonic()
+        if not g["active"]:
+            g["active"] = True
+            g["since"] = now
+        for name in self.robot.joint_names:
+            tgt = targets.get(name)
+            st = states.get(name) if states else None
+            if tgt is None or st is None:
+                continue
+            val = st.out_deg
+            if val is None or getattr(st, "pos_invalid", False):
+                continue
+            dist = abs(float(val) - float(tgt))
+            hist = g["hist"].setdefault(name, [])
+            hist.append((now, dist))
+            while hist and now - hist[0][0] > 1.5:
+                hist.pop(0)
+            if dist <= 3.0:
+                g["resent"].pop(name, None)
+                g["resend_dist"].pop(name, None)
+                continue
+            old = None
+            for t, d in hist:
+                if now - t >= 0.3:
+                    old = d
+                else:
+                    break
+            away = old is not None and dist > old + 0.3
+            if not away:
+                continue
+            resent = g["resent"].get(name)
+            if resent is None:
+                self._hold_resend(name, tgt)
+                g["resent"][name] = now
+                g["resend_dist"][name] = dist
+                if self.recorder:
+                    try:
+                        self.recorder.command(
+                            "hold_resend",
+                            f"{name} 保持偏 {dist:.2f}° 且仍在远离，已重发模式 6 + 保持目标 "
+                            f"{tgt:.3f}°", joint=name, target_deg=tgt)
+                    except Exception:  # noqa: BLE001
+                        pass
+            elif now - resent >= 0.5 and dist > g["resend_dist"].get(name, dist) + 0.3:
+                d = float(val) - float(tgt)
+                direction = "正方向" if d > 0 else "负方向"
+                self.hold_failure = {
+                    "active": True, "joint": name, "direction": direction,
+                    "offset_deg": round(d, 2), "dist_deg": round(dist, 2),
+                    "target_deg": round(float(tgt), 3),
+                    "actual_deg": round(float(val), 3),
+                    "since": time.time(), "disabled": [],
+                    "msg": (f"保持失效：{name} 往{direction}偏了 {dist:.1f}°（目标 "
+                            f"{float(tgt):.1f}°，实际 {float(val):.1f}°）。"
+                            "扶住这一段，再决定是否单颗失能或拉空开。"),
+                }
+                self.msg = self.hold_failure["msg"]
+                if self.recorder:
+                    try:
+                        self.recorder.command("hold_failure",
+                                              self.hold_failure["msg"], joint=name,
+                                              target_deg=float(tgt),
+                                              pos_deg=float(val))
+                    except Exception:  # noqa: BLE001
+                        pass
+                return
+
+    def _hold_resend(self, name: str, target_deg: float):
+        """重发“模式 6 + 保持目标”（A3b 第 1 条）。"""
+        try:
+            m = self.bus.motors[name]
+            cfg = self.bus.cfg[name]
+            m.set_target_turns(cfg.turns(target_deg))
+            m.set_mode(MODE_PROFILE_POSITION)
+            m.set_target_turns(cfg.turns(target_deg))
+            self.bus._targets[name] = target_deg
+        except Exception as exc:  # noqa: BLE001
+            self.msg = f"{name} 保持重发失败：{exc}"
+
+    def hold_disable_joint(self, joint: str, confirmed: bool = False) -> dict:
+        """A3b 第 3 条：只在保持失效状态下出现，单颗失能要二次确认。"""
+        if not self.hold_failure:
+            raise MotionError("当前没有保持失效")
+        if not confirmed:
+            raise MotionError("单颗失能要二次确认：提示臂会掉，先扶住这一段")
+        j = str(joint or "").upper()
+        if j != self.hold_failure.get("joint"):
+            raise MotionError(f"只有报保持失效的 {self.hold_failure.get('joint')} 可以单颗失能")
+        if self.motion and self.motion.status.get("busy"):
+            raise MotionError("还在运动，先按停")
+        ok = self.bus.disable_one(j)
+        self.hold_failure["disabled"].append(j)
+        self.hold_failure["msg"] = (f"{j} 已单颗失能；其余关节保持。"
+                                    "现在只能扶持停机或拉直流空开。")
+        self.msg = self.hold_failure["msg"]
+        if self.recorder:
+            try:
+                self.recorder.command("disable_joint", f"保持失效：单颗失能 {j}",
+                                      joint=j, power=0)
+            except Exception:  # noqa: BLE001
+                pass
+        self.hold_guard = {"active": False, "hist": {}, "resent": {},
+                           "resend_dist": {}, "since": None}
+        return {"ok": bool(ok), "msg": self.msg}
 
     # ---------------- 状态 ----------------
     def save_web_state(self, snap: dict) -> dict:
@@ -630,8 +930,12 @@ class Executor:
             pending = bool(self.pending)
         ms.pop("segments", None)
         joints = []
+        now_wall = time.time()
         for n in self.robot.joint_names:
             st = states.get(n)
+            if st is not None:
+                st.mode_age_s = (None if getattr(st, "mode_read_at", None) is None
+                                 else max(0.0, now_wall - st.mode_read_at))
             joints.append(st.as_dict() if st is not None else
                           {"name": n, "id": self.joint_cfg[n].id,
                            "enabled": None, "out_deg": None})
@@ -694,6 +998,12 @@ class Executor:
             "end_effector": self.end_effector,
             "payload_kg": self.payload_kg,
             "capacities": self.capacities(),
+            "hold_failure": (dict(self.hold_failure) if self.hold_failure else None),
+            "hold_guard": {"active": bool(self.hold_guard.get("active")),
+                           "since_s": (None if self.hold_guard.get("since") is None
+                                       else round(time.monotonic() - self.hold_guard["since"], 1)),
+                           "resent": sorted(self.hold_guard.get("resent", {}).keys())},
+            "read_tick_hz": round(float(getattr(self, "_poll_tick_hz", 0.0) or 0.0), 1),
             "hold": {"ratio": self.hold.get("ratio", 0.0),
                      "since_s": (None if self.hold.get("since") is None else
                                  round(time.monotonic() - self.hold["since"], 1)),
@@ -738,6 +1048,10 @@ class Executor:
 
     # ---------------- 规划 ----------------
     def _ready_for_motion(self, allow_hold: bool = False):
+        if self.hold_failure:
+            raise MotionError(
+                "保持失效中，已停止接受新的运动命令：" + self.hold_failure.get("msg", "")
+                + "（其余关节照常保持；先决定单颗失能或拉空开/扶持停机）")
         if self.park_active or (self._park_thread and self._park_thread.is_alive()):
             raise MotionError("停机流程正在跑：先按停，等它停在保持状态")
         if self.config_stale:
@@ -771,30 +1085,52 @@ class Executor:
 
     # ---------------- 18.1 / 18.2 搁架、末端配置、力矩 ----------------
     def park_config(self) -> dict:
-        """按 park_side 调整搁架位置和三个停机点（q1 取 ±90°）。"""
+        """A9/18.3：收拢点、预停机点的 q1 都取教的停机位置；park_side 由它推出来。
+
+        三者对不上（含配置里另存的 park_side 和 q1 符号相反）就写进
+        ``park_consistency``，由 park() 拒绝停机。
+        """
         pk = json.loads(json.dumps(self.park_cfg))   # deep copy
         taught = bool(pk.get("park_taught"))
+        raw_poses = pk.get("poses") or {}
+        problems: list[str] = []
         if taught:
-            qp = list((pk.get("poses") or {}).get("park") or [0] * 6)
-            # 教的最终位置决定 J1 在哪一侧；tuck/pre 仍用该侧的 ±90°
+            qp = list(raw_poses.get("park") or [0] * 6)
             side = -1 if float(qp[0]) < 0 else 1
-            pk["park_side"] = side
-        side = int(pk.get("park_side", -1))
+            q1 = float(qp[0])
+            stored = pk.get("park_side")
+            if stored is not None and int(stored) != side:
+                problems.append(
+                    f"配置里另存的 park_side={int(stored)} 和教的停机位置 q1={q1:.2f}°"
+                    f"（{'+y' if side > 0 else '−y'} 侧）相反")
+            # 收拢点、预停机点的 q1 必须和教的 q1 对得上（容差 2°）
+            for key in ("tuck", "pre"):
+                q = list(raw_poses.get(key) or [0] * 6)
+                if abs(float(q[0]) - q1) > 2.0:
+                    problems.append(
+                        f"{key} 的 q1={float(q[0]):.2f}° 和教的停机位置 q1={q1:.2f}° 差"
+                        f"{abs(float(q[0]) - q1):.1f}°")
+        else:
+            side = int(pk.get("park_side", -1))
+            q1 = 90.0 * side
+        pk["park_side"] = side
         sh = pk.get("shelf") or {}
         if side > 0 and sh.get("center"):
             sh["center"] = [-float(sh["center"][0]), -float(sh["center"][1])]
             sh["rotate_deg"] = 90.0
-        pk["park_side"] = side
         pk["shelf"] = sh
-        q1 = 90.0 * side
         poses = {}
         for key in ("tuck", "pre", "park"):
-            q = list((pk.get("poses") or {}).get(key) or [0] * 6)
-            # 教过的 park 保留 q1；tuck/pre 仍按 park_side 的 ±90°
-            if not (taught and key == "park"):
+            q = list(raw_poses.get(key) or [0] * 6)
+            if taught:
+                q[0] = q1
+            else:
                 q[0] = q1
             poses[key] = q
         pk["poses"] = poses
+        pk["park_consistency"] = {"ok": not problems, "problems": problems}
+        pk["contact_j4_z"] = pk.get("contact_j4_z")
+        pk["contact_j4_z_at"] = pk.get("contact_j4_z_at")
         z_min = float(pk.get("descent_min_j4_z") or 130.5)
         step = float(pk.get("descent_step_mm") or 1.0)
         pk["descent"] = {
@@ -1262,6 +1598,9 @@ class Executor:
 
     def park(self, preview: bool = False, prereq: dict | None = None) -> dict:
         self._reject_if_parking()
+        cons = self.park_config().get("park_consistency") or {"ok": True, "problems": []}
+        if not cons.get("ok"):
+            raise MotionError("停机点配置对不上，拒绝停机：" + "；".join(cons["problems"]))
         m = self.planning_motion()
         if m.status.get("busy"):
             raise MotionError("正在运动，先按停")
@@ -1374,6 +1713,21 @@ class Executor:
         self.msg = "已确认启停比对差异，解除运动拦截"
         return {"ok": True, "msg": self.msg}
 
+    def _contact_height_decision(self, z: float) -> tuple[str, str]:
+        """A9 第 5 条：接住高度和第一次成功停机记录比。
+
+        返回 ("first", "") 第一次（要记录）/ ("ok", "") 在 5 mm 内 /
+        ("mismatch", 说明) 超 5 mm（要原地保持）。
+        """
+        rec = self.park_cfg.get("contact_j4_z")
+        if rec is None:
+            return "first", ""
+        diff = abs(float(z) - float(rec))
+        if diff > 5.0:
+            return "mismatch", (f"接触高度和记录差 {diff:.1f} mm"
+                                f"（现在 z={float(z):.1f}，记录 {float(rec):.1f}）")
+        return "ok", ""
+
     def _start_park(self, plan: dict):
         if self.park_active or (self._park_thread and self._park_thread.is_alive()):
             raise MotionError("停机流程已经在跑")
@@ -1453,7 +1807,8 @@ class Executor:
                 m.execute(plan["lift"] + plan["tuck"] + plan["pre"],
                           preview=False, clear_stop=False)
                 check_stop()
-                time.sleep(min(settle, 0.2))
+                # A9/18.3 第 3 步：到预停机点以后静置 1 s 再采 I₀
+                time.sleep(settle)
                 check_stop()
                 i0 = self._sample_currents(["J2", "J3"], stop_event=self._park_stop)
                 check_stop()
@@ -1484,6 +1839,37 @@ class Executor:
                         contact = True
                         self.park_step["contact_z"] = round(z, 2)
                         break
+                # A9 第 5 条：接触高度和第一次成功停机记下的值比，差 >5 mm 原地保持
+                if contact:
+                    verdict, detail = self._contact_height_decision(z)
+                    if verdict == "mismatch":
+                        res = best_hold()
+                        un = (res or {}).get("unconfirmed") or []
+                        self.park_step.update({"phase": "contact_mismatch",
+                                               "z": round(z, 2),
+                                               "contact_z": round(z, 2)})
+                        self.msg = (detail + "（搁架挪了，或者接触判错）。"
+                                    "已原地保持，没有往下失能。")
+                        if un:
+                            self.msg += "；保持未确认：" + "，".join(
+                                f"{x.get('name')}({x.get('reason')})" for x in un)
+                        return
+                    if verdict == "first":
+                        try:
+                            pk2 = json.loads(json.dumps(self.park_cfg))
+                            pk2["contact_j4_z"] = round(float(z), 2)
+                            pk2["contact_j4_z_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+                            cfgmod.save_park(pk2)
+                            self.park_cfg = pk2
+                        except Exception as exc:  # noqa: BLE001
+                            self.msg = f"接触高度记录失败（不影响停机）：{exc}"
+                        if self.recorder:
+                            try:
+                                self.recorder.command(
+                                    "contact_record",
+                                    f"第一次成功停机：接住 J4 轴高度 z={z:.2f} mm 已记进 park.json")
+                            except Exception:  # noqa: BLE001
+                                pass
                 if not contact:
                     check_stop()
                     back = m._plan_move(cur_q, pre_q, "回预停机点")
@@ -1504,7 +1890,7 @@ class Executor:
                     z = nz
                     cur_q = m.read_q()
                 check_stop()
-                time.sleep(min(settle, 0.2))
+                time.sleep(settle)
                 i1 = self._sample_currents(["J2", "J3"], stop_event=self._park_stop)
                 check_stop()
                 self.park_step.update({"phase": "at_park", "I1": i1, "z": round(z, 2)})
@@ -1639,6 +2025,60 @@ class Executor:
         self.msg = f"全局速度倍率 {v * 100:.0f}%（之后规划生效）"
         return {"ok": True, "speed_scale": v, "msg": self.msg}
 
+    def check_alarm_latch(self, names=None) -> dict:
+        """A6：逐颗读报警码；不是 0 先清、再读；还不是 0 就拒绝运动并点名。
+
+        每次真机开始、每次“恢复”之前都要走一遍。
+        """
+        if not self.bus:
+            raise MotionError("还没连接")
+        names = list(names or self.bus.order)
+        rows: list[dict] = []
+        bad: list[str] = []
+        for name in names:
+            m = self.bus.motors.get(name)
+            if m is None:
+                bad.append(f"{name}(未知关节)")
+                continue
+            e = None
+            try:
+                e = m.error(timeout=0.1, retries=2)
+            except Exception:  # noqa: BLE001
+                e = None
+            if e is None:
+                rows.append({"name": name, "before": None, "after": None,
+                             "cleared": False, "error": "读不到报警码"})
+                bad.append(f"{name}(读不到报警码)")
+                continue
+            before = e
+            cleared = False
+            if e != 0:
+                try:
+                    cleared = bool(m.clear_error())
+                except Exception:  # noqa: BLE001
+                    cleared = False
+                time.sleep(0.12)
+                try:
+                    e = m.error(timeout=0.1, retries=2)
+                except Exception:  # noqa: BLE001
+                    e = None
+            rows.append({"name": name, "before": f"0x{before:04X}",
+                         "after": None if e is None else f"0x{e:04X}",
+                         "cleared": cleared, "error": ""})
+            if e not in (0, None):
+                bad.append(f"{name}(0x{e:04X})")
+            elif e is None:
+                bad.append(f"{name}(清后读不到)")
+        if self.recorder:
+            try:
+                self.recorder.command(
+                    "alarm_latch", "报警锁存检查：" + "；".join(
+                        f"{r['name']} {r['before']}→{r['after']}" for r in rows)
+                    + ("；不合格 " + "、".join(bad) if bad else "；全部为 0"))
+            except Exception:  # noqa: BLE001
+                pass
+        return {"ok": not bad, "bad": bad, "rows": rows}
+
     def recover(self) -> dict:
         """16.4 第 7 条：中止后保持状态的出口“恢复”。"""
         self._reject_if_parking()
@@ -1648,6 +2088,9 @@ class Executor:
             raise MotionError("还在运动/预演，不能恢复")
         if self.motion.status.get("phase") not in ("aborted", "error", "stopping"):
             raise MotionError("当前不在中止保持状态")
+        lat = self.check_alarm_latch()
+        if not lat["ok"]:
+            raise MotionError("恢复前报警码不是 0，拒绝运动：" + "，".join(lat["bad"]))
         res = self.bus.hold_all()
         un = (res or {}).get("unconfirmed") or []
         if un:
@@ -1657,6 +2100,8 @@ class Executor:
             self.motion.status.update({"phase": "idle", "reason": "", "label": ""})
         self.hold["since"] = None
         self.hold["warn"] = ""
+        self.hold_failure = None
+        self._hold_guard_reset()
         self.pending = None
         self.preview = None
         self.msg = "已恢复：原地保持；可以重新预演或执行"
@@ -2022,6 +2467,11 @@ class Executor:
 
     # ---------------- 清除报警锁存（不发运动/使能） ----------------
     def clear_errors(self, joint: str | None = None) -> dict:
+        """A4：已经使能的关节只清报警，不切模式、不失能。
+
+        读不到电源状态就重试；还读不到就不动这颗并报出来。
+        只有确认了“电源 ≠ 1”或“模式 ≠ 6”才把 startup_done 置假。
+        """
         self._reject_if_parking()
         if not self.bus:
             raise MotionError("还没连接")
@@ -2029,22 +2479,40 @@ class Executor:
             raise MotionError("校准/拖动/运动进行中，先停")
         names = [joint.upper()] if joint else list(self.bus.order)
         state_changed = False
+        mode_bad: list[str] = []
         rows = []
         for name in names:
             if name not in self.bus.motors:
                 raise MotionError(f"未知关节 {name}")
             m = self.bus.motors[name]
-            was_on = False
+            row = {"name": name, "cleared": False, "before": None,
+                   "before_text": None, "after": None, "after_text": None,
+                   "pos_deg": None, "out_of_limit": None, "error": "",
+                   "was_enabled": None, "mode_after": None}
+            # 读电源状态：最多三次；读不到就完全不动这颗
+            pw = None
+            for _ in range(3):
+                try:
+                    pw = m.power(timeout=0.08, retries=1)
+                except Exception:  # noqa: BLE001
+                    pw = None
+                if pw is not None:
+                    break
+                time.sleep(0.05)
+            if pw is None:
+                row["error"] = "读不到电源状态（0x2B），未对这颗粒动任何东西"
+                rows.append(row)
+                continue
+            row["was_enabled"] = (pw == 1)
             before = None
-            pos_deg = None
             try:
-                was_on = m.power() == 1
-                if was_on:
-                    before = m.error()
+                before = m.error(timeout=0.08, retries=1)
             except Exception:  # noqa: BLE001
-                pass
-            # 失能时很多参数读不到；为了读/清报警，短暂零扭矩使能这颗
-            if not was_on:
+                before = None
+            row["before"] = None if before is None else f"0x{before:04X}"
+            row["before_text"] = None if before is None else describe_error(before)
+            # 失能的那颗：只有确认 power==0 才短暂零扭矩使能来清报警
+            if pw != 1:
                 state_changed = True
                 try:
                     m.set_mode(MODE_CURRENT)
@@ -2052,48 +2520,58 @@ class Executor:
                 except Exception:  # noqa: BLE001
                     pass
                 if not m.enable():
-                    rows.append({"name": name, "cleared": False, "before": None,
-                                 "before_text": None, "after": None, "after_text": None,
-                                 "error": "使能无应答，无法清报警"})
+                    row["error"] = "使能无应答，无法清报警（这颗仍是失能状态）"
+                    rows.append(row)
                     continue
                 m.set_mode(MODE_CURRENT)
                 m.set_current_a(0.0)
                 time.sleep(0.15)
                 try:
-                    before = m.error()
+                    before = m.error(timeout=0.08, retries=1)
                 except Exception:  # noqa: BLE001
-                    pass
+                    before = None
+                row["before"] = None if before is None else f"0x{before:04X}"
+                row["before_text"] = None if before is None else describe_error(before)
             try:
-                pp = m.pos_turns()
+                pp = m.pos_turns(timeout=0.1, retries=2)
                 if pp is not None:
-                    pos_deg = round(float(self.bus.cfg[name].out_deg(pp)), 2)
+                    row["pos_deg"] = round(float(self.bus.cfg[name].out_deg(pp)), 2)
             except Exception:  # noqa: BLE001
                 pass
-            ok = False
+            cleared = False
             try:
-                ok = bool(m.clear_error())
+                cleared = bool(m.clear_error())
             except Exception:  # noqa: BLE001
-                ok = False
+                cleared = False
             time.sleep(0.12)
             after = None
             try:
-                after = m.error()
+                after = m.error(timeout=0.08, retries=1)
             except Exception:  # noqa: BLE001
-                pass
-            if not was_on:
+                after = None
+            row["cleared"] = cleared
+            row["after"] = None if after is None else f"0x{after:04X}"
+            row["after_text"] = None if after is None else describe_error(after)
+            # 使能着的关节：A4 要求只清报警，不切模式、不失能；只核对模式
+            if pw == 1:
+                try:
+                    row["mode_after"] = m.mode(timeout=0.08, retries=1)
+                except Exception:  # noqa: BLE001
+                    row["mode_after"] = None
+                if row["mode_after"] not in (MODE_PROFILE_POSITION, None):
+                    mode_bad.append(f"{name}(mode={row['mode_after']})")
+            else:
                 try:
                     m.disable()
                 except Exception:  # noqa: BLE001
                     pass
             lo_s, hi_s = self.bus.cfg[name].safe_limits_deg
-            rows.append({"name": name, "cleared": ok, "pos_deg": pos_deg,
-                         "out_of_limit": None if pos_deg is None else
-                         bool(pos_deg < lo_s - 0.5 or pos_deg > hi_s + 0.5),
-                         "before": None if before is None else f"0x{before:04X}",
-                         "before_text": None if before is None else describe_error(before),
-                         "after": None if after is None else f"0x{after:04X}",
-                         "after_text": None if after is None else describe_error(after)})
-        bad = [r["name"] for r in rows if r.get("error") or r["after"] not in (None, "0x0000")]
+            if row["pos_deg"] is not None:
+                row["out_of_limit"] = bool(row["pos_deg"] < lo_s - 0.5
+                                           or row["pos_deg"] > hi_s + 0.5)
+            rows.append(row)
+        bad = [r["name"] for r in rows if r.get("error")
+               or r["after"] not in (None, "0x0000")]
         out_bad = [r["name"] for r in rows if r.get("out_of_limit")]
         self.msg = ("报警锁存已清除；请先手查机械，再重新使能" if not bad
                     else "清除后仍有报警：" + ", ".join(bad))
@@ -2103,16 +2581,120 @@ class Executor:
             self.bus.startup_done = False
             self.pending = None
             self.preview = None
-            self.msg += "；有电机被短暂使能后又关了，现为未使能状态，必须重新使能"
-        else:
-            bad_ready = self.bus.verify_ready()
-            if bad_ready:
-                self.bus.startup_done = False
-                self.pending = None
-                self.preview = None
-                self.msg += ("；但六颗未全部回到 S 曲线位置模式，已置为未使能："
-                             + "，".join(f"{n}({m})" for n, m in bad_ready))
+            self.msg += "；有电机确认是失能状态，清报警后已重新失能，必须重新使能"
+        elif mode_bad:
+            self.bus.startup_done = False
+            self.pending = None
+            self.preview = None
+            self.msg += "；确认有电机的模式不是 S 曲线位置模式：" + "，".join(mode_bad) \
+                        + "（已置为未使能）"
         return {"ok": not bad and not out_bad, "rows": rows, "msg": self.msg}
+
+    # ---------------- A8 / 21.5 只读环路参数 ----------------
+    READONLY_PARAMS = [
+        (0x19, "位置环P", 4), (0x1A, "位置环I", 4), (0x1B, "位置环D", 4),
+        (0x17, "速度环P", 4), (0x18, "速度环I", 4),
+        (0x79, "位置环滤波器开关", 1), (0x7B, "位置环滤波带宽", 4),
+        (0x75, "速度环滤波器开关", 1), (0x77, "速度环滤波带宽", 4),
+        (0x38, "位置环输出下限", 4), (0x39, "位置环输出上限", 4),
+        (0x1C, "梯形最大速度", 4), (0x1D, "梯形加速度", 4), (0x1E, "梯形减速度", 4),
+        (0x7F, "堵转能量", 4), (0x53, "电流满量程", 2), (0x59, "电流限流", 4),
+        (0x5B, "速度限流", 4),
+    ]
+
+    def readonly_params(self) -> dict:
+        """A8：只读环路参数，一个参数都不写。工具走执行器接口。"""
+        if not self.bus:
+            raise MotionError("还没连接")
+        if not isinstance(self.bus, JointBus):
+            # mock：给一组可核对的假值，让自检能在 mock 里跑通
+            rows = {}
+            for name in self.bus.order:
+                rows[name] = {label: {"raw_hex": "（mock）", "int32": None,
+                                      "iq24": None, "float": None}
+                              for _cmd, label, _n in self.READONLY_PARAMS}
+            return {"ok": True, "mock": True, "rows": rows,
+                    "msg": "mock：只读工具走通（没有真机参数）"}
+        if self.motion and self.motion.status.get("busy"):
+            raise MotionError("正在运动，先按停再读参数（只读，但会占总线）")
+        rows: dict[str, dict] = {}
+        for name in self.bus.order:
+            mid = self.bus.motors[name].mid
+            row = {}
+            for cmd, label, n in self.READONLY_PARAMS:
+                d = None
+                for nn in (n, 4, 2, 1):
+                    if nn < n:
+                        break
+                    try:
+                        d = self.bus.link.read(mid, cmd, nn, timeout=0.08, retries=2)
+                    except Exception:  # noqa: BLE001
+                        d = None
+                    if d is not None:
+                        break
+                if d is None:
+                    row[label] = {"raw_hex": None, "note": "无应答"}
+                    continue
+                item = {"raw_hex": d.hex()}
+                if len(d) == 1:
+                    item["byte"] = d[0]
+                elif len(d) == 2:
+                    item["int16"] = struct.unpack(">h", d)[0]
+                elif len(d) >= 4:
+                    raw = struct.unpack(">i", d[:4])[0]
+                    item["int32"] = raw
+                    item["iq24"] = round(raw / (2.0 ** 24), 6)
+                    try:
+                        item["float"] = round(struct.unpack(">f", d[:4])[0], 6)
+                    except Exception:  # noqa: BLE001
+                        pass
+                row[label] = item
+            rows[name] = row
+        if self.recorder:
+            try:
+                self.recorder.command("readonly_params", "A8 只读环路参数（未写任何参数）")
+            except Exception:  # noqa: BLE001
+                pass
+        return {"ok": True, "mock": False, "rows": rows}
+
+    def readonly_timing(self, n: int = 500, confirmed: bool = False) -> dict:
+        """A8 第 3 条：量 read_all(full=False) 和 set_targets_q 的耗时。"""
+        if not confirmed:
+            raise MotionError("量通信耗时会在保持状态下重写当前目标，要二次确认")
+        if not self.bus:
+            raise MotionError("还没连接")
+        if self.motion and self.motion.status.get("busy"):
+            raise MotionError("正在运动，先按停")
+        n = max(20, min(int(n or 500), 2000))
+        if isinstance(self.bus, MockJointBus):
+            return {"ok": True, "mock": True,
+                    "read_all": {"n": n, "median_ms": 0.05, "p99_ms": 0.1,
+                                 "max_ms": 0.2, "retries": 0},
+                    "set_targets_q": {"n": n, "median_ms": 0.05, "p99_ms": 0.1,
+                                      "max_ms": 0.2}}
+        def stats(vals):
+            vals = sorted(vals)
+            def p(q):
+                i = min(len(vals) - 1, max(0, int(round(q * (len(vals) - 1)))))
+                return round(vals[i] * 1000.0, 3)
+            return {"n": len(vals), "median_ms": p(0.5), "p99_ms": p(0.99),
+                    "max_ms": p(1.0)}
+        t_before = self.bus.link.timeouts
+        ra = []
+        for _ in range(n):
+            t0 = time.monotonic()
+            self.bus.read_all(full=False)
+            ra.append(time.monotonic() - t0)
+        ra_retry = self.bus.link.timeouts - t_before
+        st = []
+        q = self.motion.read_q() if self.motion else [0.0] * len(self.bus.order)
+        tg = {name: float(q[i]) for i, name in enumerate(self.bus.order)}
+        for _ in range(n):
+            t0 = time.monotonic()
+            self.bus.set_targets_q(tg)
+            st.append(time.monotonic() - t0)
+        return {"ok": True, "mock": False, "read_all": {**stats(ra), "retries": ra_retry},
+                "set_targets_q": stats(st)}
 
     # ---------------- 零扭矩拖动 / 手动测量 ----------------
     def drag_start(self, confirmed: bool = False) -> dict:
@@ -2513,6 +3095,17 @@ class Handler(BaseHTTPRequestHandler):
             if p == "/api/clear_errors":
                 EXEC.require_control(body)
                 return self._json(200, EXEC.clear_errors(body.get("joint")))
+            if p == "/api/readonly/params":
+                EXEC.require_control(body)
+                return self._json(200, EXEC.readonly_params())
+            if p == "/api/readonly/timing":
+                EXEC.require_control(body)
+                return self._json(200, EXEC.readonly_timing(
+                    int(body.get("n") or 500), bool(body.get("confirmed"))))
+            if p == "/api/hold_failure/disable_joint":
+                EXEC.require_control(body)
+                return self._json(200, EXEC.hold_disable_joint(
+                    str(body.get("joint") or ""), bool(body.get("confirmed"))))
             if p == "/api/limits/write":
                 EXEC.require_control(body)
                 if not body.get("confirmed"):

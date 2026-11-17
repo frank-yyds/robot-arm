@@ -226,3 +226,17 @@ footer { height: 24px; flex: 0 0 24px; display: flex; justify-content: space-bet
 .safe-check table { width:100%; border-collapse:collapse; margin-top:4px; font-family:ui-monospace,Menlo,monospace; font-size:11px; }
 .safe-check td { padding:1px 3px; }
 .safe-check td.bad { color:#ff8a96; font-weight:600; }
+
+
+/* 24 节 A3b：保持失效红色横幅；A3：读数超时灰显 */
+.hold-fail-banner {
+  position: sticky; top: 0; z-index: 60;
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  padding: 10px 16px; background: #b3261e; color: #fff;
+  font-weight: 600; box-shadow: 0 2px 12px rgba(0,0,0,.4);
+}
+.hold-fail-banner .hf-actions { display: flex; gap: 8px; }
+.hold-fail-banner .btn { background: #fff; color: #b3261e; border-color: #fff; }
+tr.stale td { opacity: .38; }
+tr.invalid td { background: rgba(179,38,30,.18); }
+td.age-cell { font-size: 11px; color: #9aa4b2; white-space: nowrap; }

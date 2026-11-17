@@ -79,6 +79,7 @@ class MockJointBus:
         self.order = list(self.cfg)
         self.q = {n: float((initial_deg or {}).get(n, 0.0)) for n in self.order}
         self.target = dict(self.q)
+        self._targets = dict(self.q)
         self.v = {n: 0.0 for n in self.order}
         self.vmax = {n: self.cfg[n].motion_speed_deg_s for n in self.order}
         self.amax = {n: self.cfg[n].motion_speed_deg_s / self.cfg[n].motion_accel_time_s
@@ -105,6 +106,13 @@ class MockJointBus:
         self.current_limit_readback: dict[str, float | None] = {
             n: 3.0 for n in self.order}
         self.mock_fault_log: list[str] = []
+        # A4/A6：给按颗操作的代码（clear_errors / check_alarm_latch）一个电机代理
+        self.motors = {n: MockMotor(self, n) for n in self.order}
+        self.mode_writes = 0
+        self.mode_set_log: list[tuple[str, int]] = []
+        self.disable_calls = 0
+        self.enable_calls = 0
+        self.drift: dict[str, float] = {}
 
     # ---------------- 生命周期 ----------------
     def preflight(self):
@@ -152,6 +160,11 @@ class MockJointBus:
         if not self.enabled:
             return
         for n in self.order:
+            if n in self.drift:
+                # A3b 自检：这颗不听目标，按给定 °/s 往一个方向走
+                self.q[n] += float(self.drift[n]) * dt
+                self.v[n] = float(self.drift[n])
+                continue
             err = self.target[n] - self.q[n]
             dist = abs(err)
             # 允许的最高速度同时受减速距离限制
@@ -190,7 +203,7 @@ class MockJointBus:
             del self.mock_fault_log[:-2000]
 
     def set_faults(self, silent=None, drop=None, delay=None, error_bits=None,
-                   limits=None, mode=None, currents=None):
+                   limits=None, mode=None, currents=None, drift=None):
         """drop: {"position"/"power"/"mode"/"error"/"current": 概率}；
         delay: {"J4": 1} 或 1（所有关节位置延迟轮数）；
         error_bits: {关节: 位}；limits: {关节: A}；mode: {关节: 模式}。"""
@@ -215,6 +228,8 @@ class MockJointBus:
             self.force_mode = {str(k).upper(): int(v) for k, v in mode.items()}
         if currents is not None:
             self.current_override = {str(k).upper(): float(v) for k, v in currents.items()}
+        if drift is not None:
+            self.drift = {str(k).upper(): float(v) for k, v in drift.items()}
 
     def clear_faults(self):
         self.silent = set()
@@ -223,6 +238,7 @@ class MockJointBus:
         self.error_bits = {}
         self.force_mode = {}
         self.current_override = {}
+        self.drift = {}
         self.mock_fault_log = []
 
     def mock_faults(self):
@@ -232,7 +248,8 @@ class MockJointBus:
                                  for k, v in self.delay_rounds.items()},
                 "error_bits": dict(self.error_bits),
                 "force_mode": dict(self.force_mode),
-                "limits": dict(self.current_limit_readback)}
+                "limits": dict(self.current_limit_readback),
+                "drift": dict(self.drift)}
 
     # ---------------- 读 ----------------
     def read_all(self, full: bool = False):
@@ -285,6 +302,7 @@ class MockJointBus:
             for n, q in targets.items():
                 lo, hi = self.cfg[n].soft_limits_deg
                 self.target[n] = max(lo, min(hi, float(q)))
+                self._targets[n] = self.target[n]
             return {n: True for n in targets}
 
     def set_profiles_q(self, vel, acc=None):
@@ -311,6 +329,7 @@ class MockJointBus:
                     continue
                 self.target[n] = self.q[n]
                 self.v[n] = 0.0
+                self._targets[n] = self.q[n]
                 held[n] = self.q[n]
                 if not self.enabled:
                     unconfirmed.append({"name": n, "reason": "读到了但 power=0"})
@@ -389,3 +408,61 @@ class MockJointBus:
 
     def stats(self):
         return {"tx": 0, "rx": 0, "mock": True, "faults": self.mock_faults()}
+
+
+class MockMotor:
+    """MockJointBus 的单颗代理：只给 clear_errors / check_alarm_latch 用。"""
+
+    def __init__(self, bus, name):
+        self.bus = bus
+        self.name = name
+        self.mid = bus.cfg[name].id
+
+    def power(self, timeout=None, retries=None):
+        b = self.bus
+        if b._lost(self.name, R_POWER):
+            return None
+        return 1 if (b.enabled and self.name not in b.off) else 0
+
+    def error(self, timeout=None, retries=None):
+        if self.bus._lost(self.name, R_ERROR):
+            return None
+        return self.bus.error_bits.get(self.name, self.bus._errors.get(self.name, 0))
+
+    def clear_error(self):
+        self.bus._errors[self.name] = 0
+        self.bus.error_bits.pop(self.name, None)
+        return True
+
+    def mode(self, timeout=None, retries=None):
+        if self.bus._lost(self.name, R_MODE):
+            return None
+        return self.bus.force_mode.get(self.name, MODE_PROFILE_POSITION)
+
+    def set_mode(self, mode):
+        self.bus.mode_writes += 1
+        self.bus.mode_set_log.append((self.name, int(mode)))
+        return True
+
+    def set_current_a(self, amp):
+        return True
+
+    def enable(self):
+        self.bus.enable_calls += 1
+        return True
+
+    def disable(self):
+        self.bus.disable_calls += 1
+        self.bus.off.add(self.name)
+        return True
+
+    def pos_turns(self, timeout=None, retries=None):
+        if self.bus._lost(self.name, R_POSITION):
+            return None
+        return self.bus.cfg[self.name].turns(self.bus.q[self.name])
+
+    def set_target_turns(self, turns):
+        return True
+
+    def set_profile_out(self, *a, **kw):
+        return True
