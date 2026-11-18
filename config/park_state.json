@@ -17,5 +17,6 @@
     "J3": 0.0
   },
   "contact_z": 166.0,
-  "end_effector": "flange"
+  "end_effector": "flange",
+  "valid": false
 }

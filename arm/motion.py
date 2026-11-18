@@ -915,9 +915,25 @@ class Motion:
                         error=err_cache.get(n), target_deg=self._target_q.get(n),
                         current_limit_a=self.bus.current_limit_readback.get(n),
                     )
+            # 26.2 第 1 条：没有 0x94 速度时（扫描段 read_full），用最近
+            # 位置差分估速度，别把“没速度”当成“不动”。
+            now = time.monotonic()
+            if "prev_q" not in locals():
+                prev_q = {}
+                prev_t = None
+            if prev_t is not None and now > prev_t:
+                dt_est = now - prev_t
+                for n in self.order:
+                    st = states.get(n)
+                    if st is None or st.out_deg is None:
+                        continue
+                    if st.velocity_deg_s is None and n in prev_q:
+                        st.velocity_deg_s = (float(st.out_deg) - prev_q[n]) / dt_est
+            prev_q = {n: float(states[n].out_deg) for n in self.order
+                      if states.get(n) is not None and states[n].out_deg is not None}
+            prev_t = now
             if self.recorder:
                 self.recorder.poll(states)
-            now = time.monotonic()
             q = []
             errs: dict[str, float | None] = {}
             for i, n in enumerate(self.order):
@@ -978,8 +994,7 @@ class Motion:
             # 26.2：运动趋势判法
             if None not in q and cmd_v is not None:
                 # 起步 1 s / 5° 反向空程照旧不算
-                grace = (now - t0 <= START_GRACE_S
-                         and float(err0.get(self.order[0]) or 0) >= 0.0)
+                in_start = now - t0 <= START_GRACE_S
                 sample = {"t": round(now - t0, 3), "joints": {}}
                 for i, n in enumerate(self.order):
                     st = states[n]
@@ -1012,7 +1027,17 @@ class Motion:
                         trend["max_rho"][n] = max(trend["max_rho"][n], rho)
                     sample["joints"][n] = [round(lag, 2), round(u, 2),
                                            None if rho is None else round(rho, 2)]
-                    if grace:
+                    # 26.2：起步 1 s 内、5° 以内的反向空程不算；反向超过 5°
+                    # 立即中止；正向、不动照常判。
+                    back = ((float(q[i]) - float(q_from[i]))
+                            * (1.0 if d_all[i] >= 0 else -1.0))
+                    if in_start and back < 0:
+                        if back < -START_REVERSE_DEG:
+                            trend["trig"][n] = "启动反向"
+                            self._trend_log("启动反向")
+                            self._abort(
+                                f"{n} 启动反向 {-back:.1f}° >"
+                                f"{START_REVERSE_DEG:g}°（起始误差 {err0[n]:.1f}°）")
                         trend["away_since"].pop(n, None)
                         trend["stuck_since"].pop(n, None)
                         continue

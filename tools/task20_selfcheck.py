@@ -327,9 +327,10 @@ check("20.9.1 calib.jog 先写目标再切位置模式",
 
 # ---------------- 20.9.2 逐关节跟踪 ----------------
 class Stuck(MockJointBus):
+    # 26.2：不在动的轴兜底阈值是 max(15°, v×2 s)，所以卡住的量要超过 15°
     def read_all(self, full=False):
         d = super().read_all(full)
-        d["J4"].out_deg = 10.0
+        d["J4"].out_deg = 20.0
         return d
 
 
@@ -347,7 +348,9 @@ try:
     check("20.9.2 小关节卡住逐关节发现", False)
 except MotionError as exc:
     check("20.9.2 小关节卡住逐关节发现",
-          "J4" in str(exc) and time.time() - t0 < 1.5, str(exc)[:90])
+          "J4" in str(exc) and time.time() - t0 < 2.5
+          and ("落后" in str(exc) or "不动" in str(exc) or "卡住" in str(exc)),
+          str(exc)[:90])
 
 # ---------------- 20.9.4 换末端清计划 ----------------
 e = mk_exec()
