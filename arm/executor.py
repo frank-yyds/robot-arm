@@ -2628,6 +2628,41 @@ class Executor:
                         + "（已置为未使能）"
         return {"ok": not bad and not out_bad, "rows": rows, "msg": self.msg}
 
+    # ---------------- 26.1 AP-1：只写内存的 PID 调试 ----------------
+    def write_pid_param(self, joint: str, cmd: int, value: float,
+                        confirmed: bool = False) -> dict:
+        """AP-1 用：写 PID 类参数（只进内存，不发 0x0D）。"""
+        if not confirmed:
+            raise MotionError("写电机 PID 参数要二次确认（只进内存，不存储）")
+        if not self.bus or not isinstance(self.bus, JointBus):
+            raise MotionError("只对真机开放")
+        j = str(joint or "").upper()
+        if j not in self.bus.motors:
+            raise MotionError(f"未知关节 {j}")
+        m = self.bus.motors[j]
+        ok = m.write_pid_iq24(int(cmd), float(value))
+        time.sleep(0.2)
+        back = m.read_pid_iq24(int(cmd))
+        if self.recorder:
+            try:
+                self.recorder.command(
+                    "pid_write", f"{j} 0x{int(cmd):02X} 写 {float(value):g} 回读 {back}",
+                    joint=j)
+            except Exception:  # noqa: BLE001
+                pass
+        return {"ok": bool(ok and back is not None and abs(back - float(value)) < 5e-4),
+                "joint": j, "cmd": int(cmd), "value": float(value), "readback": back}
+
+    def read_pid_param(self, joint: str, cmd: int) -> dict:
+        if not self.bus or not isinstance(self.bus, JointBus):
+            raise MotionError("只对真机开放")
+        j = str(joint or "J3").upper()
+        m = self.bus.motors.get(j)
+        if m is None:
+            raise MotionError(f"未知关节 {j}")
+        v = m.read_pid_iq24(int(cmd))
+        return {"ok": v is not None, "joint": j, "cmd": int(cmd), "value": v}
+
     # ---------------- A8 / 21.5 只读环路参数 ----------------
     READONLY_PARAMS = [
         (0x19, "位置环P", 4), (0x1A, "位置环I", 4), (0x1B, "位置环D", 4),
@@ -3134,6 +3169,15 @@ class Handler(BaseHTTPRequestHandler):
             if p == "/api/clear_errors":
                 EXEC.require_control(body)
                 return self._json(200, EXEC.clear_errors(body.get("joint")))
+            if p == "/api/ap1/pid_read":
+                EXEC.require_control(body)
+                return self._json(200, EXEC.read_pid_param(
+                    str(body.get("joint") or "J3"), int(body.get("cmd") or 0x18)))
+            if p == "/api/ap1/pid":
+                EXEC.require_control(body)
+                return self._json(200, EXEC.write_pid_param(
+                    str(body.get("joint") or "J3"), int(body.get("cmd") or 0x11),
+                    float(body.get("value", 0.0001)), bool(body.get("confirmed"))))
             if p == "/api/readonly/params":
                 EXEC.require_control(body)
                 return self._json(200, EXEC.readonly_params())

@@ -367,6 +367,17 @@ class ScaMotor:
             time.sleep(0.01)
         return ok
 
+    def write_pid_iq24(self, cmd: int, value: float, timeout: float = 0.5) -> bool:
+        """26.1：写 PID 类参数（0x10/0x11/0x12/0x13…），格式 IQ24。不存储。"""
+        raw = int(round(float(value) * IQ24))
+        return self._w(cmd, struct.pack(">i", raw), timeout=timeout)
+
+    def read_pid_iq24(self, cmd: int, timeout: float = 0.2) -> float | None:
+        d = self._r(cmd, 4, timeout=timeout, retries=2)
+        if not d:
+            return None
+        return struct.unpack(">i", d)[0] / IQ24
+
     def set_home_turns(self, turns: float = 0.0) -> bool:
         """0x87 设 Home 值/把当前位置设为零。发完以位置回读为准。"""
         raw = int(round(turns * IQ24))
