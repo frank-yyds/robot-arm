@@ -466,6 +466,7 @@ class Executor:
         # A2/A3/A5：读异常回调、写命令记录钩子（真机总线才有）
         if isinstance(self.bus, JointBus):
             self.bus.anomaly_hook = self._on_read_anomaly
+            self.bus.write_resend_hook = self._on_write_resend
             self.bus.link.event_hook = self._on_bus_event
         self.hold_failure = None
         self.hold_guard = {"active": False, "hist": {}, "resent": {},
@@ -723,6 +724,16 @@ class Executor:
             try:
                 self.recorder.command("read_anomaly", txt, joint=name,
                                       target_deg=raw_deg)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _on_write_resend(self, names, targets):
+        txt = ("写目标后 0.06 s 没见速度朝目标起来，已重发一次："
+               + "、".join(f"{n}→{float(targets.get(n, 0.0)):.2f}°" for n in names))
+        self.msg = txt
+        if self.recorder:
+            try:
+                self.recorder.command("write_resend", txt)
             except Exception:  # noqa: BLE001
                 pass
 
@@ -1070,6 +1081,8 @@ class Executor:
             raise MotionError("还没完成启动/使能，不能执行")
         if self.park_block:
             raise MotionError(
+                (str(self.park_block.get("reason")) + "：")
+                if self.park_block.get("reason") else
                 f"启停比对不过（和 parked_q 差 {self.park_block.get('max_diff_deg')}°）："
                 "看过实物、确认没问题后点“已确认”才解除")
         phase = (self.motion.status or {}).get("phase")
@@ -1250,6 +1263,12 @@ class Executor:
         parked = (self.park_state or {}).get("parked_q")
         if not parked:
             return {"has_parked": False, "ok": None}
+        if (self.park_state or {}).get("valid") is False:
+            return {"has_parked": True, "ok": False,
+                    "reason": "上次不是正常停机（扶持停机，或 18.3 没走完），"
+                              "不比对数值；请看实物后点“已确认”解除",
+                    "parked_q": parked,
+                    "ts": (self.park_state or {}).get("ts", "")}
         if not q:
             return {"has_parked": True, "ok": None}
         diffs = {n: round(abs(float(a) - float(b)), 2)
@@ -1742,6 +1761,13 @@ class Executor:
                 raise MotionError("正在运动")
             self._park_stop.clear()
             self.park_active = True
+            # 26.5 第 1 条：停机没走完就断电，parked_q 无效
+            try:
+                self.park_state = dict(self.park_state or {})
+                self.park_state["valid"] = False
+                cfgmod.save_park_state(self.park_state)
+            except Exception:  # noqa: BLE001
+                pass
             self.park_step = {"phase": "moving_pre", "reason": "", "z": None, "step": 0,
                               "I0": None, "I2": None, "I1": None, "contact_z": None,
                               "disabled": []}
@@ -1901,6 +1927,7 @@ class Executor:
                 q_park = m.read_q()
                 self.park_state = {"parked_q": [round(float(v), 4) for v in q_park],
                                    "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+                                   "valid": True,
                                    "I0": i0, "I1": i1, "contact_z": round(z, 2),
                                    "end_effector": self.end_effector}
                 cfgmod.save_park_state(self.park_state)
@@ -2123,6 +2150,14 @@ class Executor:
         if max(abs(float(v)) for v in q) > 2.0:
             raise MotionError("臂不在零位；先回零位并用手扶住前臂，再扶持停机")
         ok = self.bus.disable_all(True, "扶持停机（用户扶住）")
+        self.park_state = dict(self.park_state or {})
+        self.park_state["valid"] = False
+        self.park_state["ts"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        self.park_state["reason"] = "扶持停机"
+        try:
+            cfgmod.save_park_state(self.park_state)
+        except Exception:  # noqa: BLE001
+            pass
         self.park_step = {"phase": "support_parked", "reason": "", "I0": None, "I1": None}
         self.pending = None
         self.preview = None
@@ -3193,10 +3228,15 @@ class Handler(BaseHTTPRequestHandler):
                     if check.get("has_parked") and check.get("ok") is False:
                         EXEC.park_block = {"max_diff_deg": check.get("max_diff_deg"),
                                            "diffs": check.get("diffs"),
+                                           "reason": check.get("reason", ""),
                                            "ts": check.get("ts")}
-                        EXEC.msg = (f"启停比对不过：和 parked_q 差 "
-                                    f"{check.get('max_diff_deg')}°（{check.get('diffs')}）。"
-                                    "已拒绝一切运动；看过实物后点“已确认”解除。")
+                        if check.get("reason"):
+                            EXEC.msg = (str(check["reason"])
+                                        + "。已拒绝一切运动；看过实物后点“已确认”解除。")
+                        else:
+                            EXEC.msg = (f"启停比对不过：和 parked_q 差 "
+                                        f"{check.get('max_diff_deg')}°（{check.get('diffs')}）。"
+                                        "已拒绝一切运动；看过实物后点“已确认”解除。")
                     elif check.get("has_parked") and check.get("ok"):
                         EXEC.park_block = None
                         EXEC.msg = ("臂在停机姿态（搁架上）。先点“抬回预停机点”离开搁架，"

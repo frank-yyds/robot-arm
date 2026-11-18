@@ -95,6 +95,10 @@ class EcbTransport:
         self.debug = debug
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self._sock.bind(("", 0))
+        # 26.7 7b：写目标走单独发送口，不排在读取的重试后面
+        self._wsock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._wsock.bind(("", 0))
+        self._wlock = threading.Lock()
         self._lock = threading.RLock()
         self.tx = 0
         self.rx = 0
@@ -106,6 +110,8 @@ class EcbTransport:
         self.event_hook = None
         # 上一次事务超时：总线可能还有迟到回包，下一次事务先等一下再读空
         self._sync_lost = False
+        # 26.7：按指令统计发送/回包/超时，供链路诊断
+        self.by_cmd: dict[int, dict[str, int]] = {}
         self._resync_until = 0.0
         self.dup_window_s = 0.004     # 收到一条应答后这段窗口内同 key 的包按重复丢弃
         self.resync_wait_s = 0.03     # 超时之后先等这么久，再读空旧包
@@ -122,6 +128,10 @@ class EcbTransport:
             s.close()
 
     # ---------------- 底层 ----------------
+    def _stat(self, cmd: int, key: str, n: int = 1) -> None:
+        d = self.by_cmd.setdefault(cmd, {"tx": 0, "rx": 0, "timeout": 0})
+        d[key] = d.get(key, 0) + n
+
     def _send(self, raw: bytes) -> None:
         try:
             self._sock.sendto(raw, (self.ip, self.port))
@@ -215,9 +225,10 @@ class EcbTransport:
                 self._resync()
                 self._drain_rx()
                 self._send(raw)
+                self._stat(cmd, "tx")
                 end = time.monotonic() + timeout
                 while time.monotonic() < end:
-                    for f in self._collect(min(0.02, end - time.monotonic())):
+                    for f in self._collect(min(0.002, end - time.monotonic())):
                         # ECB 握手应答的 CRC 两字节是 00 00（不参与校验），
                         # 其它指令仍跳过 CRC 不符的帧。
                         if f.crc_ok is False and not (f.addr == 0 or f.cmd == 0x44):
@@ -230,8 +241,10 @@ class EcbTransport:
                 if got_frame is not None:
                     # A2：单个请求不等重复窗口（总线串行，20 ms 会把 trace
                     # 节拍压到 3 Hz）；重复包靠下一次 _drain_rx / _resync 清掉。
+                    self._stat(cmd, "rx")
                     break
                 self.timeouts += 1
+                self._stat(cmd, "timeout")
                 self._sync_lost = True
                 self._resync_until = time.monotonic() + self.resync_wait_s
         if self.event_hook is not None:
@@ -241,6 +254,19 @@ class EcbTransport:
                 pass
         return got_frame
 
+
+    def send_now(self, addr: int, cmd: int, data: bytes = b"") -> None:
+        """26.7 7b：立即发一条不等回包的写命令，不占读取的锁。"""
+        raw = make_frame(addr, cmd, data)
+        with self._wlock:
+            self._wsock.sendto(raw, (self.ip, self.port))
+        self.tx += 1
+        self._stat(cmd, "tx")
+        if self.event_hook is not None:
+            try:
+                self.event_hook(addr, cmd, data, None)
+            except Exception:  # noqa: BLE001
+                pass
 
     def send_cmd(self, addr: int, cmd: int, data: bytes = b"") -> None:
         """只发不等回（有些固件的使能/失能应答不可靠，但状态会变）。"""
@@ -288,22 +314,26 @@ class EcbTransport:
                 self._drain_rx()
                 for addr, cmd, _n in pending:
                     self._send(make_frame(addr, cmd))
+                    self._stat(cmd, "tx")
                 end = time.monotonic() + timeout
                 got_round: set[tuple[int, int]] = set()
                 while time.monotonic() < end and len(got_round) < len(want):
-                    for f in self._collect(min(0.01, end - time.monotonic())):
+                    for f in self._collect(min(0.002, end - time.monotonic())):
                         key = (f.addr, f.cmd)
                         if key in want and len(f.data) >= want[key] and key not in results:
                             results[key] = f.data[:want[key]]
                             got_round.add(key)
+                            self._stat(f.cmd, "rx")
                 pending = [it for it in pending if (it[0], it[1]) not in results]
                 if pending:
                     self.timeouts += len(pending)
+                    for _a, _c, _n in pending:
+                        self._stat(_c, "timeout")
                     self._sync_lost = True
                     self._resync_until = time.monotonic() + self.resync_wait_s
                 else:
                     # 这一轮要的都收到了；把紧跟着的重复回包丢掉
-                    self._drain_dup_any(set(want), 0.004)
+                    self._drain_dup_any(set(want), 0.001)
         if self.event_hook is not None:
             for addr, cmd, _n in items:
                 try:
@@ -342,6 +372,10 @@ class EcbTransport:
         return out
 
     def close(self) -> None:
+        try:
+            self._wsock.close()
+        except Exception:  # noqa: BLE001
+            pass
         try:
             self._sock.close()
         except Exception:  # noqa: BLE001

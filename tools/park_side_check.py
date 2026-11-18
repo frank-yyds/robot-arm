@@ -61,6 +61,15 @@ def main():
         ("接触高度差 6 mm 原地保持、4 mm 通过、第一次要记录", ok3,
          f"6mm={v6}, 4mm={v4}, 0mm={v0}, 未记录={vf}；6mm 说明={d6}"),
     ]
+    # 4) parked_q 无效标记：扶持停机后必须硬拦
+    ex.park_state = {"parked_q": [0.0] * 6, "valid": False, "ts": "test"}
+    chk = ex._park_check([0.0] * 6)
+    ok4 = (chk.get("has_parked") and chk.get("ok") is False
+           and "正常停机" in str(chk.get("reason")))
+    checks.append(("parked_q 无效（扶持停机后）→ 硬拦并说明", ok4, str(chk.get("reason"))[:60]))
+    ex.park_state = {"parked_q": [0.0] * 6, "valid": True, "ts": "test"}
+    chk2 = ex._park_check([0.0] * 6)
+    checks.append(("parked_q 有效 → 正常比对", bool(chk2.get("ok")), str(chk2.get("ok"))))
     ok = all(c[1] for c in checks)
     for name, passed, detail in checks:
         print(f"  {'过' if passed else '没过'}：{name}（{detail}）")

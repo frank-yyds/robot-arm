@@ -113,6 +113,13 @@ class MockJointBus:
         self.disable_calls = 0
         self.enable_calls = 0
         self.drift: dict[str, float] = {}
+        self.stuck: set[str] = set()
+        self.lag_offset: dict[str, float] = {}
+        self.slow: dict[str, float] = {}
+        # 26.7 7：写目标丢包注入 + 统计
+        self.drop_write_prob = 0.0
+        self.write_dropped = 0
+        self.write_resent = 0
 
     # ---------------- 生命周期 ----------------
     def preflight(self):
@@ -160,6 +167,9 @@ class MockJointBus:
         if not self.enabled:
             return
         for n in self.order:
+            if n in self.stuck:
+                self.v[n] = 0.0
+                continue
             if n in self.drift:
                 # A3b 自检：这颗不听目标，按给定 °/s 往一个方向走
                 self.q[n] += float(self.drift[n]) * dt
@@ -169,7 +179,8 @@ class MockJointBus:
             dist = abs(err)
             # 允许的最高速度同时受减速距离限制
             v_allow = math.sqrt(max(0.0, 2.0 * self.amax[n] * dist))
-            desired = min(self.vmax[n], v_allow) * (1.0 if err >= 0 else -1.0)
+            cap = min(self.vmax[n], self.slow.get(n, self.vmax[n]))
+            desired = min(cap, v_allow) * (1.0 if err >= 0 else -1.0)
             dv = desired - self.v[n]
             step = self.amax[n] * dt
             self.v[n] += max(-step, min(step, dv))
@@ -179,6 +190,14 @@ class MockJointBus:
                 self.v[n] = 0.0
             else:
                 self.q[n] += move
+        # 26.2 自检：让这颗固定落后目标 offset 度，但仍在“追”
+        for n, off in self.lag_offset.items():
+            if n in self.stuck or n in self.drift:
+                continue
+            err = self.target[n] - self.q[n]
+            sgn = 1.0 if err >= 0 else -1.0
+            self.q[n] = self.target[n] - sgn * abs(float(off))
+            self.v[n] = sgn * max(1.0, abs(self.v[n]))
 
     # ---------------- 20.0 故障注入 ----------------
     def _lost(self, name: str, cmd: int) -> bool:
@@ -203,7 +222,8 @@ class MockJointBus:
             del self.mock_fault_log[:-2000]
 
     def set_faults(self, silent=None, drop=None, delay=None, error_bits=None,
-                   limits=None, mode=None, currents=None, drift=None):
+                   limits=None, mode=None, currents=None, drift=None,
+                   stuck=None, lag_offset=None, slow=None):
         """drop: {"position"/"power"/"mode"/"error"/"current": 概率}；
         delay: {"J4": 1} 或 1（所有关节位置延迟轮数）；
         error_bits: {关节: 位}；limits: {关节: A}；mode: {关节: 模式}。"""
@@ -230,6 +250,12 @@ class MockJointBus:
             self.current_override = {str(k).upper(): float(v) for k, v in currents.items()}
         if drift is not None:
             self.drift = {str(k).upper(): float(v) for k, v in drift.items()}
+        if stuck is not None:
+            self.stuck = {str(x).upper() for x in stuck}
+        if lag_offset is not None:
+            self.lag_offset = {str(k).upper(): float(v) for k, v in lag_offset.items()}
+        if slow is not None:
+            self.slow = {str(k).upper(): float(v) for k, v in slow.items()}
 
     def clear_faults(self):
         self.silent = set()
@@ -239,6 +265,9 @@ class MockJointBus:
         self.force_mode = {}
         self.current_override = {}
         self.drift = {}
+        self.stuck = set()
+        self.lag_offset = {}
+        self.slow = {}
         self.mock_fault_log = []
 
     def mock_faults(self):
@@ -249,7 +278,10 @@ class MockJointBus:
                 "error_bits": dict(self.error_bits),
                 "force_mode": dict(self.force_mode),
                 "limits": dict(self.current_limit_readback),
-                "drift": dict(self.drift)}
+                "drift": dict(self.drift),
+                "stuck": sorted(self.stuck),
+                "lag_offset": dict(self.lag_offset),
+                "slow": dict(self.slow)}
 
     # ---------------- 读 ----------------
     def read_all(self, full: bool = False):
@@ -295,15 +327,58 @@ class MockJointBus:
             return out
 
     # ---------------- 写 ----------------
-    def set_targets_q(self, targets):
+    def read_cvp_all(self, timeout=None, retries=None):
+        with self._lock:
+            states = self.read_all(full=True)
+            out = {}
+            for n in self.order:
+                st = states[n]
+                lim = self.current_limit_readback.get(n) or self.cfg[n].required_current_limit_a
+                out[n] = {"ok": st.out_deg is not None,
+                          "pos_deg": st.out_deg,
+                          "vel_deg_s": self.v[n],
+                          "current_a": st.current_a,
+                          "limit_a": lim,
+                          "rho": None if (not lim or st.current_a is None)
+                          else abs(st.current_a) / lim}
+            return out
+
+    def read_errors(self, timeout=None, retries=None):
+        with self._lock:
+            return {n: self.error_bits.get(n, self._errors.get(n, 0))
+                    for n in self.order}
+
+    def set_targets_q(self, targets, confirm: bool = True):
+        dropped = []
         with self._lock:
             self.writes += 1
             self._tick()
             for n, q in targets.items():
+                if self.drop_write_prob and random.random() < self.drop_write_prob:
+                    dropped.append(n)
+                    self.write_dropped += 1
+                    continue
                 lo, hi = self.cfg[n].soft_limits_deg
                 self.target[n] = max(lo, min(hi, float(q)))
                 self._targets[n] = self.target[n]
-            return {n: True for n in targets}
+        if confirm and dropped:
+            # 行为确认：丢了的这颗速度/位置不会朝目标走，重发一次
+            time.sleep(0.06)
+            resent = []
+            with self._lock:
+                for n in dropped:
+                    q = float(targets[n])
+                    d = q - self.q[n]
+                    u = (1.0 if d > 0 else -1.0) * self.v[n]
+                    if abs(d) > 0.8 and u < 0.5:
+                        self.target[n] = q
+                        self._targets[n] = q
+                        resent.append(n)
+                        self.write_resent += 1
+            self.last_resend = resent
+        else:
+            self.last_resend = []
+        return {n: True for n in targets}
 
     def set_profiles_q(self, vel, acc=None):
         self.writes += 1

@@ -23,6 +23,7 @@ import numpy as np
 
 from . import gravity
 from .fence import Fence
+from .joints import JointState
 from .kinematics import RobotModel
 from .recorder import Recorder
 from .sca import MODE_POSITION, MODE_PROFILE_POSITION
@@ -717,8 +718,35 @@ class Motion:
                 self.status["phase"] = "idle"
                 self.status["reason"] = ""
 
+    def _trend_log(self, why: str):
+        """26.2 第 6 条：每段每个关节一行；中止时把前 2 s 的 d/u/ρ 存下来。"""
+        t = getattr(self, "_trend_ctx", None)
+        if not t:
+            return
+        self._trend_ctx = None
+        try:
+            if self.recorder:
+                for n in self.order:
+                    self.recorder.command(
+                        "trend_segment",
+                        f"{t['label']}（{why}）最大落后 {t['max_lag'][n]:.2f}°、"
+                        f"最小 u {t['min_u'][n] if t['min_u'][n] is not None else '—'}、"
+                        f"最大 ρ {t['max_rho'][n]:.2f}、触发 {t['trig'][n]}",
+                        joint=n)
+                if why not in ("到位",) and t["samples"]:
+                    for smp in list(t["samples"])[-40:]:
+                        for n, vals in smp["joints"].items():
+                            self.recorder.command(
+                                "trend_trace",
+                                f"t={smp['t']}s 落后 {vals[0]}° u {vals[1]}°/s "
+                                f"ρ {'—' if vals[2] is None else vals[2]}",
+                                joint=n)
+        except Exception:  # noqa: BLE001
+            pass
+
     def _abort(self, reason: str):
         """中止 = 原地保持；只有六颗全部读不到（通信完全断）才全部失能。"""
+        self._trend_log("中止")
         # 22.3：先给记录钩子一个结束信号（不允许它影响中止流程）
         try:
             self._call_hooks(None, None, None, "end",
@@ -841,15 +869,52 @@ class Motion:
         timeout = max(5.0, seg["T"] * 1.5 + 3.0)
         last_ok = {n: t0 for n in self.order}
         consec = 0
-        # 21.4.5：跟踪保护改成和“主机算的应到位置”比，而不是和目标终点比。
-        # 起步反向空程（1 s / 5°）保留；d≈0 的关节按绝对偏差 3° 判。
         lag_ref_t = {n: None for n in self.order}
         err0 = {n: None for n in self.order}
+        # 26.2：运动趋势保护（取代原“落后应到位置”判法）
+        from collections import deque
+        trend = {
+            "t0": t0, "label": seg["label"],
+            "max_lag": {n: 0.0 for n in self.order},
+            "min_u": {n: None for n in self.order},
+            "max_rho": {n: 0.0 for n in self.order},
+            "trig": {n: "无" for n in self.order},
+            "away_since": {}, "stuck_since": {},
+            "tight": bool(seg.get("descend") or seg.get("tight")),
+            "samples": deque(maxlen=80),
+        }
+        self._trend_ctx = trend
+        self._target_q = {n: float(q_target[i]) for i, n in enumerate(self.order)}
+        err_cache = {n: None for n in self.order}
+        cmd_v = None
+        tick = 0
         while True:
             if self._stop.is_set():
                 self._abort(self._stop_reason)
+            tick += 1
             # 22.2 扫描段要带电流/原始计数：read_full=True 时按全量回读。
-            states = self.bus.read_all(full=bool(seg.get("read_full")))
+            if seg.get("read_full"):
+                states = self.bus.read_all(full=True)
+            elif not hasattr(self.bus, "read_cvp_all"):
+                states = self.bus.read_all(full=bool(seg.get("read_full")))
+            else:
+                # 26.2：运动/保持期间用 0x94 一条指令取位置/速度/电流（快）
+                cvp = self.bus.read_cvp_all(timeout=0.03, retries=1)
+                if tick % 5 == 1:
+                    err_cache = self.bus.read_errors()
+                states = {}
+                for n in self.order:
+                    c = self.bus.cfg[n]
+                    d = cvp.get(n) or {}
+                    ok = bool(d.get("ok"))
+                    states[n] = JointState(
+                        name=n, id=c.id, enabled=True if ok else None,
+                        out_deg=(None if not ok else d.get("pos_deg")),
+                        current_a=(None if not ok else d.get("current_a")),
+                        velocity_deg_s=(None if not ok else d.get("vel_deg_s")),
+                        error=err_cache.get(n), target_deg=self._target_q.get(n),
+                        current_limit_a=self.bus.current_limit_readback.get(n),
+                    )
             if self.recorder:
                 self.recorder.poll(states)
             now = time.monotonic()
@@ -908,43 +973,121 @@ class Motion:
                     self._call_hooks(states, q_target.tolist(), [0.0] * 6, "end",
                                      seg["label"], elapsed,
                                      float(seg.get("T") or 0.0))
+                    self._trend_log("到位")
                     return
-            # 21.4.5：每个关节按“同一组速度/加速度下 t 时刻应到位置”算滞后。
-            # lag>max(3°, v×0.5 s) 持续 0.3 s → 中止；起步 1 s/5° 反向空程保留。
-            if None not in q:
+            # 26.2：运动趋势判法
+            if None not in q and cmd_v is not None:
+                # 起步 1 s / 5° 反向空程照旧不算
+                grace = (now - t0 <= START_GRACE_S
+                         and float(err0.get(self.order[0]) or 0) >= 0.0)
+                sample = {"t": round(now - t0, 3), "joints": {}}
                 for i, n in enumerate(self.order):
-                    if err0[n] is None:
-                        err0[n] = errs[n]
-                    d = float(d_all[i])
-                    if abs(d) > 0.1:
+                    st = states[n]
+                    if st.out_deg is None:
+                        continue
+                    vp = abs(float(v_all[i]))          # 本轴规划峰值速度
+                    should = abs(float(cmd_v[i])) > 2.0
+                    if not should:
+                        continue
+                    d_end = float(q_target[i]) - float(st.out_deg)
+                    sdir = 1.0 if d_end >= 0 else -1.0
+                    u = sdir * float(st.velocity_deg_s or 0.0)
+                    lim = (self.bus.current_limit_readback.get(n)
+                           or (self.bus.cfg[n].required_current_limit_a))
+                    rho = (None if (st.current_a is None or not lim)
+                           else abs(float(st.current_a)) / float(lim))
+                    u_min = max(0.5, 0.1 * vp)
+                    # 落后量（相对主机算的应到位置，沿运动方向）
+                    d_move = float(d_all[i])
+                    if abs(d_move) > 0.1:
                         expected = float(q_from[i]) + self._trap_pos(
-                            d, v_all[i], a_all[i], now - t0)
-                        lag = (expected - float(q[i])) * (1.0 if d > 0 else -1.0)
-                        lim = max(3.0, abs(float(v_all[i])) * 0.5)
+                            d_move, v_all[i], a_all[i], now - t0)
+                        lag = (expected - float(q[i])) * (1.0 if d_move > 0 else -1.0)
+                    else:
+                        lag = abs(float(q[i]) - float(q_from[i]))
+                    trend["max_lag"][n] = max(trend["max_lag"][n], lag)
+                    if trend["min_u"][n] is None or u < trend["min_u"][n]:
+                        trend["min_u"][n] = u
+                    if rho is not None:
+                        trend["max_rho"][n] = max(trend["max_rho"][n], rho)
+                    sample["joints"][n] = [round(lag, 2), round(u, 2),
+                                           None if rho is None else round(rho, 2)]
+                    if grace:
+                        trend["away_since"].pop(n, None)
+                        trend["stuck_since"].pop(n, None)
+                        continue
+                    if u >= u_min:
+                        # 慢但在追：不中止
+                        trend["away_since"].pop(n, None)
+                        trend["stuck_since"].pop(n, None)
+                        continue
+                    # 背离：u <= -1 持续 0.3 s
+                    if u <= -1.0:
+                        t_away = trend["away_since"].get(n)
+                        if t_away is None:
+                            trend["away_since"][n] = now
+                        elif now - t_away >= 0.3:
+                            kind = "没抵抗" if (rho is None or rho < 0.3) else "被推走"
+                            trend["trig"][n] = "背离、没抵抗" if kind == "没抵抗" else "背离、被推走"
+                            self._trend_log("背离")
+                            self._abort(
+                                f"{n} 背离目标（{kind}），电流占比 "
+                                f"{'无' if rho is None else f'{rho*100:.0f}%'}"
+                                f"；目标 {float(q_target[i]):.1f}°，实际 {float(q[i]):.1f}°，u={u:.1f}°/s")
+                        continue
+                    else:
+                        trend["away_since"].pop(n, None)
+                    # 不动：|u| < u_min 且 |d| > 0.8
+                    if abs(u) < u_min and abs(d_end) > 0.8:
+                        t_st = trend["stuck_since"].get(n)
+                        if t_st is None:
+                            trend["stuck_since"][n] = now
+                        elif now - t_st >= 0.5:
+                            if rho is not None and rho >= 0.9:
+                                trend["trig"][n] = "卡住或力矩不够"
+                                self._trend_log("卡住")
+                                self._abort(
+                                    f"{n} 卡住或力矩不够，电流占比 {rho*100:.0f}%；"
+                                    f"目标 {float(q_target[i]):.1f}°，实际 {float(q[i]):.1f}°")
+                            else:
+                                trend["trig"][n] = "不动"
+                                self._trend_log("不动")
+                                self._abort(
+                                    f"{n} 不动，电流占比 "
+                                    f"{'无' if rho is None else f'{rho*100:.0f}%'}；"
+                                    f"目标 {float(q_target[i]):.1f}°，实际 {float(q[i]):.1f}°")
+                        continue
+                    else:
+                        trend["stuck_since"].pop(n, None)
+                # 26.2 第 4 条：不规划在动的关节也要兜底（被带走）
+                for i, n in enumerate(self.order):
+                    st = states[n]
+                    if st.out_deg is None:
+                        continue
+                    d_move = float(d_all[i])
+                    if abs(d_move) > 0.1:
+                        expected = float(q_from[i]) + self._trap_pos(
+                            d_move, v_all[i], a_all[i], now - t0)
+                        lag = (expected - float(q[i])) * (1.0 if d_move > 0 else -1.0)
                     else:
                         expected = float(q_from[i])
                         lag = abs(float(q[i]) - expected)
-                        lim = 3.0
-                    # 起步容忍：起始误差 >5° 的关节允许 1 s 内最多 5° 反向空程。
-                    if now - t0 <= START_GRACE_S and float(err0[n] or 0) >= 5.0 - 1e-6:
-                        back = ((float(q[i]) - float(q_from[i]))
-                                * (1.0 if d > 0 else -1.0))
-                        if back < -START_REVERSE_DEG:
-                            self._abort(
-                                f"{n} 启动反向 {-back:.1f}° >"
-                                f"{START_REVERSE_DEG:g}°（起始误差 {err0[n]:.1f}°）")
-                        lag_ref_t[n] = None
-                        continue
-                    if lag > lim:
+                    trend["max_lag"][n] = max(trend["max_lag"][n], lag)
+                    lim_lag = (max(3.0, abs(float(v_all[i])) * 0.5)
+                               if trend["tight"]
+                               else max(15.0, abs(float(v_all[i])) * 2.0))
+                    if lag > lim_lag:
                         if lag_ref_t[n] is None:
                             lag_ref_t[n] = now
                         elif now - lag_ref_t[n] > 0.3:
+                            trend["trig"][n] = "落后兜底"
+                            self._trend_log("落后")
                             self._abort(
-                                f"{n} 实际位置比应到位置落后 {lag:.1f}° "
-                                f"> {lim:.1f}°（应到 {expected:.2f}°，实际 {q[i]:.2f}°）"
-                                "且持续 0.3 s")
+                                f"{n} 落后 {lag:.1f}° > {lim_lag:.1f}° 且持续 0.3 s"
+                                f"（应到位置 {expected:.2f}°，实际 {q[i]:.2f}°）")
                     else:
                         lag_ref_t[n] = None
+                trend["samples"].append(sample)
             if now - t0 > timeout:
                 self._abort(f"到达超时（{timeout:.1f} s）")
             if None not in q:

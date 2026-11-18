@@ -288,7 +288,7 @@ class J3Drift(MockJointBus):
         if self.t0 is None:
             self.t0 = time.monotonic()
         if time.monotonic() - self.t0 > 0.5:
-            d["J3"].out_deg = -8.0   # 目标≈0，实际被带走
+            d["J3"].out_deg = -20.0  # 目标≈0，实际被带走；26.2 兜底阈值 15°
         return d
 
 

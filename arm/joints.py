@@ -66,6 +66,7 @@ class JointState:
     error: int | None = None
     error_text: str = ""
     current_a: float | None = None
+    velocity_deg_s: float | None = None
     current_raw: int | None = None
     current_full_scale_a: float | None = None
     voltage_v: float | None = None
@@ -171,6 +172,8 @@ class JointBus:
         self._invalid_streak: dict[str, int] = {}
         self._invalid_candidate: dict[str, float] = {}
         self._anomaly_at: dict[str, float] = {}
+        self.last_resend: list[str] = []
+        self.write_resend_hook = None
         self.anomaly_hook = None      # fn(name, raw_hex, raw_deg, prev_deg, dt)
         self.plausible_rate = 70.0    # °/s
         self.plausible_margin = 2.0   # °
@@ -249,13 +252,9 @@ class JointBus:
             except Exception:  # noqa: BLE001
                 pass
             time.sleep(0.04)
-            if not m.enable():
-                # A7：第一次没应答，单独再试这一颗；第二次还不行才判失败
-                report.setdefault("enable_retry", []).append(name)
-                time.sleep(0.2)
-                if not m.enable():
-                    self._disable_all_quiet()
-                    raise StartupRefused(f"{name} 使能两次都无应答；已全部失能")
+            if not self._enable_with_retry(m, name, report):
+                self._disable_all_quiet()
+                raise StartupRefused(f"{name} 使能两次都无应答；已全部失能")
             time.sleep(0.05)
             # 使能后立刻零扭矩，避免“使能那一下出力”
             m.set_mode(MODE_CURRENT)
@@ -418,6 +417,15 @@ class JointBus:
         report["msg"] = "零扭矩使能/读核/成链检查通过；已切 S 曲线保持"
         self.startup_report = report
         return report
+
+    @staticmethod
+    def _enable_with_retry(m, name: str, report: dict) -> bool:
+        """A7：第一次使能无应答，单独再试这一颗；第二次还不行才失败。"""
+        if m.enable():
+            return True
+        report.setdefault("enable_retry", []).append(name)
+        time.sleep(0.2)
+        return bool(m.enable())
 
     def _validate_enabled(self, name: str, tel) -> list[str]:
         c = self.cfg[name]
@@ -634,6 +642,60 @@ class JointBus:
                 self._last_state[name] = st
         return out
 
+    def read_cvp_all(self, timeout: float = 0.05, retries: int = 2) -> dict[str, dict]:
+        """26.2：六颗一轮用 0x94 同时取位置/速度/电流（输出端角度）。"""
+        with self._lock:
+            got = self.link.read_many(
+                [(self.motors[n].mid, 0x94, 7) for n in self.order],
+                timeout=timeout, retries=retries)
+            out: dict[str, dict] = {}
+            for name in self.order:
+                d = got.get((self.motors[name].mid, 0x94))
+                if not d or len(d) < 7:
+                    out[name] = {"ok": False}
+                    continue
+                raw = int.from_bytes(d[0:3], "big")
+                if raw & 0x800000:
+                    raw -= 1 << 24
+                pos_turns = raw / 65536.0
+                vel_raw = struct.unpack(">h", d[3:5])[0]
+                cur_raw = struct.unpack(">h", d[5:7])[0]
+                c = self.cfg[name]
+                vel_rpm = vel_raw / 16384.0 * VELOCITY_FULL_RPM
+                cm = self.current_limit_readback.get(name)
+                if cm is None:
+                    try:
+                        cm = self.motors[name].current_limit_a()
+                    except Exception:  # noqa: BLE001
+                        cm = None
+                lim = self.current_limit_readback.get(name) or cm
+                cur_a = None if cm is None else cur_raw / 16384.0 * cm
+                out[name] = {
+                    "ok": True, "raw": d.hex(),
+                    "pos_deg": c.out_deg(pos_turns),
+                    "vel_deg_s": c.sign * vel_rpm * DEG_PER_MOTOR_TURN / 60.0,
+                    "current_a": cur_a,
+                    "limit_a": lim,
+                    "rho": (None if cur_a is None or not lim else abs(cur_a) / lim),
+                }
+        return out
+
+    def read_errors(self, timeout: float = 0.04, retries: int = 1) -> dict[str, int | None]:
+        """26.2：运动循环里 5 Hz 读报警码（按 2 颗一批）。"""
+        with self._lock:
+            got = {}
+            order = list(self.order)
+            for i in range(0, len(order), 2):
+                chunk = order[i:i + 2]
+                got.update(self.link.read_many(
+                    [(self.motors[n].mid, R_ERROR, 2) for n in chunk],
+                    timeout=timeout, retries=retries))
+            out = {}
+            for n in order:
+                d = got.get((self.motors[n].mid, R_ERROR))
+                out[n] = None if d is None else struct.unpack(">H", d[:2])[0]
+        return out
+
     def read_many_raw(self, items, timeout: float = 0.05, retries: int = 2):
         """A2：给 trace 用；和 read_all 走同一把总线锁，不另开收发路径。"""
         with self._lock:
@@ -642,11 +704,15 @@ class JointBus:
     def read_status(self, timeout: float = 0.08) -> dict[str, dict]:
         """A5：电源 0x2B、模式 0x55、报警 0xFF。六颗一起发，丢的按颗单独补。"""
         with self._lock:
-            items = []
-            for n in self.order:
-                mid = self.motors[n].mid
-                items += [(mid, R_POWER, 1), (mid, R_MODE, 1), (mid, R_ERROR, 2)]
-            got = self.link.read_many(items, timeout=timeout, retries=2)
+            # 18 条一起发会超 ECB 的缓冲、造成自己丢包重试；按指令拆成 6 条一批
+            got = {}
+            order = list(self.order)
+            for cmd, n in ((R_POWER, 1), (R_MODE, 1), (R_ERROR, 2)):
+                for i in range(0, len(order), 2):
+                    chunk = order[i:i + 2]
+                    got.update(self.link.read_many(
+                        [(self.motors[nm].mid, cmd, n) for nm in chunk],
+                        timeout=timeout, retries=2))
             out: dict[str, dict] = {}
             for n in self.order:
                 mid = self.motors[n].mid
@@ -672,14 +738,52 @@ class JointBus:
         return out
 
     # ---------------- 写 ----------------
-    def set_targets_q(self, targets: dict[str, float]) -> dict[str, bool]:
+    def set_targets_q(self, targets: dict[str, float], confirm: bool = True) -> dict[str, bool]:
+        """写目标；26.7 7b 用优先发送口，26.7 7 用行为确认送到。"""
         res = {}
         with self._lock:
             for name, q in targets.items():
                 c = self.cfg[name]
-                res[name] = self.motors[name].set_target_turns(c.turns(q))
+                res[name] = self.motors[name].set_target_turns(c.turns(q), priority=True)
                 self._targets[name] = q
+        if confirm:
+            self.confirm_targets(targets)
         return res
+
+    def confirm_targets(self, targets: dict[str, float], wait: float = 0.06) -> list[str]:
+        """26.7 7：写出目标以后看行为（速度朝目标起来/已在到位窗口）。
+
+        只对 |d| > 2° 的关节判；没起来就重发一次并记进 last_resend。
+        """
+        time.sleep(max(0.02, wait))
+        resend: list[str] = []
+        try:
+            cvp = self.read_cvp_all(timeout=0.03, retries=1)
+        except Exception:  # noqa: BLE001
+            return resend
+        for name, q in targets.items():
+            st = cvp.get(name) or {}
+            if not st.get("ok"):
+                continue
+            d = float(q) - float(st.get("pos_deg") or 0.0)
+            if abs(d) <= 0.8:
+                continue
+            u = (1.0 if d > 0 else -1.0) * float(st.get("vel_deg_s") or 0.0)
+            if u >= 0.5:
+                continue
+            try:
+                self.motors[name].set_target_turns(self.cfg[name].turns(q), priority=True)
+                self._targets[name] = q
+                resend.append(name)
+            except Exception:  # noqa: BLE001
+                pass
+        self.last_resend = resend
+        if resend and self.write_resend_hook is not None:
+            try:
+                self.write_resend_hook(resend, targets)
+            except Exception:  # noqa: BLE001
+                pass
+        return resend
 
     def set_profiles_q(self, vel: dict[str, float], acc: dict[str, float] | None = None):
         acc = acc or {}
@@ -870,9 +974,9 @@ class JointBus:
                     continue
                 self._trust[name] = (cand, time.monotonic())
                 try:
-                    m.set_target_turns(pos)
+                    m.set_target_turns(pos, priority=True)
                     m.set_mode(MODE_PROFILE_POSITION)
-                    m.set_target_turns(pos)
+                    m.set_target_turns(pos, priority=True)
                 except Exception as exc:  # noqa: BLE001
                     add(name, f"写目标/切模式失败：{exc}")
                     continue
