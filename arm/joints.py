@@ -23,6 +23,36 @@ from .sca import (DEG_PER_MOTOR_TURN, GEAR, IQ8, IQ10, IQ24,
 from .transport import EcbTransport
 
 
+def startup_enable_issues(cfg, name: str, mode=None, cur=None, pos=None,
+                         pos_before=None, limit_a=None) -> list[str]:
+    """27.2 第 6 条：启动时每颗使能、进入零扭矩以后 0.3 s 内的核对项。
+
+    - 模式不是电流模式（1）→ 失败
+    - 位置比使能前变了 >0.5° → 失败（电机像带着旧目标/旧模式使劲）
+    - 零扭矩时电流 >0.25 A → 失败
+    - ρ = |I|/限流 >0.1 → 失败
+    """
+    bad: list[str] = []
+    if mode is not None and mode != MODE_CURRENT:
+        bad.append(f"模式={mode}，不是电流模式（零扭矩）")
+    if cur is not None and abs(cur) > 0.25:
+        bad.append(f"零扭矩时电流 {cur:.2f} A > 0.25 A")
+    if pos is not None and pos_before is not None:
+        try:
+            moved = abs(cfg.out_deg(pos) - cfg.out_deg(pos_before))
+        except Exception:  # noqa: BLE001
+            moved = None
+        if moved is not None and moved > 0.5:
+            bad.append(f"使能后 0.3 s 内位置变了 {moved:.2f}° > 0.5°"
+                       "（电机像是带着旧目标/旧模式使劲）")
+    if cur is not None and limit_a:
+        rho = abs(cur) / float(limit_a)
+        if rho > 0.1:
+            bad.append(f"零扭矩时 ρ={rho:.2f} > 0.1"
+                       f"（电流 {cur:.2f} A / 限流 {float(limit_a):.2f} A）")
+    return bad
+
+
 @dataclass
 class JointConfig:
     name: str
@@ -160,6 +190,19 @@ class JointBus:
         self.motors = {n: ScaMotor(self.link, self.cfg[n].id) for n in self.order}
         self.discovered: dict[int, int] = {}
         self.connected = False
+        # 27.2 第 3 条：失能以后同一次上电里不再使能（唯一例外 18.3 第 7 条）。
+        # 锁存写进 config/disabled_latch.json，只有用户确认“已断电重上电”才清。
+        self.disabled_latch = False
+        self.disabled_latch_at = None
+        self.disabled_latch_reason = ""
+        try:
+            _lat = cfgmod.load_disabled_latch() or {}
+        except Exception:  # noqa: BLE001
+            _lat = {}
+        if _lat.get("disabled_latch"):
+            self.disabled_latch = True
+            self.disabled_latch_at = _lat.get("at")
+            self.disabled_latch_reason = _lat.get("reason") or ""
         self.startup_done = False
         self.startup_report: dict = {}
         self._lock = threading.RLock()
@@ -219,7 +262,9 @@ class JointBus:
         self.startup_report = report
         return report
 
-    def enable_all(self, confirmed_supported: bool = False) -> dict:
+    def enable_all(self, confirmed_supported: bool = False,
+                   power_cycle_confirmed: bool = False,
+                   allow_restart: bool = False) -> dict:
         """16.4 第 1 条启动序列（v2）：
 
         握手 → 枚举/计数/ID↔SN → 用户确认支撑 → J6→J1 一次一颗
@@ -230,6 +275,21 @@ class JointBus:
         """
         if not confirmed_supported:
             raise StartupRefused("没有确认臂已支撑，拒绝使能")
+        # 27.2 第 3 条：失能以后同一次上电里不再使能
+        if self.disabled_latch:
+            if not power_cycle_confirmed:
+                raise StartupRefused(
+                    "已经失能过（" + (self.disabled_latch_reason or "原因没记")
+                    + "）：27.2 第 3 条规定这一次上电里不再使能任何关节。"
+                    "请拉空开断电、重新上电，再勾选“已经断电重上电”后启动")
+            self.clear_latch_on_power_cycle()
+        # 27.2 第 6 条的配套：六颗已经在保持里时，不许再跑一遍启动序列
+        # （11-18 两次 0x0200 就是这么来的：旧目标当阶跃，见 incident_20261118_AP1.md）
+        if self.startup_done and not allow_restart:
+            raise StartupRefused(
+                "六颗已经在使能保持里（startup_done=True），不要重跑启动序列："
+                "启动序列会把电机里存着的旧目标当阶跃，可能报 0x0200。"
+                "要重新启动，请先正常停机、拉空开断电、再上电")
         if not self.connected:
             r = self.preflight()
             if not r["ok"]:
@@ -252,14 +312,20 @@ class JointBus:
             except Exception:  # noqa: BLE001
                 pass
             time.sleep(0.04)
+            # 27.2 第 6 条：记下使能前的位置，使能后 0.3 s 内比对
+            pos_before = None
+            try:
+                pos_before = m.pos_turns(timeout=0.08, retries=1)
+            except Exception:  # noqa: BLE001
+                pos_before = None
             if not self._enable_with_retry(m, name, report):
                 self._disable_all_quiet()
                 raise StartupRefused(f"{name} 使能两次都无应答；已全部失能")
-            time.sleep(0.05)
             # 使能后立刻零扭矩，避免“使能那一下出力”
             m.set_mode(MODE_CURRENT)
             m.set_current_a(0.0)
-            time.sleep(0.12)
+            # 27.2 第 6 条：0.3 s 内读一次模式/位置/电流（原来只等 0.12 s）
+            time.sleep(0.3)
             m.set_current_a(0.0)
             mode = m.mode()
             cur = m.current_a()
@@ -285,10 +351,10 @@ class JointBus:
                 issues.append(
                     f"当前位置 {out_now:.1f}° 超出安全限位 {lo_s:.0f}..{hi_s:.0f}°；"
                     "先断电手动移回安全范围内再使能")
-            if mode is not None and mode != MODE_CURRENT:
-                issues.append(f"模式={mode}，不是电流模式（零扭矩）")
-            if cur is not None and abs(cur) > 0.25:
-                issues.append(f"零扭矩时电流 {cur:.2f} A > 0.25 A")
+            # 27.2 第 6 条：使能后 0.3 s 内核对模式 / 位置 / 电流 / ρ
+            issues.extend(startup_enable_issues(
+                c, name, mode=mode, cur=cur, pos=pos, pos_before=pos_before,
+                limit_a=tel.current_limit_a))
             if issues:
                 m.disable()
                 self._disable_all_quiet()
@@ -468,6 +534,7 @@ class JointBus:
                 m.disable()
             except Exception:  # noqa: BLE001
                 pass
+        self.latch_disabled("启动自检失败/全部失能")
 
     def disable_all(self, confirmed: bool = False, reason: str = "") -> bool:
         if not confirmed:
@@ -477,7 +544,42 @@ class JointBus:
             ok &= self.motors[name].disable()
             self._enabled_cache[name] = False
         self.startup_done = False
+        self.latch_disabled(reason or "全部失能")
         return ok
+
+    def latch_disabled(self, reason: str = ""):
+        """27.2 第 3 条：记下“这一次上电里已经失能过”，之后不许再使能。"""
+        if not self.disabled_latch:
+            self.disabled_latch = True
+            self.disabled_latch_at = time.strftime("%Y-%m-%dT%H:%M:%S")
+            self.disabled_latch_reason = str(reason or "")
+            if not self.is_mock:
+                try:
+                    cfgmod.save_disabled_latch(
+                        {"disabled_latch": True, "at": self.disabled_latch_at,
+                         "reason": self.disabled_latch_reason})
+                except Exception:  # noqa: BLE001
+                    pass
+        return self.disabled_latch
+
+    def latch_status(self) -> dict:
+        return {"disabled_latch": bool(self.disabled_latch),
+                "at": self.disabled_latch_at,
+                "reason": self.disabled_latch_reason,
+                "msg": ("已经失能过：这一次上电里不再使能任何关节，请拉空开断电后重上电"
+                        if self.disabled_latch else "")}
+
+    def clear_latch_on_power_cycle(self):
+        """用户确认“已经拉空开断电、重新上电”以后才清掉锁存（27.2 第 3 条）。"""
+        self.disabled_latch = False
+        self.disabled_latch_at = None
+        self.disabled_latch_reason = ""
+        if not self.is_mock:
+            try:
+                cfgmod.save_disabled_latch({})
+            except Exception:  # noqa: BLE001
+                pass
+
 
     # ---------------- 读 ----------------
     def _plausible(self, name: str, val: float, now: float) -> tuple[bool, float]:
@@ -858,7 +960,10 @@ class JointBus:
         return out
 
     def disable_one(self, name: str) -> bool:
-        return bool(self.motors[name].disable())
+        ok = bool(self.motors[name].disable())
+        self._enabled_cache[name] = False
+        self.latch_disabled(f"{name} 失能")
+        return ok
 
     def enable_one_hold(self, name: str, pos_turns: float) -> bool:
         """把一颗重新使能到“目标 = 该位置”的 S 曲线保持（停机流程报警时用）。"""

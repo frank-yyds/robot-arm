@@ -36,6 +36,9 @@ class MotionError(RuntimeError):
 # 启动容忍：每段开始，若某颗起始误差 >5°，允许 1 s 内最多 3° 的反向空程；
 # 一旦朝目标动，仍用原来的 >5° 且 0.3 s 不降 1° 判据。超过 3° 立即中止。
 START_GRACE_S = 1.0
+# 27.2 第 2 条：前臂俯仰检查（实测 q2+q3 比应到大 2° 以上，持续 0.2 s 就中止）
+PITCH_TOL_DEG = 2.0
+PITCH_HOLD_S = 0.2
 # 2026-11-15：J2 在停机起步实测反向 3.2°（重力/背隙），3° 太紧；
 # 放宽到 5°，仍远小于“换分支/走反”的量级。
 START_REVERSE_DEG = 5.0
@@ -654,18 +657,37 @@ class Motion:
                 raise
             # 离线/人工 staging：不抬高，直接关节空间到收拢位
             tuck = self._plan_move(q0, poses["tuck"], "收拢（无抬高兜底）")
-            pre = self._plan_move(poses["tuck"], poses["pre"], "J2/J3 到预停机点")
+            pre3a, pre3b = self._plan_pre_split(poses["tuck"], poses["pre"])
+            pre = pre3a + pre3b
             down = (self._plan_move(poses["pre"], poses["park"], "下降到 P")
                     if include_down else [])
-            return {"lift": [], "tuck": tuck, "pre": pre, "park": down,
+            return {"lift": [], "tuck": tuck, "pre": pre,
+                    "pre3a": pre3a, "pre3b": pre3b, "park": down,
                     "poses": poses, "direct_fallback": True}
         cur = lift[-1]["q_target"] if lift else list(q0)
         tuck = self._plan_move(cur, poses["tuck"], "收拢+折腕+转 J1")
-        pre = self._plan_move(poses["tuck"], poses["pre"], "J2/J3 到预停机点")
+        pre3a, pre3b = self._plan_pre_split(poses["tuck"], poses["pre"])
+        pre = pre3a + pre3b
         down = (self._plan_move(poses["pre"], poses["park"], "下降到 P")
                 if include_down else [])
-        return {"lift": lift, "tuck": tuck, "pre": pre, "park": down,
+        return {"lift": lift, "tuck": tuck, "pre": pre,
+                "pre3a": pre3a, "pre3b": pre3b, "park": down,
                 "poses": poses}
+
+    def _plan_pre_split(self, tuck_pose, pre_pose) -> tuple[list[dict], list[dict]]:
+        """27.2 第 1 条：第 3 步拆成 3a（J2 不动，只动 J3 + 腕）和 3b（只动 J2）。
+
+        3a 走完 J3 到位以后才开始 3b；3b 起加前臂俯仰检查（seg["pitch_check"]）。
+        """
+        mid = list(tuck_pose)
+        mid[2] = float(pre_pose[2])
+        mid[3], mid[4], mid[5] = (float(pre_pose[3]), float(pre_pose[4]),
+                                  float(pre_pose[5]))
+        a = self._plan_move(list(tuck_pose), mid, "3a J3 到预停机点")
+        b = self._plan_move(mid, list(pre_pose), "3b J2 到预停机点")
+        for seg in b:
+            seg["pitch_check"] = True
+        return a, b
 
     @staticmethod
     def _park_wrist(pk: dict, poses: dict) -> tuple[float, float, float]:
@@ -689,7 +711,12 @@ class Motion:
         pre[3] = q4
         pre[4] = q5
         pre[5] = q6
-        return self._plan_move(q0, pre, "抬回预停机点")
+        # 27.2 第 1 条反序：先 J2 单独到预停机点的 q2（远端离开 V 槽），再 J3 单独到 q3
+        mid = list(q0)
+        mid[1] = float(pre[1])
+        up_j2 = self._plan_move(list(q0), mid, "抬离搁架：先 J2 到预停机点")
+        up_j3 = self._plan_move(mid, pre, "抬离搁架：再 J3 到预停机点")
+        return up_j2 + up_j3
 
     # ---------------- 执行 ----------------
     def begin_command(self):
@@ -885,6 +912,11 @@ class Motion:
         }
         self._trend_ctx = trend
         self._target_q = {n: float(q_target[i]) for i, n in enumerate(self.order)}
+        # 27.2 第 2 条：前臂俯仰检查状态
+        pitch_since = None
+        pitch_dev_max = 0.0
+        i_j2 = self.order.index("J2") if "J2" in self.order else 1
+        i_j3 = self.order.index("J3") if "J3" in self.order else 2
         err_cache = {n: None for n in self.order}
         cmd_v = None
         tick = 0
@@ -967,6 +999,25 @@ class Motion:
                     for i in range(6)]
                 self._call_hooks(states, cmd_q, cmd_v, "run", seg["label"],
                                  elapsed, float(seg.get("T") or 0.0))
+                # 27.2 第 2 条：前臂俯仰检查（只查“比计划低”这一方向）
+                if seg.get("pitch_check"):
+                    exp_sum = float(cmd_q[i_j2]) + float(cmd_q[i_j3])
+                    act_sum = float(q[i_j2]) + float(q[i_j3])
+                    dev = act_sum - exp_sum
+                    if dev > pitch_dev_max:
+                        pitch_dev_max = dev
+                        with self._lock:
+                            self.status["pitch_dev_max"] = round(dev, 2)
+                    if dev > PITCH_TOL_DEG:
+                        if pitch_since is None:
+                            pitch_since = now
+                        elif now - pitch_since >= PITCH_HOLD_S:
+                            self._abort(
+                                f"前臂俯仰偏 {dev:.1f}°"
+                                f"（J2 落后 {float(q[i_j2]) - float(cmd_q[i_j2]):.1f}°、"
+                                f"J3 落后 {float(q[i_j3]) - float(cmd_q[i_j3]):.1f}°）")
+                    else:
+                        pitch_since = None
                 maxerr = max(errs.values())
                 # 0.8° 以内算到位；J3 这种有摩擦/背隙的关节常停在 0.3~0.5°
                 if maxerr < 0.8:

@@ -1010,6 +1010,9 @@ class Executor:
             "payload_kg": self.payload_kg,
             "capacities": self.capacities(),
             "hold_failure": (dict(self.hold_failure) if self.hold_failure else None),
+            "disabled_latch": (self.bus.latch_status()
+                               if self.bus and hasattr(self.bus, "latch_status")
+                               else {"disabled_latch": False, "msg": ""}),
             "hold_guard": {"active": bool(self.hold_guard.get("active")),
                            "since_s": (None if self.hold_guard.get("since") is None
                                        else round(time.monotonic() - self.hold_guard["since"], 1)),
@@ -1078,6 +1081,10 @@ class Executor:
         if not self.motion or not self.connected:
             raise MotionError("还没连接")
         if not getattr(self.bus, "startup_done", False):
+            if hasattr(self.bus, "latch_status") and self.bus.latch_status().get("disabled_latch"):
+                raise MotionError(
+                    "已经失能过：按 27.2 第 3 条这一次上电里不再使能。"
+                    "请拉空开断电后重上电")
             raise MotionError("还没完成启动/使能，不能执行")
         if self.park_block:
             raise MotionError(
@@ -1733,6 +1740,77 @@ class Executor:
         self.msg = "已确认启停比对差异，解除运动拦截"
         return {"ok": True, "msg": self.msg}
 
+    def park_drop(self, confirmed: bool = False) -> dict:
+        """27.2 第 4 条：停机中途停在搁架上方时，就地失能、让臂落到搁架上。
+
+        只在这种情况下开放：停机序列在第 3–6 步里停住/中止、q1 和教的 q1 差 ≤2°、
+        按实测关节角算出的 J4 轴高 ≤175 mm。按 J6→J1 每颗隔 0.5 s 失能；
+        这时不做 18.3 第 7 条“其余关节变化 >1° 就重新使能”（本来就要让它滑进 V 槽）。
+        """
+        if not confirmed:
+            raise MotionError(
+                "要让臂就地失能落到搁架上，要二次确认（确认以后臂会自己滑下来）")
+        self._reject_if_parking()
+        if self.motion is None:
+            raise MotionError("还没连接")
+        if not getattr(self.bus, "startup_done", False):
+            raise MotionError(
+                "六颗现在不在使能保持里：不能做“就地失能”（这一条只给停机中途、还使能着的时候用）")
+        phase = str((self.park_step or {}).get("phase") or "")
+        allowed = ("moving_pre", "pre_3a_done", "at_pre", "descending",
+                   "contact_mismatch", "catch_failed", "at_park", "aborted")
+        if phase not in allowed:
+            raise MotionError(
+                f"现在不在停机流程第 3–6 步里（phase={phase or '空'}），不开放就地失能")
+        pk = self.park_config()
+        q1p = float((pk.get("poses") or {}).get("pre", [90.0])[0])
+        q = list(self.motion.read_q())
+        if len(q) != 6 or any(v is None for v in q):
+            raise MotionError("读不到完整六关节位置，不能做就地失能")
+        dq1 = abs(float(q[0]) - q1p)
+        if dq1 > 2.0:
+            raise MotionError(
+                f"q1={q[0]:.2f}° 和教的 q1={q1p:.2f}° 差 {dq1:.1f}° > 2°："
+                "不在搁架正上方，就地失能会摔倒，拒绝")
+        z = 120.5 + 203.5 * math.cos(math.radians(float(q[1])))
+        if z > 175.0:
+            raise MotionError(
+                f"按实测角算出的 J4 轴高 {z:.1f} mm > 175 mm：太高，落到搁架上会撞，拒绝")
+        gap = float(self.park_cfg.get("disable_gap_s") or 0.5)
+        disabled: list[str] = []
+        order = list(self.park_cfg.get("disable_order") or
+                     ["J6", "J5", "J4", "J3", "J2", "J1"])
+        for name in order:
+            try:
+                self.bus.disable_one(name)
+            except Exception as exc:  # noqa: BLE001
+                raise MotionError(f"失能 {name} 失败：{exc}") from exc
+            disabled.append(name)
+            time.sleep(gap)
+        self.bus.startup_done = False
+        try:
+            self.park_state = dict(self.park_state or {})
+            self.park_state["valid"] = False
+            cfgmod.save_park_state(self.park_state)
+        except Exception:  # noqa: BLE001
+            pass
+        self.park_step.update({"phase": "dropped_onto_shelf",
+                              "disabled": list(disabled), "z": round(z, 1),
+                              "q": [round(float(v), 2) for v in q]})
+        self.msg = ("已按 J6→J1 就地失能（q1 差 "
+                    f"{dq1:.1f}°、J4 轴高 {z:.1f} mm），臂自己落到搁架上。"
+                    "这次上电不再使能：请拉空开断电。")
+        if self.recorder:
+            try:
+                self.recorder.command(
+                    "park_drop",
+                    f"就地失能落到搁架上：q1 差 {dq1:.2f}°、J4 轴高 {z:.1f} mm、"
+                    f"失能顺序 {','.join(disabled)}")
+            except Exception:  # noqa: BLE001
+                pass
+        return {"ok": True, "disabled": disabled, "q1_diff_deg": round(dq1, 2),
+                "j4_axis_z": round(z, 1), "msg": self.msg}
+
     def _contact_height_decision(self, z: float) -> tuple[str, str]:
         """A9 第 5 条：接住高度和第一次成功停机记录比。
 
@@ -1831,8 +1909,18 @@ class Executor:
             try:
                 # 1–3：抬高、收拢、到预停机点，读 I₀
                 check_stop()
-                m.execute(plan["lift"] + plan["tuck"] + plan["pre"],
-                          preview=False, clear_stop=False)
+                pre3a = plan.get("pre3a")
+                pre3b = plan.get("pre3b")
+                if pre3a is None or pre3b is None:      # 兼容旧 plan 结构
+                    m.execute(plan["lift"] + plan["tuck"] + plan["pre"],
+                              preview=False, clear_stop=False)
+                else:
+                    # 27.2 第 1 条：3a（只动 J3+腕）走完、J3 到位，才走 3b（只动 J2）
+                    m.execute(plan["lift"] + plan["tuck"] + pre3a,
+                              preview=False, clear_stop=False)
+                    check_stop()
+                    self.park_step.update({"phase": "pre_3a_done"})
+                    m.execute(pre3b, preview=False, clear_stop=False)
                 check_stop()
                 # A9/18.3 第 3 步：到预停机点以后静置 1 s 再采 I₀
                 time.sleep(settle)
@@ -1851,6 +1939,8 @@ class Executor:
                     nz = max(z_min, round(z - step_mm, 3))
                     segs = m._plan_move(cur_q, self._park_q_at_z(nz, q1),
                                         f"分步下降 z={nz:.1f}")
+                    for seg in segs:
+                        seg["pitch_check"] = True
                     m.execute(segs, preview=False, clear_stop=False)
                     check_stop()
                     time.sleep(0.15)
@@ -1915,6 +2005,8 @@ class Executor:
                     nz = max(z_min, round(z - step_mm, 3))
                     segs = m._plan_move(cur_q, self._park_q_at_z(nz, q1),
                                         f"再走一步 z={nz:.1f}")
+                    for seg in segs:
+                        seg["pitch_check"] = True
                     m.execute(segs, preview=False, clear_stop=False)
                     z = nz
                     cur_q = m.read_q()
@@ -2118,6 +2210,11 @@ class Executor:
             raise MotionError("还在运动/预演，不能恢复")
         if self.motion.status.get("phase") not in ("aborted", "error", "stopping"):
             raise MotionError("当前不在中止保持状态")
+        # 27.2 第 3 条：已经失能过就不再使能/恢复
+        if hasattr(self.bus, "latch_status") and self.bus.latch_status().get("disabled_latch"):
+            raise MotionError(
+                "已经失能过：按 27.2 第 3 条这一次上电里不再使能、也不恢复。"
+                "请拉空开断电后重上电")
         lat = self.check_alarm_latch()
         if not lat["ok"]:
             raise MotionError("恢复前报警码不是 0，拒绝运动：" + "，".join(lat["bad"]))
@@ -2549,21 +2646,10 @@ class Executor:
                 before = None
             row["before"] = None if before is None else f"0x{before:04X}"
             row["before_text"] = None if before is None else describe_error(before)
-            # 失能的那颗：只有确认 power==0 才短暂零扭矩使能来清报警
+            # 27.2 第 5 条：失能的关节只发清报警指令，不使能（旧 A4 会先零扭矩使能再失能）
             if pw != 1:
                 state_changed = True
-                try:
-                    m.set_mode(MODE_CURRENT)
-                    m.set_current_a(0.0)
-                except Exception:  # noqa: BLE001
-                    pass
-                if not m.enable():
-                    row["error"] = "使能无应答，无法清报警（这颗仍是失能状态）"
-                    rows.append(row)
-                    continue
-                m.set_mode(MODE_CURRENT)
-                m.set_current_a(0.0)
-                time.sleep(0.15)
+                row["note"] = "这颗是失能状态：只清报警，不使能"
                 try:
                     before = m.error(timeout=0.08, retries=1)
                 except Exception:  # noqa: BLE001
@@ -2598,11 +2684,6 @@ class Executor:
                     row["mode_after"] = None
                 if row["mode_after"] not in (MODE_PROFILE_POSITION, None):
                     mode_bad.append(f"{name}(mode={row['mode_after']})")
-            else:
-                try:
-                    m.disable()
-                except Exception:  # noqa: BLE001
-                    pass
             lo_s, hi_s = self.bus.cfg[name].safe_limits_deg
             if row["pos_deg"] is not None:
                 row["out_of_limit"] = bool(row["pos_deg"] < lo_s - 0.5
@@ -2616,10 +2697,16 @@ class Executor:
         if out_bad:
             self.msg += "；但这些关节当前位置超出安全限位，先断电手动移回：" + ", ".join(out_bad)
         if state_changed:
+            # 27.2 第 3/5 条：失能的关节只清报警、不使能；这一次上电不许再使能
             self.bus.startup_done = False
             self.pending = None
             self.preview = None
-            self.msg += "；有电机确认是失能状态，清报警后已重新失能，必须重新使能"
+            lat = ({}
+                   if not hasattr(self.bus, "latch_status") else self.bus.latch_status())
+            if lat.get("disabled_latch"):
+                self.msg += "；有电机是失能状态，本次上电已经失能过，不再使能：请拉空开断电后重上电"
+            else:
+                self.msg += "；有电机确认是失能状态，清报警没有使能它们（要走启动序列请确认臂已支撑）"
         elif mode_bad:
             self.bus.startup_done = False
             self.pending = None
@@ -3261,7 +3348,9 @@ class Handler(BaseHTTPRequestHandler):
                     raise MotionError("正在运动/停机流程/预演，先按停")
                 if EXEC.drag_active:
                     raise MotionError("零扭矩拖动中，先锁定保持")
-                rep = EXEC.bus.enable_all(bool(body.get("confirmed_supported")))
+                rep = EXEC.bus.enable_all(
+                    bool(body.get("confirmed_supported")),
+                    bool(body.get("power_cycle_confirmed")))
                 EXEC.pending = None
                 EXEC.preview = None
                 EXEC.msg = "已使能（J6→J1），S 曲线模式就绪"
@@ -3376,6 +3465,9 @@ class Handler(BaseHTTPRequestHandler):
             if p == "/api/recover":
                 EXEC.require_control(body)
                 return self._json(200, EXEC.recover())
+            if p == "/api/park/drop":
+                EXEC.require_control(body)
+                return self._json(200, EXEC.park_drop(bool(body.get("confirmed"))))
             if p == "/api/park/support":
                 EXEC.require_control(body)
                 return self._json(200, EXEC.support_park(bool(body.get("confirmed"))))

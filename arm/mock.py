@@ -120,6 +120,35 @@ class MockJointBus:
         self.drop_write_prob = 0.0
         self.write_dropped = 0
         self.write_resent = 0
+        # 27.2 第 3 条：失能后这一次上电不再使能（mock 不写真实配置文件）
+        self.disabled_latch = False
+        self.disabled_latch_at = None
+        self.disabled_latch_reason = ""
+        # 27.2 第 6 条自检注入：使能后这颗“带着旧目标/旧模式使劲”
+        self.enable_fault_mode: dict[str, int] = {}
+        self.enable_fault_drift: dict[str, float] = {}
+        self.enable_fault_current: dict[str, float] = {}
+        self.enable_call_log: list[str] = []
+        self.enable_refused_log: list[str] = []
+
+    def latch_disabled(self, reason: str = ""):
+        if not self.disabled_latch:
+            self.disabled_latch = True
+            self.disabled_latch_at = time.strftime("%Y-%m-%dT%H:%M:%S")
+            self.disabled_latch_reason = str(reason or "")
+        return self.disabled_latch
+
+    def latch_status(self):
+        return {"disabled_latch": bool(self.disabled_latch),
+                "at": self.disabled_latch_at,
+                "reason": self.disabled_latch_reason,
+                "msg": ("已经失能过：这一次上电里不再使能任何关节，请拉空开断电后重上电"
+                        if self.disabled_latch else "")}
+
+    def clear_latch_on_power_cycle(self):
+        self.disabled_latch = False
+        self.disabled_latch_at = None
+        self.disabled_latch_reason = ""
 
     # ---------------- 生命周期 ----------------
     def preflight(self):
@@ -128,10 +157,46 @@ class MockJointBus:
         return {"ok": True, "mock": True, "handshake": True,
                 "scan": self.discovered, "mismatch": []}
 
-    def enable_all(self, confirmed_supported: bool = False):
+    def enable_all(self, confirmed_supported: bool = False,
+                   power_cycle_confirmed: bool = False,
+                   allow_restart: bool = False):
+        from .joints import StartupRefused, startup_enable_issues
+        self.enable_call_log.append("enable_all")
         if not confirmed_supported:
-            from .joints import StartupRefused
             raise StartupRefused("没有确认臂已支撑，拒绝使能")
+        if self.startup_done and self.enabled and not allow_restart:
+            raise StartupRefused(
+                "六颗已经在使能保持里（startup_done=True），不要重跑启动序列："
+                "启动序列会把电机里存着的旧目标当阶跃，可能报 0x0200。"
+                "要重新启动，请先正常停机、拉空开断电、再上电")
+        if self.disabled_latch:
+            if not power_cycle_confirmed:
+                self.enable_refused_log.append("latch")
+                raise StartupRefused(
+                    "已经失能过（" + (self.disabled_latch_reason or "原因没记")
+                    + "）：27.2 第 3 条规定这一次上电里不再使能任何关节。"
+                    "请拉空开断电、重新上电，再勾选“已经断电重上电”后启动")
+            self.clear_latch_on_power_cycle()
+        # 27.2 第 6 条：逐颗模拟“使能 0.3 s 后读模式/位置/电流/ρ”的核对
+        for n in reversed(self.order):
+            mode = int(self.enable_fault_mode.get(n, 1))
+            cur = float(self.enable_fault_current.get(n, 0.0))
+            drift = float(self.enable_fault_drift.get(n, 0.0))
+            pos = self.q[n] / 10.0
+            pos_before = pos - (drift * 0.3 / 10.0)
+            issues = startup_enable_issues(
+                self.cfg[n], n, mode=mode, cur=cur, pos=pos,
+                pos_before=pos_before,
+                limit_a=self.current_limit_readback.get(n))
+            if issues:
+                self.enabled = True
+                self.off.add(n)
+                self.startup_done = False
+                self.enabled = False
+                self.latch_disabled(f"{n} 启动核对不合格")
+                raise StartupRefused(
+                    f"{n} 启动核对不合格，已把这颗失能并停下："
+                    + "；".join(issues))
         self.enabled = True
         self.startup_done = True
         for n in self.order:
@@ -154,6 +219,7 @@ class MockJointBus:
             raise StartupRefused("全部失能要二次确认")
         self.enabled = False
         self.startup_done = False
+        self.latch_disabled(reason or "全部失能")
         return True
 
     def close(self):
@@ -430,6 +496,8 @@ class MockJointBus:
             self.off.add(name)
             self.target[name] = self.q[name]
             self.v[name] = 0.0
+            self.disable_calls += 1
+            self.latch_disabled(f"{name} 失能")
             return True
 
     def enable_one_hold(self, name, pos_turns):

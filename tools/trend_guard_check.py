@@ -27,7 +27,7 @@ def run_case(move, faults, inject_after=1.2, trial_time=6.0):
     ex = Executor()
     ex.connect("mock")
     ex.motion.speed_scale = 0.5
-    ex.bus.enable_all(True)
+    ex.bus.enable_all(True, allow_restart=True)
     ex.bus.set_targets_q({n: 0.0 for n in ex.bus.order}, confirm=False)
     ex.bus.target = {n: 0.0 for n in ex.bus.order}
     th = threading.Thread(target=lambda: _safe_move(ex, move), daemon=True)

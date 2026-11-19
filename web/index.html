@@ -18,6 +18,9 @@
       <button id="btn-hold-dismiss" class="btn tiny" type="button" style="display:none">知道了</button>
     </span>
   </div>
+  <div id="latch-banner" class="hold-fail-banner" style="display:none">
+    <span id="latch-text">已失能：请拉空开断电</span>
+  </div>
   <header>
     <div class="brand">
       <span class="dot" id="conn-dot"></span>
@@ -188,6 +191,9 @@
         </div>
         <div class="row">
           <button id="btn-support-park" class="btn danger" style="width:100%" disabled>扶持停机（零位 + 人扶住 + 二次确认）</button>
+        </div>
+        <div class="row">
+          <button id="btn-park-drop" class="btn danger" style="width:100%" disabled>就地失能、落到搁架上（停机中途停在搁架上方时）</button>
         </div>
         <div class="row">
           <button id="btn-disable-all" class="btn danger" style="width:100%" disabled>紧急全部失能（立即断使能，臂会掉）</button>

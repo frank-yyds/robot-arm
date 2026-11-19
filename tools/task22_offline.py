@@ -161,7 +161,7 @@ def test_scan(joint: str, speed: float):
     bus = PhysicsBus(params, offs)
     e = build_exec(bus)
     try:
-        e.bus.enable_all(True)
+        e.bus.enable_all(True, allow_restart=True)
         e.kt = {}
         runner = SweepRunner(e, joint, speed_deg_s=speed, save=False)
         e.sweep_runner = runner
@@ -192,7 +192,7 @@ def test_scan(joint: str, speed: float):
 def test_scan_paths():
     e = build_exec(MockJointBus())
     try:
-        e.bus.enable_all(True)
+        e.bus.enable_all(True, allow_restart=True)
         for joint in ("J2", "J3", "J4"):
             p = plan_sweep(e.motion, joint)
             if not p.get("ok"):
@@ -248,7 +248,7 @@ def test_program_roundtrip():
 
     e.motion.add_hook(hook)
     try:
-        e.bus.enable_all(True)
+        e.bus.enable_all(True, allow_restart=True)
         pts = program_points()
         record_points(e, pts)
         e.program_load("selftest5")
@@ -309,7 +309,7 @@ def test_collision_flag():
     bus = PhysicsBus(params)
     e = build_exec(bus)
     try:
-        e.bus.enable_all(True)
+        e.bus.enable_all(True, allow_restart=True)
         # 监视器用同一组标定值预测（摩擦/偏置已知），阈值下限 0.5 A
         e.kt = {n: {"kt_eff": p[0], "i_fric": p[1], "i_bias": p[2], "rms": 0.0}
                 for n, p in params.items()}
@@ -333,7 +333,7 @@ def test_collision_no_false():
     bus = PhysicsBus(params)
     e = build_exec(bus)
     try:
-        e.bus.enable_all(True)
+        e.bus.enable_all(True, allow_restart=True)
         e.kt = {n: {"kt_eff": p[0], "i_fric": p[1], "i_bias": p[2], "rms": 0.0}
                 for n, p in params.items()}
         n0 = len(e.collision.flag_events)
@@ -366,7 +366,7 @@ def test_collision_exception_and_speed():
     bus = PhysicsBus(params)
     e = build_exec(bus)
     try:
-        e.bus.enable_all(True)
+        e.bus.enable_all(True, allow_restart=True)
         e.kt = {n: {"kt_eff": p[0], "i_fric": p[1], "i_bias": p[2], "rms": 0.0}
                 for n, p in params.items()}
 
@@ -384,7 +384,7 @@ def test_collision_exception_and_speed():
             b = PhysicsBus(params)
             x = build_exec(b)
             try:
-                x.bus.enable_all(True)
+                x.bus.enable_all(True, allow_restart=True)
                 x.collision.enabled = enabled
                 b.read_times.clear()
                 segs = x.motion._plan_move([0] * 6, [0, 20, 0, 0, 0, 0],
