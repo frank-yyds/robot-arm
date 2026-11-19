@@ -7,3 +7,6 @@ __pycache__/
 
 # 模型（体积大，单独留存）
 # models/ 保留入库
+
+# 失能锁存是运行时状态，不入库
+config/disabled_latch.json
