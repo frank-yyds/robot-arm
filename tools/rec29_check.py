@@ -119,8 +119,6 @@ def main(argv=None) -> int:
         now = time.monotonic()
         ticks.append(now - last)
         last = now
-        if time.monotonic() - t0 > 8:
-            break
     rows1 = count_state_rows(d_on)
     size1 = sum(p.stat().st_size for p in d_on.iterdir() if p.is_file())
     elapsed = min(minutes * 60.0, time.monotonic() - t0)

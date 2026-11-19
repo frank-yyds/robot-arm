@@ -3323,10 +3323,6 @@ class Handler(BaseHTTPRequestHandler):
                 return self._events()
             if p == "/api/config":
                 return self._json(200, {"ok": True, **EXEC.config_payload()})
-            if p == "/api/mark":
-                # 29.3 用户标记：安全动作，不要求控制权（任何客户端都能标记）
-                return self._json(200, EXEC.mark(
-                    str(body.get("text") or ""), str(body.get("kind") or "其他")))
             if p == "/api/session":
                 return self._json(200, {"ok": True,
                                         "session": (EXEC.session.id if EXEC.session else None),
@@ -3378,6 +3374,10 @@ class Handler(BaseHTTPRequestHandler):
             if p == "/api/stop":
                 # 停是安全动作：不要求控制权，任何客户端都能停
                 return self._json(200, EXEC.stop_all("用户按停"))
+            if p == "/api/mark":
+                # 29.3 用户标记：安全动作，不要求控制权（任何客户端都能标记）
+                return self._json(200, EXEC.mark(
+                    str(body.get("text") or ""), str(body.get("kind") or "其他")))
             if p == "/api/trace/start":
                 EXEC.require_control(body)
                 try:
