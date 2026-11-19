@@ -48,7 +48,7 @@ def fmt(q):
 
 e = Executor()
 e.connect("mock")
-e.bus.enable_all(True)
+e.bus.enable_all(True, allow_restart=True)
 e.speed_scale = 0.5
 e._sync_motion_params()
 m = e.motion
@@ -123,7 +123,7 @@ try:
     except Exception:  # noqa: BLE001
         pass
     if not getattr(e.bus, "startup_done", False):
-        e.bus.enable_all(True)
+        e.bus.enable_all(True, allow_restart=True)
     # mock 里把臂摆回零位，给 22.2/22.4 一个已知起点（真机这一步由用户扶/抬回）
     for n in NAMES:
         e.bus.q[n] = 0.0

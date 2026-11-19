@@ -48,6 +48,22 @@ def save_park_state(data: dict) -> None:
         json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
+def load_disabled_latch() -> dict:
+    """27.2 第 3 条：这一次上电里已经失能过的锁存（断电重上电才清）。"""
+    return load_json(CONFIG_DIR / "disabled_latch.json", {})
+
+
+def save_disabled_latch(data: dict) -> None:
+    if not data:
+        try:
+            (CONFIG_DIR / "disabled_latch.json").unlink()
+        except FileNotFoundError:
+            pass
+        return
+    (CONFIG_DIR / "disabled_latch.json").write_text(
+        json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
+
+
 def save_park(data: dict) -> None:
     """原子写 config/park.json（记录教的停机位置）。"""
     path = CONFIG_DIR / "park.json"

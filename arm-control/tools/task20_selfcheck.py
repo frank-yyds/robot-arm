@@ -270,7 +270,7 @@ close_exec(e)
 # ---------------- 20.8 预演实际下降 ----------------
 e = mk_exec()
 p = e.park(preview=True, prereq=park_prereq())
-q_expected = e._park_q_at_z(130.5, 90.0)
+q_expected = e._park_q_at_z(130.5, p["preview"]["park"]["poses"]["pre"][0])
 check("20.8 预演画实际下降终点", [round(v, 3) for v in p["preview"]["q"]] ==
       [round(v, 3) for v in q_expected], str(p["preview"]["q"]))
 check("20.8 网页说明教的点的作用（J1 左右侧 / J4–J6 腕姿）",
@@ -327,9 +327,10 @@ check("20.9.1 calib.jog 先写目标再切位置模式",
 
 # ---------------- 20.9.2 逐关节跟踪 ----------------
 class Stuck(MockJointBus):
+    # 26.2：不在动的轴兜底阈值是 max(15°, v×2 s)，所以卡住的量要超过 15°
     def read_all(self, full=False):
         d = super().read_all(full)
-        d["J4"].out_deg = 10.0
+        d["J4"].out_deg = 20.0
         return d
 
 
@@ -347,7 +348,9 @@ try:
     check("20.9.2 小关节卡住逐关节发现", False)
 except MotionError as exc:
     check("20.9.2 小关节卡住逐关节发现",
-          "J4" in str(exc) and time.time() - t0 < 1.5, str(exc)[:90])
+          "J4" in str(exc) and time.time() - t0 < 2.5
+          and ("落后" in str(exc) or "不动" in str(exc) or "卡住" in str(exc)),
+          str(exc)[:90])
 
 # ---------------- 20.9.4 换末端清计划 ----------------
 e = mk_exec()

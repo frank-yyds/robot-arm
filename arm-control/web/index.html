@@ -11,6 +11,16 @@
 </head>
 <body>
 <div id="app">
+  <div id="hold-fail-banner" class="hold-fail-banner" style="display:none">
+    <span id="hold-fail-text">保持失效</span>
+    <span class="hf-actions">
+      <button id="btn-hold-disable" class="btn danger" type="button">只失能这一颗（二次确认）</button>
+      <button id="btn-hold-dismiss" class="btn tiny" type="button" style="display:none">知道了</button>
+    </span>
+  </div>
+  <div id="latch-banner" class="hold-fail-banner" style="display:none">
+    <span id="latch-text">已失能：请拉空开断电</span>
+  </div>
   <header>
     <div class="brand">
       <span class="dot" id="conn-dot"></span>
@@ -156,6 +166,7 @@
         <div class="row two">
           <button id="btn-exec" class="btn primary" disabled>执行</button>
           <button id="btn-stop" class="btn danger" disabled>停</button>
+          <button id="btn-mark" class="btn" disabled title="记一条标记（快捷键 M）：撞到/歪了/异响/抖动">标记</button>
         </div>
         <div class="hint" id="plan-state">还没有计划：先点回零位/拖到可达点或点网格。</div>
         <div class="row two">
@@ -181,6 +192,9 @@
         </div>
         <div class="row">
           <button id="btn-support-park" class="btn danger" style="width:100%" disabled>扶持停机（零位 + 人扶住 + 二次确认）</button>
+        </div>
+        <div class="row">
+          <button id="btn-park-drop" class="btn danger" style="width:100%" disabled>就地失能、落到搁架上（停机中途停在搁架上方时）</button>
         </div>
         <div class="row">
           <button id="btn-disable-all" class="btn danger" style="width:100%" disabled>紧急全部失能（立即断使能，臂会掉）</button>

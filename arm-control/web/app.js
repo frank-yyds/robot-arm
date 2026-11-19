@@ -3,7 +3,7 @@ import { OrbitControls } from './vendor/OrbitControls.js';
 import { TransformControls } from './vendor/TransformControls.js';
 
 // 每次改网页都同时改这里和 web/version.json；刷新后右上角应显示这个版本
-const WEB_VERSION = '2026-11-16.5';
+const WEB_VERSION = '2026-11-19.3';
 const webverEl = document.getElementById('pill-webver');
 if (webverEl) webverEl.textContent = `网页 v${WEB_VERSION}`;
 
@@ -691,7 +691,10 @@ function syncVersion(s) {
 }
 
 let lastUiAt = 0;
+let LAST_STATE = null;
+
 function applyState(s) {
+  LAST_STATE = s;
   syncVersion(s);
   if (CALIB_OPEN) updateCalib(s.calib);
   if (MEASURE_OPEN) updateMeasureUI(s);
@@ -919,6 +922,19 @@ function updateUI(s) {
   $('btn-recover').disabled = !s.connected || !owner || busy || dragActive || unsafe || stale;
   $('btn-unpark').disabled = !s.connected || !owner || busy || dragActive || unsafe || stale;
   $('btn-support-park').disabled = !s.connected || !owner || busy || dragActive || unsafe || stale;
+  updateLatchBanner(s);
+  // 27.2 第 4 条：停机中途停在搁架上方时，就地失能落到搁架上
+  const dropBtn = $('btn-park-drop');
+  if (dropBtn) {
+    const lat = !!(s.disabled_latch && s.disabled_latch.disabled_latch);
+    const ph = ((s.park && s.park.step && s.park.step.phase) || '');
+    const dropPhases = ['moving_pre', 'pre_3a_done', 'at_pre', 'descending',
+      'contact_mismatch', 'catch_failed', 'at_park', 'aborted'];
+    dropBtn.disabled = !s.connected || !owner || busy || dragActive || lat ||
+      !s.startup_done || dropPhases.indexOf(ph) < 0;
+    dropBtn.title = lat ? '已经失能过：请拉空开断电'
+      : '只有在停机流程第 3–6 步停住/中止、q1 差 ≤2°、J4 轴高 ≤175 mm 时才可用';
+  }
   // 紧急失能故意不检查 unsafe；只要连接/控制权/不在运动/不在拖动
   $('btn-disable-all').disabled = !s.connected || !owner || busy || dragActive;
   $('btn-ee').disabled = !owner || busy || dragActive;
@@ -936,6 +952,7 @@ function updateUI(s) {
   $('btn-acquire').disabled = !s.connected || owner || busy || dragActive;
   $('btn-exec').disabled = !s.has_plan || busy || !owner || unsafe || stale;
   $('btn-stop').disabled = !s.connected && !busy;
+  if ($('btn-mark')) $('btn-mark').disabled = !s.connected;
   const ps = document.getElementById('plan-state');
   if (ps) {
     if (!owner) ps.textContent = '只读：另一个页面持有控制权，不能生成/执行计划。';
@@ -956,12 +973,22 @@ function updateUI(s) {
   const tb = document.querySelector('#joints tbody');
   const nearSet = new Set((s.near_limit || []).map((x) => x.joint));
   tb.innerHTML = (s.joints || []).map((j) => {
-    const cls = j.error ? 'err' : (nearSet.has(j.name) ? 'near' : '');
-    const state = j.enabled === false ? '失能' : (j.enabled ? (j.error ? '报警' : '使能') : '—');
+    const age = (j.pos_age_s === null || j.pos_age_s === undefined) ? null : Number(j.pos_age_s);
+    const mage = (j.mode_age_s === null || j.mode_age_s === undefined) ? null : Number(j.mode_age_s);
+    const stale = (age !== null && age > 0.5) || (mage !== null && mage > 0.5);
+    const cls = [j.error ? 'err' : '', j.pos_invalid ? 'invalid' : '',
+                 stale ? 'stale' : '', nearSet.has(j.name) ? 'near' : ''].filter(Boolean).join(' ');
+    let state = j.pos_invalid ? '读数异常'
+      : (j.enabled === false ? '失能' : (j.enabled ? (j.error ? '报警' : '使能') : '—'));
+    if (mage !== null && mage > 0.5) state += `·模式旧(${mage.toFixed(1)}s)`;
+    const ageTxt = j.pos_invalid ? '异常'
+      : (age === null ? '—' : (age > 0.5 ? `${age.toFixed(2)}s 前` : `${Math.round(age * 1000)}ms`));
     return `<tr class="${cls}"><td>${j.name}</td><td>${fmt(j.out_deg, 2)}</td>` +
       `<td>${fmt(j.target_deg, 2)}</td><td>${fmt(j.current_a, 2)}</td>` +
-      `<td>${fmt(j.temp_c, 0)}</td><td>${state}</td></tr>`;
+      `<td>${fmt(j.temp_c, 0)}</td><td>${state}</td>` +
+      `<td class="age-cell">${ageTxt}</td></tr>`;
   }).join('');
+  updateHoldFailure(s);
 
   if (s.preview) {
     const p = s.preview;
@@ -1073,6 +1100,65 @@ function updateUI(s) {
 // ---------------------------------------------------------------------------
 // 22.2 / 22.4 面板
 // ---------------------------------------------------------------------------
+// 24 节 A3b：保持失效横幅 + 声音 + 只失能这一颗
+let holdFailBeeped = null;
+function beepHoldFailure() {
+  try {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return;
+    const ctx = new AC();
+    const o = ctx.createOscillator();
+    const g = ctx.createGain();
+    o.type = 'square';
+    o.frequency.value = 880;
+    g.gain.value = 0.18;
+    o.connect(g).connect(ctx.destination);
+    o.start();
+    o.stop(ctx.currentTime + 0.45);
+    setTimeout(() => ctx.close && ctx.close(), 700);
+  } catch (e) { /* 浏览器不给声音就算了 */ }
+}
+
+function updateLatchBanner(s) {
+  const lat = s.disabled_latch || null;
+  const el = document.getElementById('latch-banner');
+  const txt = document.getElementById('latch-text');
+  if (!el || !txt) return;
+  if (!lat || !lat.disabled_latch) {
+    el.style.display = 'none';
+    return;
+  }
+  el.style.display = 'flex';
+  txt.textContent = '已失能：按 27.2 第 3 条，这一次上电里不再使能任何关节。'
+    + '请拉空开断电、重新上电后再启动。'
+    + (lat.reason ? `（失能原因：${lat.reason}）` : '');
+}
+
+function updateHoldFailure(s) {
+  const hf = s.hold_failure;
+  const el = document.getElementById('hold-fail-banner');
+  const txt = document.getElementById('hold-fail-text');
+  const btn = document.getElementById('btn-hold-disable');
+  if (!el || !txt) return;
+  if (!hf) {
+    el.style.display = 'none';
+    holdFailBeeped = null;
+    return;
+  }
+  el.style.display = 'flex';
+  txt.textContent = hf.msg || `保持失效：${hf.joint}`;
+  if (holdFailBeeped !== hf.since) {
+    holdFailBeeped = hf.since;
+    beepHoldFailure();
+    log(hf.msg || '保持失效', 'b');
+  }
+  if (btn) {
+    const done = (hf.disabled || []).includes(hf.joint);
+    btn.disabled = !!done;
+    btn.textContent = done ? `${hf.joint} 已单颗失能` : `只失能这一颗（${hf.joint}，二次确认）`;
+  }
+}
+
 function updateSweep(s) {
   const w = s.sweep || {};
   const owner = isOwner(s);
@@ -1235,7 +1321,11 @@ async function enableArm() {
   if (!confirm('臂已支撑好、人站在直流空开旁？\n将 J6→J1 逐个零扭矩使能（电流模式 0 A），回读限流/限位/母线电压，做成链检查，然后切 S 曲线保持。')) return;
   try {
     log('使能中（J6→J1）...');
-    const r = await apiPost('/api/enable', { confirmed_supported: true });
+    const r = await apiPost('/api/enable', {
+      confirmed_supported: true,
+      power_cycle_confirmed: !!((LAST_STATE && LAST_STATE.disabled_latch && LAST_STATE.disabled_latch.disabled_latch)
+        ? confirm('已经拉空开断电、重新上电了吗？\n\n只有真的断电重上电过才能启动（27.2 第 3 条）。') : false),
+    });
     (r.report.zero_torque || []).forEach((z) => log(
       `零扭矩使能 ${z.name}: 模式 ${z.mode}，电流 ${z.current_a} A`, 'g'));
     (r.report.enabled || []).forEach((e) => log(
@@ -1282,6 +1372,17 @@ $('btn-exec').addEventListener('click', async () => {
 
 $('btn-stop').addEventListener('click', doStop);
 
+async function doMark() {
+  const kinds = ['撞到', '歪了', '异响', '抖动', '其他'];
+  const kind = prompt('标记原因（撞到/歪了/异响/抖动/其他）：', '其他') || '其他';
+  const text = prompt('补一句说明（可以留空）：', '') || '';
+  try {
+    const r = await apiPost('/api/mark', { kind: kind || '其他', text });
+    log('已记标记：' + (r.mark || kind) + '（' + (r.phase || '—') + '.' + (r.step || '—') + '）', 'w');
+  } catch (e) { log('记标记失败：' + e.message, 'b'); }
+}
+$('btn-mark').addEventListener('click', doMark);
+
 function doStop() {
   const drag = STATE && STATE.drag && STATE.drag.active;
   const p = drag ? apiPost('/api/drag/stop', {}) : postRaw('/api/stop', {});
@@ -1292,6 +1393,15 @@ function doStop() {
 }
 
 window.addEventListener('keydown', (e) => {
+  // 29.3 快捷键：M = 标记（空格是停，不许占用）
+  if (e.key && e.key.toLowerCase() === 'm' && !e.ctrlKey && !e.metaKey && !e.altKey) {
+    const tag = document.activeElement && document.activeElement.tagName;
+    if (!['INPUT', 'TEXTAREA', 'SELECT'].includes(tag)) {
+      e.preventDefault();
+      doMark();
+      return;
+    }
+  }
   if (e.code !== 'Space') return;
   const t = document.activeElement && document.activeElement.tagName;
   if (['INPUT', 'TEXTAREA', 'SELECT', 'BUTTON'].includes(t)) return;
@@ -1421,6 +1531,16 @@ $('btn-disable-all').addEventListener('click', async () => {
     await apiPost('/api/disable_all', { confirmed: true, reason: 'web emergency' });
     log('紧急全部失能：已断使能（臂可能已掉下；必要时拉空开）', 'b');
   } catch (e) { log('紧急失能失败：' + e.message, 'b'); alert('紧急失能失败：' + e.message); }
+});
+
+$('btn-park-drop').addEventListener('click', async () => {
+  if (!confirm('就地失能、落到搁架上：六颗按 J6→J1 依次失能（间隔 0.5 s），'
+    + '臂会自己滑进 V 槽。只用在停机中途停在搁架上方的时候。\n\n'
+    + '确认前请看一眼臂周围没有人/线。继续？')) return;
+  try {
+    const r = await apiPost('/api/park/drop', { confirmed: true });
+    log('就地失能：' + (r.msg || '已失能'), 'b');
+  } catch (e) { log('就地失能失败：' + e.message, 'b'); }
 });
 
 $('btn-support-park').addEventListener('click', async () => {
@@ -2201,3 +2321,19 @@ function pushPageSnapshot() {
   } catch (_) { /* 快照绝不干扰主流程 */ }
 }
 setInterval(pushPageSnapshot, 100);
+
+
+// 24 节 A3b：只失能报保持失效的那一颗（二次确认）
+document.getElementById('btn-hold-disable')?.addEventListener('click', async () => {
+  const hf = (STATE && STATE.hold_failure) || null;
+  if (!hf) return;
+  const j = hf.joint;
+  const a = confirm(`只失能 ${j}？\n其余关节保持使能；${j} 失能以后这一段会掉，先扶住。`);
+  if (!a) return;
+  const b = confirm(`再确认一次：${j} 失能后不会再自动保持。\n如果扶不住，先拉直流空开。`);
+  if (!b) return;
+  try {
+    const r = await apiPost('/api/hold_failure/disable_joint', { joint: j, confirmed: true });
+    log(r.msg || `${j} 已单颗失能`, 'b');
+  } catch (e) { log(`单颗失能失败：${e.message || e}`, 'b'); }
+});

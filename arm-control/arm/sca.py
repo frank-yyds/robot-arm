@@ -30,6 +30,8 @@ BATTERY_SCALE = 100.0
 R_POSITION = 0x06
 R_VELOCITY = 0x05
 R_CURRENT = 0x04
+# 26.2 AP-2：一条指令同时取电流/速度/位置（协议 A.1.4，官方 SDK R4_CVP）
+R_CVP = 0x94
 R_VOLTAGE = 0x45
 R_CURRENT_MAX = 0x53
 R_TEMP_MOTOR = 0x5F
@@ -146,6 +148,27 @@ class ScaMotor:
     def pos_turns(self, timeout: float = 0.25, retries: int | None = None) -> float | None:
         d = self._r(R_POSITION, 4, timeout=timeout, retries=retries)
         return struct.unpack(">i", d)[0] / IQ24 if d else None
+
+    def read_cvp(self, timeout: float = 0.1, retries: int | None = 2):
+        """26.2：0x94 一次返回 位置(3B, IQ16) / 速度(2B, IQ14) / 电流(2B, IQ14)。
+
+        返回 {"pos_turns", "vel_rpm", "current_a"}；读不到返回 None。
+        电流要用 0x53 满量程换算；读不到满量程时 current_a 为 None。
+        """
+        d = self._r(R_CVP, 7, timeout=timeout, retries=retries)
+        if not d or len(d) < 7:
+            return None
+        raw = int.from_bytes(d[0:3], "big")
+        if raw & 0x800000:
+            raw -= 1 << 24
+        pos_turns = raw / 65536.0
+        vel_raw = struct.unpack(">h", d[3:5])[0]
+        cur_raw = struct.unpack(">h", d[5:7])[0]
+        vel_rpm = vel_raw / 16384.0 * VELOCITY_FULL_RPM
+        cm = self.current_max_a()
+        cur_a = None if cm is None else cur_raw / 16384.0 * cm
+        return {"pos_turns": pos_turns, "vel_rpm": vel_rpm, "current_a": cur_a,
+                "raw": d.hex()}
 
     def velocity_rpm(self) -> float | None:
         d = self._r(R_VELOCITY, 4)
@@ -297,9 +320,16 @@ class ScaMotor:
             return False
         return True
 
-    def set_target_turns(self, turns: float) -> bool:
+    def set_target_turns(self, turns: float, priority: bool = False) -> bool:
         raw = int(round(max(-127.999, min(127.999, turns)) * IQ24))
         # 位置目标不等回包；运动循环用实际位置/报警/限位确认
+        if priority and hasattr(self.link, "send_now"):
+            # 26.7 7b：写目标走单独发送口，不被读取的重试挡住
+            try:
+                self.link.send_now(self.mid, W_TARGET, struct.pack(">i", raw))
+                return True
+            except Exception:  # noqa: BLE001
+                pass
         return self._send_only(W_TARGET, struct.pack(">i", raw))
 
     def set_pos_limits_turns(self, lo: float, hi: float) -> bool:
@@ -336,6 +366,17 @@ class ScaMotor:
         if ok:
             time.sleep(0.01)
         return ok
+
+    def write_pid_iq24(self, cmd: int, value: float, timeout: float = 0.5) -> bool:
+        """26.1：写 PID 类参数（0x10/0x11/0x12/0x13…），格式 IQ24。不存储。"""
+        raw = int(round(float(value) * IQ24))
+        return self._w(cmd, struct.pack(">i", raw), timeout=timeout)
+
+    def read_pid_iq24(self, cmd: int, timeout: float = 0.2) -> float | None:
+        d = self._r(cmd, 4, timeout=timeout, retries=2)
+        if not d:
+            return None
+        return struct.unpack(">i", d)[0] / IQ24
 
     def set_home_turns(self, turns: float = 0.0) -> bool:
         """0x87 设 Home 值/把当前位置设为零。发完以位置回读为准。"""

@@ -216,7 +216,7 @@ a = float(seg["acc_deg_s2"]["J4"])
 lim = max(3.0, v * 0.5)
 first = None
 for t, qd in bus.log:
-    if t < t0 + 1.0:      # 起步容忍 1 s
+    if t < t0 + 0.3:      # 新判法不再整体跳 1 s，只看起步空程
         continue
     expected = np.asarray(seg["q_from"])[3] + m._trap_pos(d, v, a, t - t0)
     lag = expected - qd["J4"]
@@ -224,10 +224,15 @@ for t, qd in bus.log:
         first = t
         break
 dt_abort = (abort_t - first) if first else 999
-check("21.4.5 一颗卡住：超过阈值后约 0.3 s 中止",
-      first is not None and 0.25 <= dt_abort <= 0.5
-      and "J4" in reason and "落后" in reason,
-      f"阈值 {lim:.1f}°，超阈值→中止 {dt_abort * 1000:.0f} ms；{reason[:80]}")
+# 26.2 新判法：不动（|u| < u_min 持续 0.5 s）算“卡住/不动”，不再是旧的
+# “落后 3° 持续 0.3 s”。量从注入卡住（freeze_at）到中止的时间。
+dt_from_freeze = (abort_t - bus.freeze_at) if bus.freeze_at else 999
+# 新判法不要求“落后 >3°”，所以 first（旧阈值）不再作为判据；只看
+# “注入卡住 → 判不动/卡住 → 中止”的时间。
+check("21.4.5 一颗卡住：按 26.2 判“不动/卡住”，注入后 ≤0.8 s 中止",
+      0.4 <= dt_from_freeze <= 0.8
+      and "J4" in reason and ("卡住" in reason or "不动" in reason),
+      f"注入卡住→中止 {dt_from_freeze * 1000:.0f} ms；{reason[:80]}")
 
 # --------------------------------------------------------------------------- #
 # 6. 按停回拉 + 7. 进度按实际

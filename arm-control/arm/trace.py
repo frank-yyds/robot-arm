@@ -21,8 +21,10 @@ from .sca import (DEG_PER_MOTOR_TURN, IQ24, R_CURRENT, R_ERROR, R_MODE,
 
 class TraceSampler:
     def __init__(self, ex, hz: float = 100.0, seconds: float = 10.0,
-                 joints=None, status_hz: float = 5.0):
+                 joints=None, status_hz: float = 5.0, light: bool = False):
         self.ex = ex
+        # B1 用：只采位置 + 电源/模式/报警，节拍能上 20 Hz
+        self.light = bool(light)
         self.joints = ([str(x).upper() for x in joints] if joints else None)
         # 0x2B power / 0x55 mode 的采样频率；默认 5 Hz，诊断掉使能时可调到 10 Hz
         self.status_hz = max(0.5, min(float(status_hz or 5.0), float(hz)))
@@ -119,8 +121,9 @@ class TraceSampler:
                     for n in order:
                         mid = ids[n]
                         items.append((mid, R_POSITION, 4))
-                        items.append((mid, R_CURRENT, 4))
-                        if tick % 2 == 0:
+                        if not self.light:
+                            items.append((mid, R_CURRENT, 4))
+                        if tick % 2 == 0 and not self.light:
                             items.append((mid, R_VELOCITY, 4))
                         if tick % 5 == 0:
                             items.append((mid, R_ERROR, 2))
@@ -128,7 +131,10 @@ class TraceSampler:
                             items.append((mid, R_POWER, 1))
                             items.append((mid, R_MODE, 1))
                     try:
-                        got = bus.link.read_many(items, timeout=0.03, retries=1)
+                        # A2：走总线同一把锁（read_many_raw），不直接抢 link
+                        got = (bus.read_many_raw(items, timeout=0.03, retries=1)
+                               if hasattr(bus, "read_many_raw")
+                               else bus.link.read_many(items, timeout=0.03, retries=1))
                     except Exception as exc:  # noqa: BLE001
                         got = {}
                         self.error = f"读总线失败：{exc}"
