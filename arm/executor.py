@@ -61,6 +61,7 @@ from .mock import MockJointBus, VirtualJointBus
 from .motion import Motion, MotionError
 from .sca import MODE_CURRENT, MODE_PROFILE_POSITION, describe_error
 from .recorder import Recorder
+from .session import Session
 from .trace import TraceSampler
 
 MIME = {".js": "text/javascript", ".mjs": "text/javascript",
@@ -114,6 +115,8 @@ class Executor:
         self.preview_motion = Motion(self.preview_bus, self.robot, self.fence,
                                      self.limits, recorder=None)
         self.recorder: Recorder | None = None
+        self.session: Session | None = None
+        self._capture = None
         self.trace: TraceSampler | None = None
         self.mode = None
         self.ip = ""
@@ -380,6 +383,13 @@ class Executor:
             self.motion.stop(reason)
         if not quiet:
             self.msg = f"已按停：{reason}"
+            # 29.2：用户按停要自动存快照
+            if self.session:
+                try:
+                    self.session.event("user_stop", reason)
+                    self.session.incident("用户按停", detail={"原因": reason})
+                except Exception:  # noqa: BLE001
+                    pass
         return {"ok": True}
 
     def release(self, token: str) -> dict:
@@ -459,8 +469,15 @@ class Executor:
                 self.msg = "预检未通过：" + "；".join(rep.get("mismatch", []))
         self.runs_dir.mkdir(parents=True, exist_ok=True)
         stamp = time.strftime("%Y%m%d_%H%M%S")
+        # 第二十九节 29.1：每次连上开一个会话目录 runs/<日期时间>/
+        try:
+            self.session = Session(self.runs_dir, tag=self.mode)
+        except Exception as exc:  # noqa: BLE001
+            self.session = None
+            self.msg += f"（会话目录创建失败：{exc}）"
         self.recorder = Recorder(self.runs_dir / f"{stamp}_run.csv",
-                                 note=f"connect {self.mode} {self.ip}")
+                                 note=f"connect {self.mode} {self.ip}",
+                                 session=self.session)
         self.motion = Motion(self.bus, self.robot, self.fence, self.limits,
                              recorder=self.recorder)
         # A2/A3/A5：读异常回调、写命令记录钩子（真机总线才有）
@@ -468,6 +485,39 @@ class Executor:
             self.bus.anomaly_hook = self._on_read_anomaly
             self.bus.write_resend_hook = self._on_write_resend
             self.bus.link.event_hook = self._on_bus_event
+        if self.session and self.mode == "mock" and hasattr(self.bus, "write_log_path"):
+            self.bus.write_log_path = str(self.session.dir / "mock_writes.jsonl")
+
+            def _mock_write_event(joint, cmd, value):
+                try:
+                    self.session.event("cmd", f"0x{int(cmd):02X} 值 {value}",
+                                       joint=joint, cmd=int(cmd), value=str(value))
+                except Exception:  # noqa: BLE001
+                    pass
+
+            self.bus.event_hook = _mock_write_event
+        if self.session:
+            try:
+                self.session.header(
+                    connector=f"{self.mode} {self.ip}",
+                    config_version=self.config_version,
+                    web_version=self._read_web_version(),
+                    joints_cfg=self.joint_cfg,
+                    bus_stats=self._param_stats(),
+                    iface=str(self.cfg.get("ecb_iface") or ""))
+                if self.mode == "hw" and bool(self.cfg.get("auto_start_capture", False)):
+                    from .capture import Capture
+                    cap = Capture(ecb_ip=self.ecb_ip)
+                    self._capture = cap
+                    self.session.attach_capture(cap.start())
+            except Exception as exc:  # noqa: BLE001
+                self.msg += f"（会话头/抓包启动失败：{exc}）"
+        if self.session:
+            try:
+                threading.Thread(target=self.session.enforce_quota,
+                                 daemon=True).start()
+            except Exception:  # noqa: BLE001
+                pass
         self.hold_failure = None
         self.hold_guard = {"active": False, "hist": {}, "resent": {},
                            "resend_dist": {}, "since": None}
@@ -538,8 +588,15 @@ class Executor:
                 self.bus.close()
             except Exception:  # noqa: BLE001
                 pass
+        try:
+            if self._capture is not None:
+                self._capture.stop()
+                self._capture = None
+        except Exception:  # noqa: BLE001
+            pass
         if self.recorder:
             self.recorder.close()
+        self.session = None
         self.bus = None
         self.motion = None
         self.connected = False
@@ -738,8 +795,26 @@ class Executor:
                 pass
 
     def _status_tick(self, states):
-        """A5：电源/模式/报警 5 Hz 落盘；回读节拍掉到 15 Hz 以下时降到 2 Hz。"""
-        if self.recorder is None or not isinstance(self.bus, JointBus):
+        """A5：电源/模式/报警 5 Hz 落盘；回读节拍掉到 15 Hz 以下时降到 2 Hz。
+
+        第二十九节：不运动时（包括 mock）也要把逐拍状态写进会话（29.1 第 2 条）。
+        """
+        if self.recorder is None:
+            return
+        if self.session is not None:
+            now_s = time.monotonic()
+            if now_s - getattr(self, "_last_session_state_at", 0.0) >= 0.1:
+                self._last_session_state_at = now_s
+                try:
+                    snap = dict(self._last_states or {})
+                    for n, st in list(snap.items()):
+                        tgt = self._targets.get(n) if hasattr(self, "_targets") else None
+                        if tgt is not None:
+                            st.target_deg = tgt
+                    self.session.state(snap)
+                except Exception:  # noqa: BLE001
+                    pass
+        if not isinstance(self.bus, JointBus):
             return
         if not getattr(self.bus, "startup_done", False):
             return
@@ -763,13 +838,30 @@ class Executor:
                 st.mode = row["mode"]
                 st.mode_read_at = time.time()
             if row.get("error") is not None:
+                prev_err = getattr(st, "_session_prev_error", None)
                 st.error = row["error"]
+                st._session_prev_error = row["error"]
+                # 29.2 第 1 条：报警码变化要记事件；非 0 时存快照
+                if self.session is not None and row["error"] != prev_err:
+                    try:
+                        self.session.event(
+                            "alarm_change",
+                            f"报警 0x{int(row['error']):04X}（上一拍 "
+                            f"{'—' if prev_err is None else f'0x{int(prev_err):04X}'}）",
+                            joint=n)
+                        if int(row["error"]):
+                            self.session.incident(
+                                "报警码非 0", joint=n,
+                                detail={"报警": f"0x{int(row['error']):04X}"})
+                    except Exception:  # noqa: BLE001
+                        pass
             if row.get("power") is not None:
                 st.enabled = (row["power"] == 1)
         try:
             self.recorder.status(rows)
         except Exception:  # noqa: BLE001
             pass
+
 
     def _hold_guard_reset(self):
         self.hold_guard = {"active": False, "hist": {}, "resent": {},
@@ -981,6 +1073,15 @@ class Executor:
                          + "；禁止使能/运动，先断电手动移回"),
             }
         now = time.monotonic()
+        # 29.1 第 3 条：把当前流程/步号同步给会话（事故快照里要写）
+        if self.session is not None:
+            try:
+                self.session.set_ctx(
+                    phase=str((self.motion.status or {}).get("phase") or ""),
+                    label=str((self.motion.status or {}).get("label") or ""),
+                    park_step=str((self.park_step or {}).get("phase") or ""))
+            except Exception:  # noqa: BLE001
+                pass
         return {
             "ok": True, "ts": time.time(),
             "connected": self.connected, "mode": self.mode,
@@ -1023,6 +1124,11 @@ class Executor:
                                  round(time.monotonic() - self.hold["since"], 1)),
                      "warn": self.hold.get("warn", ""),
                      "threshold": gravity.HOLD_WARN_RATIO},
+            "flow": {"phase": (self.motion.status.get("phase")
+                               if self.motion else ""),
+                     "label": (self.motion.status.get("label")
+                               if self.motion else ""),
+                     "park_phase": str((self.park_step or {}).get("phase") or "")},
             "park": {**self.park_config(),
                      "step": dict(self.park_step),
                      "check": self._park_check(q),
@@ -1159,6 +1265,55 @@ class Executor:
                      f"{z_min:.1f}，每 {step:g} mm 一步"),
         }
         return pk
+
+    def _param_stats(self) -> dict:
+        """29.4：会话头里要的六颗可读参数（读不到就留空，不猜）。"""
+        stats: dict = {"limits": {}, "speed_limits": {}, "pid": {}}
+        bus = self.bus
+        if bus is None or not hasattr(bus, "motors"):
+            return stats
+        for name, m in getattr(bus, "motors", {}).items():
+            try:
+                stats["limits"][name] = bus.current_limit_readback.get(name)
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                sp = m.speed_limit_rpm()
+                stats["speed_limits"][name] = (None if sp is None
+                                               else round(float(sp) * 10.0 / 60.0, 2))
+            except Exception:  # noqa: BLE001
+                pass
+        return stats
+
+    def mark(self, text: str = "", kind: str = "其他") -> dict:
+        """29.3 用户标记：记一条事件（带当前流程/步号）并触发事故快照。"""
+        phase = ""
+        step = ""
+        try:
+            phase = str((self.motion.status or {}).get("phase") or "")
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            step = str((self.park_step or {}).get("phase") or "")
+        except Exception:  # noqa: BLE001
+            pass
+        flow = "park" if step and step != "idle" else (
+            "motion" if phase and phase not in ("idle",) else "")
+        text = (f"{kind}" + (f"：{text}" if text else ""))
+        if self.session:
+            self.session.event("user_mark", text, phase=phase, step=step,
+                               flow=flow)
+            self.session.incident("用户标记", phase=phase, step=step,
+                                  detail={"标记": text})
+        if self.recorder:
+            try:
+                self.recorder.command("user_mark", text)
+            except Exception:  # noqa: BLE001
+                pass
+        self.msg = f"已记标记：{text}（{phase or '—'}.{step or '—'}）"
+        return {"ok": True, "mark": text, "phase": phase, "step": step,
+                "flow": flow, "session": (self.session.id if self.session else None),
+                "msg": self.msg}
 
     def current_limits(self) -> dict:
         """20.5：优先用总线真正回读的限流；J2 读不到时按最保守 3.0 A。
@@ -3168,6 +3323,15 @@ class Handler(BaseHTTPRequestHandler):
                 return self._events()
             if p == "/api/config":
                 return self._json(200, {"ok": True, **EXEC.config_payload()})
+            if p == "/api/mark":
+                # 29.3 用户标记：安全动作，不要求控制权（任何客户端都能标记）
+                return self._json(200, EXEC.mark(
+                    str(body.get("text") or ""), str(body.get("kind") or "其他")))
+            if p == "/api/session":
+                return self._json(200, {"ok": True,
+                                        "session": (EXEC.session.id if EXEC.session else None),
+                                        "dir": (str(EXEC.session.dir) if EXEC.session else None),
+                                        "meta": (EXEC.session.meta if EXEC.session else None)})
             if p == "/api/debug/page_state":
                 return self._json(200, EXEC.load_web_state())
             if p == "/api/kt/points":

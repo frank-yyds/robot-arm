@@ -952,6 +952,7 @@ function updateUI(s) {
   $('btn-acquire').disabled = !s.connected || owner || busy || dragActive;
   $('btn-exec').disabled = !s.has_plan || busy || !owner || unsafe || stale;
   $('btn-stop').disabled = !s.connected && !busy;
+  if ($('btn-mark')) $('btn-mark').disabled = !s.connected;
   const ps = document.getElementById('plan-state');
   if (ps) {
     if (!owner) ps.textContent = '只读：另一个页面持有控制权，不能生成/执行计划。';
@@ -1371,6 +1372,17 @@ $('btn-exec').addEventListener('click', async () => {
 
 $('btn-stop').addEventListener('click', doStop);
 
+async function doMark() {
+  const kinds = ['撞到', '歪了', '异响', '抖动', '其他'];
+  const kind = prompt('标记原因（撞到/歪了/异响/抖动/其他）：', '其他') || '其他';
+  const text = prompt('补一句说明（可以留空）：', '') || '';
+  try {
+    const r = await apiPost('/api/mark', { kind: kind || '其他', text });
+    log('已记标记：' + (r.mark || kind) + '（' + (r.phase || '—') + '.' + (r.step || '—') + '）', 'w');
+  } catch (e) { log('记标记失败：' + e.message, 'b'); }
+}
+$('btn-mark').addEventListener('click', doMark);
+
 function doStop() {
   const drag = STATE && STATE.drag && STATE.drag.active;
   const p = drag ? apiPost('/api/drag/stop', {}) : postRaw('/api/stop', {});
@@ -1381,6 +1393,15 @@ function doStop() {
 }
 
 window.addEventListener('keydown', (e) => {
+  // 29.3 快捷键：M = 标记（空格是停，不许占用）
+  if (e.key && e.key.toLowerCase() === 'm' && !e.ctrlKey && !e.metaKey && !e.altKey) {
+    const tag = document.activeElement && document.activeElement.tagName;
+    if (!['INPUT', 'TEXTAREA', 'SELECT'].includes(tag)) {
+      e.preventDefault();
+      doMark();
+      return;
+    }
+  }
   if (e.code !== 'Space') return;
   const t = document.activeElement && document.activeElement.tagName;
   if (['INPUT', 'TEXTAREA', 'SELECT', 'BUTTON'].includes(t)) return;

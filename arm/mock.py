@@ -130,6 +130,39 @@ class MockJointBus:
         self.enable_fault_current: dict[str, float] = {}
         self.enable_call_log: list[str] = []
         self.enable_refused_log: list[str] = []
+        # 29.6：mock 下没有真抓包，用它自己的“实际发出去的写命令”日志代替
+        self.write_log_path = None
+        self.write_log_count = 0
+        self.event_hook = None
+
+    def _emit_event(self, joint: str, cmd: int, value, src: str = "executor"):
+        """29.1：执行器“记了”这条写命令（会话事件）。"""
+        hook = getattr(self, "event_hook", None)
+        if hook is not None:
+            try:
+                hook(joint, cmd, value)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _emit_write(self, joint: str, cmd: int, value, src: str = "executor"):
+        """mock 电机真正收下这条写命令：记“实际发出去”的日志 + 会话事件。"""
+        self.log_write(joint, cmd, value, src=src)
+        self._emit_event(joint, cmd, value, src=src)
+
+    def log_write(self, joint: str, cmd: int, value, src: str = "executor"):
+        """29.6：记一条“实际发出去的写命令”，供 pcap_check 对账。"""
+        self.write_log_count += 1
+        if not self.write_log_path:
+            return
+        try:
+            import json as _json
+            rec = {"mono": round(time.monotonic(), 4), "wall": time.strftime(
+                "%Y-%m-%dT%H:%M:%S"), "joint": joint,
+                "cmd": int(cmd), "value": value, "src": src}
+            with open(self.write_log_path, "a", encoding="utf-8") as fh:
+                fh.write(_json.dumps(rec, ensure_ascii=False) + "\n")
+        except Exception:  # noqa: BLE001
+            pass
 
     def latch_disabled(self, reason: str = ""):
         if not self.disabled_latch:
@@ -420,10 +453,14 @@ class MockJointBus:
             self.writes += 1
             self._tick()
             for n, q in targets.items():
+                turns = round(float(q) / 10.0, 6)
+                # 执行器的记录（发之前就记：丢了以后要能对出“记了没发”）
+                self._emit_event(n, 0x0A, turns)
                 if self.drop_write_prob and random.random() < self.drop_write_prob:
                     dropped.append(n)
                     self.write_dropped += 1
                     continue
+                self.log_write(n, 0x0A, turns)
                 lo, hi = self.cfg[n].soft_limits_deg
                 self.target[n] = max(lo, min(hi, float(q)))
                 self._targets[n] = self.target[n]
@@ -583,20 +620,24 @@ class MockMotor:
         return self.bus.force_mode.get(self.name, MODE_PROFILE_POSITION)
 
     def set_mode(self, mode):
+        self.bus._emit_write(self.name, 0x07, int(mode))
         self.bus.mode_writes += 1
         self.bus.mode_set_log.append((self.name, int(mode)))
         return True
 
     def set_current_a(self, amp):
+        self.bus._emit_write(self.name, 0x08, float(amp))
         return True
 
     def enable(self):
         self.bus.enable_calls += 1
+        self.bus._emit_write(self.name, 0x2A, 1)
         return True
 
     def disable(self):
         self.bus.disable_calls += 1
         self.bus.off.add(self.name)
+        self.bus._emit_write(self.name, 0x2A, 0)
         return True
 
     def pos_turns(self, timeout=None, retries=None):
@@ -605,6 +646,7 @@ class MockMotor:
         return self.bus.cfg[self.name].turns(self.bus.q[self.name])
 
     def set_target_turns(self, turns):
+        self.bus._emit_write(self.name, 0x0A, float(turns))
         return True
 
     def set_profile_out(self, *a, **kw):

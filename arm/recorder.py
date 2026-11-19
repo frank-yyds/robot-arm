@@ -21,8 +21,24 @@ HEADER = ["time", "t_rel", "kind", "joint", "pos_deg", "target_deg",
           "current_a", "error", "power", "mode", "note"]
 
 
+INCIDENT_KINDS = {
+    "abort": "中止 / 原地保持",
+    "hold_failure": "保持失效",
+    "read_anomaly": "读数被合理性检查拒掉",
+    "write_resend": "写目标丢了（已重发）",
+    "disable_joint": "单颗失能",
+    "contact_mismatch": "接触高度比对不符",
+    "catch_failed": "搁架没接住",
+    "park_drop": "就地失能落到搁架上",
+    "user_mark": "用户标记",
+    "user_stop": "用户按停",
+    "alarm_change": "报警码变化",
+}
+
+
 class Recorder:
-    def __init__(self, path: Path | None = None, note: str = ""):
+    def __init__(self, path: Path | None = None, note: str = "",
+                 session=None):
         config.RUNS_DIR.mkdir(parents=True, exist_ok=True)
         if path is None:
             stamp = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -33,6 +49,8 @@ class Recorder:
         self._w = csv.writer(self._fh)
         self._w.writerow(HEADER)
         self._t0 = _dt.datetime.now()
+        # 第二十九节：同一份记录同时写进会话目录（三层记录）
+        self.session = session
         if note:
             self.note(note)
         self._fh.flush()
@@ -51,9 +69,23 @@ class Recorder:
 
     def note(self, text: str):
         self._row("note", note=text)
+        if self.session:
+            try:
+                self.session.event("note", text)
+            except Exception:  # noqa: BLE001
+                pass
 
     def command(self, kind: str, note: str = "", joint: str = "",
                 target_deg: float | None = None, **kw):
+        if self.session:
+            try:
+                self.session.event(kind, note, joint=joint,
+                                   target_deg=target_deg)
+                why = INCIDENT_KINDS.get(kind)
+                if why:
+                    self.session.incident(why, detail={"原文": note})
+            except Exception:  # noqa: BLE001
+                pass
         self._row(kind, joint=joint,
                   pos="" if kw.get("pos_deg") is None else f"{kw['pos_deg']:.4f}",
                   target="" if target_deg is None else f"{target_deg:.4f}",
@@ -68,10 +100,21 @@ class Recorder:
             rep = "回包=不等"
         else:
             rep = "回包=有" if replied else "回包=无"
-        self._row("cmd", joint=joint,
-                  note=f"0x{cmd:02X} 值 {value} {rep}" + (f"；{note}" if note else ""))
+        text = f"0x{cmd:02X} 值 {value} {rep}" + (f"；{note}" if note else "")
+        self._row("cmd", joint=joint, note=text)
+        if self.session:
+            try:
+                self.session.event("cmd", text, joint=joint, cmd=cmd,
+                                   value=value, replied=replied)
+            except Exception:  # noqa: BLE001
+                pass
 
     def poll(self, states: dict):
+        if self.session:
+            try:
+                self.session.state(states)
+            except Exception:  # noqa: BLE001
+                pass
         with self._lock:
             t, tr = self._ts()
             for name, st in states.items():
@@ -88,6 +131,14 @@ class Recorder:
 
     def status(self, rows: dict[str, dict]):
         """A5：电源/模式/报警，每颗一行（位置由 poll 行覆盖）。"""
+        if self.session:
+            try:
+                for name, r in rows.items():
+                    self.session.event(
+                        "status", f"电源={r.get('power')} 模式={r.get('mode')} "
+                                  f"报警={r.get('error')}", joint=name)
+            except Exception:  # noqa: BLE001
+                pass
         with self._lock:
             t, tr = self._ts()
             for name, r in rows.items():
@@ -101,6 +152,11 @@ class Recorder:
             self._fh.flush()
 
     def close(self):
+        if self.session:
+            try:
+                self.session.close()
+            except Exception:  # noqa: BLE001
+                pass
         try:
             self._fh.close()
         except Exception:  # noqa: BLE001
