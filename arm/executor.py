@@ -116,6 +116,7 @@ class Executor:
                                      self.limits, recorder=None)
         self.recorder: Recorder | None = None
         self.session: Session | None = None
+        self._prev_errors: dict[str, int] = {}
         self._capture = None
         self.trace: TraceSampler | None = None
         self.mode = None
@@ -801,7 +802,7 @@ class Executor:
         """
         if self.recorder is None:
             return
-        if self.session is not None:
+        if self.session is not None and not self._session_busy():
             now_s = time.monotonic()
             if now_s - getattr(self, "_last_session_state_at", 0.0) >= 0.1:
                 self._last_session_state_at = now_s
@@ -838,9 +839,9 @@ class Executor:
                 st.mode = row["mode"]
                 st.mode_read_at = time.time()
             if row.get("error") is not None:
-                prev_err = getattr(st, "_session_prev_error", None)
+                prev_err = self._prev_errors.get(n)
                 st.error = row["error"]
-                st._session_prev_error = row["error"]
+                self._prev_errors[n] = row["error"]
                 # 29.2 第 1 条：报警码变化要记事件；非 0 时存快照
                 if self.session is not None and row["error"] != prev_err:
                     try:
@@ -1274,6 +1275,17 @@ class Executor:
                      f"{z_min:.1f}，每 {step:g} mm 一步"),
         }
         return pk
+
+    def _session_busy(self) -> bool:
+        """运动中由运动层写逐拍行；空闲态才由状态线程补写，避免混进缓存旧值。"""
+        try:
+            if self.motion and self.motion.status.get("busy"):
+                return True
+            if self.park_active or self.drag_active or self.calib.active:
+                return True
+        except Exception:  # noqa: BLE001
+            pass
+        return False
 
     def _param_stats(self) -> dict:
         """29.4：会话头里要的六颗可读参数（读不到就留空，不猜）。"""
