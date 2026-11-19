@@ -1210,6 +1210,15 @@ class Executor:
             raise MotionError("停机流程正在跑：先按停，等它停在保持状态")
 
     # ---------------- 18.1 / 18.2 搁架、末端配置、力矩 ----------------
+    def _save_park_state_safe(self, state: dict) -> None:
+        """保存停车状态；mock 不写真实 config（防止自检污染真机配置）。"""
+        if getattr(self.bus, "is_mock", False):
+            return
+        try:
+            cfgmod.save_park_state(state)
+        except Exception:  # noqa: BLE001
+            pass
+
     def park_config(self) -> dict:
         """A9/18.3：收拢点、预停机点的 q1 都取教的停机位置；park_side 由它推出来。
 
@@ -1946,7 +1955,7 @@ class Executor:
         try:
             self.park_state = dict(self.park_state or {})
             self.park_state["valid"] = False
-            cfgmod.save_park_state(self.park_state)
+            self._save_park_state_safe(self.park_state)
         except Exception:  # noqa: BLE001
             pass
         self.park_step.update({"phase": "dropped_onto_shelf",
@@ -1998,7 +2007,7 @@ class Executor:
             try:
                 self.park_state = dict(self.park_state or {})
                 self.park_state["valid"] = False
-                cfgmod.save_park_state(self.park_state)
+                self._save_park_state_safe(self.park_state)
             except Exception:  # noqa: BLE001
                 pass
             self.park_step = {"phase": "moving_pre", "reason": "", "z": None, "step": 0,
@@ -2177,7 +2186,7 @@ class Executor:
                                    "valid": True,
                                    "I0": i0, "I1": i1, "contact_z": round(z, 2),
                                    "end_effector": self.end_effector}
-                cfgmod.save_park_state(self.park_state)
+                self._save_park_state_safe(self.park_state)
                 # 6：按序失能，每颗之后检查其余还使能的关节
                 order = list(self.park_cfg.get("disable_order") or
                              ["J6", "J5", "J4", "J3", "J2", "J1"])
@@ -2406,10 +2415,7 @@ class Executor:
         self.park_state["valid"] = False
         self.park_state["ts"] = time.strftime("%Y-%m-%d %H:%M:%S")
         self.park_state["reason"] = "扶持停机"
-        try:
-            cfgmod.save_park_state(self.park_state)
-        except Exception:  # noqa: BLE001
-            pass
+        self._save_park_state_safe(self.park_state)
         self.park_step = {"phase": "support_parked", "reason": "", "I0": None, "I1": None}
         self.pending = None
         self.preview = None
