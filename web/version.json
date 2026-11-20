@@ -1,4 +1,4 @@
 {
-  "version": "2026-11-21.2",
-  "note": "30.2 起步反向分析工具(tools/reverse_start.py)；30.6 ECB 独占锁(arm/ecblock.py，所有真 ECB 通信经 EcbTransport 先拿锁)+重连接管(六颗使能着时不跑启动序列、只写目标=当前位置、不发 0x07/0x08/0x2A)+mock 自检；30.5 锁存边界(还没使能过就停下不置锁存)；抓包会话脚本 tools/session_start.sh/session_stop.sh；会话头接管抓包 pid"
+  "version": "2026-11-21.3",
+  "note": "30.4 配套：网页 3D 底座按实物画两段（120方×48.5 方块 + Ø73×31 转台柱），围栏底座区不变；执行器 scene 输出 base_parts（兼容旧 base）"
 }

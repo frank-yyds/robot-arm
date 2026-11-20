@@ -195,7 +195,16 @@ class Fence:
         }
         return {
             "capsules": capsules,
-            "base": {"center": [0, 0, 41.75], "size": [122.6, 122.6, 83.5]},
+            # 30.4 第 5 条：底座显示按实物 #32 改（只是显示；围栏的底座区不改）。
+            # 两段：方块 120 方 z 0…48.5 + 转台柱 Ø73 z 48.5…79.5。
+            "base": {"center": [0, 0, 24.25], "size": [120.0, 120.0, 48.5],
+                     "shape": "box"},
+            "base_parts": [
+                {"shape": "box", "center": [0, 0, 24.25],
+                 "size": [120.0, 120.0, 48.5]},
+                {"shape": "cylinder", "center": [0, 0, 64.0],
+                 "radius": 36.5, "length": 31.0},
+            ],
             "probe": probe,
             "tcp": tcp.round(3).tolist(),
             "flange": flange.round(3).tolist(),
