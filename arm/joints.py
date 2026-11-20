@@ -223,6 +223,9 @@ class JointBus:
         self.last_read_hz = 0.0
         # 20.5：启动/写限位/校准时真正回读的限流（A），不拿配置值冒充
         self.current_limit_readback: dict[str, float | None] = {}
+        # 30.1：0x53 电流满量程（A）。0x94 的电流原始值是 IQ14 乘满量程，
+        # 不是乘限流；这里缓存一份，避免每拍都去读 0x53。
+        self.current_full_scale_readback: dict[str, float | None] = {}
 
     def reload_config(self, cfg: dict | None = None):
         """重新读 config/joints.json（sign/offset/限位），不重建电机连接。"""
@@ -724,6 +727,7 @@ class JointBus:
                     cm = u(R_CURRENT_MAX, ">h")
                     if cm is not None:
                         cm = cm / IQ8
+                        self.current_full_scale_readback[name] = cm
                     v = u(R_VOLTAGE, ">H")
                     st.voltage_v = None if v is None else v / IQ10
                     t = u(R_TEMP_MOTOR, ">h")
@@ -764,14 +768,17 @@ class JointBus:
                 cur_raw = struct.unpack(">h", d[5:7])[0]
                 c = self.cfg[name]
                 vel_rpm = vel_raw / 16384.0 * VELOCITY_FULL_RPM
-                cm = self.current_limit_readback.get(name)
-                if cm is None:
+                # 30.1：0x94 电流是 IQ14 × 满量程（0x53），不是 × 限流（0x59）
+                fs = self.current_full_scale_readback.get(name)
+                if fs is None:
                     try:
-                        cm = self.motors[name].current_limit_a()
+                        fs = self.motors[name].current_max_a()
                     except Exception:  # noqa: BLE001
-                        cm = None
-                lim = self.current_limit_readback.get(name) or cm
-                cur_a = None if cm is None else cur_raw / 16384.0 * cm
+                        fs = None
+                    if fs is not None:
+                        self.current_full_scale_readback[name] = fs
+                lim = self.current_limit_readback.get(name)
+                cur_a = None if fs is None else cur_raw / 16384.0 * float(fs)
                 out[name] = {
                     "ok": True, "raw": d.hex(),
                     "pos_deg": c.out_deg(pos_turns),

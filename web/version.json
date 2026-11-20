@@ -1,4 +1,4 @@
 {
-  "version": "2026-11-19.3",
-  "note": "第二十九节：会话目录三层记录（meta/state.csv/events.jsonl）、事故自动快照+自动 summary.md、网页“标记”按钮（快捷键 M）、参数快照与开机体检、查记录工具 timeline/plot/pcap_check/replay_guard、网页面板（流程/步号）；29.5 摄像头按用户 11-19 决定不做"
+  "version": "2026-11-21.1",
+  "note": "30.1 0x94 电流换算修正：0x94 电流原始值是 IQ14 × 0x53 满量程（原来错用了回读限流，读数偏小 2–11 倍）；ρ 仍 = |A| / 回读限流；新增 tools/cvp_current_check.py（mock 自检 + 真机 0x94 vs 0x04 对照）；mock 补满量程缓存"
 }

@@ -105,6 +105,9 @@ class MockJointBus:
         self.current_fn = None
         self.current_limit_readback: dict[str, float | None] = {
             n: 3.0 for n in self.order}
+        # 30.1：0x53 满量程（mock 固定 33 A，和真机口径一致：0x94 电流按满量程换）
+        self.current_full_scale_readback: dict[str, float | None] = {
+            n: 33.0 for n in self.order}
         self.mock_fault_log: list[str] = []
         # A4/A6：给按颗操作的代码（clear_errors / check_alarm_latch）一个电机代理
         self.motors = {n: MockMotor(self, n) for n in self.order}
