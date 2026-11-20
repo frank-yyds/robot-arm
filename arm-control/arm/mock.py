@@ -105,6 +105,9 @@ class MockJointBus:
         self.current_fn = None
         self.current_limit_readback: dict[str, float | None] = {
             n: 3.0 for n in self.order}
+        # 30.1：0x53 满量程（mock 固定 33 A，和真机口径一致：0x94 电流按满量程换）
+        self.current_full_scale_readback: dict[str, float | None] = {
+            n: 33.0 for n in self.order}
         self.mock_fault_log: list[str] = []
         # A4/A6：给按颗操作的代码（clear_errors / check_alarm_latch）一个电机代理
         self.motors = {n: MockMotor(self, n) for n in self.order}
@@ -120,6 +123,8 @@ class MockJointBus:
         self.drop_write_prob = 0.0
         self.write_dropped = 0
         self.write_resent = 0
+        # 30.5 第 3 条：只在“使能过、之后又失能”时才置锁存
+        self._ever_enabled = True if self.enabled else False
         # 27.2 第 3 条：失能后这一次上电不再使能（mock 不写真实配置文件）
         self.disabled_latch = False
         self.disabled_latch_at = None
@@ -165,6 +170,8 @@ class MockJointBus:
             pass
 
     def latch_disabled(self, reason: str = ""):
+        if not self._ever_enabled:
+            return False
         if not self.disabled_latch:
             self.disabled_latch = True
             self.disabled_latch_at = time.strftime("%Y-%m-%dT%H:%M:%S")
@@ -182,6 +189,7 @@ class MockJointBus:
         self.disabled_latch = False
         self.disabled_latch_at = None
         self.disabled_latch_reason = ""
+        self._ever_enabled = False
 
     # ---------------- 生命周期 ----------------
     def preflight(self):
@@ -232,6 +240,7 @@ class MockJointBus:
                     + "；".join(issues))
         self.enabled = True
         self.startup_done = True
+        self._ever_enabled = True
         for n in self.order:
             self.current_limit_readback.setdefault(n, 3.0)
         enabled = [{"name": n, "out_deg": round(self.q[n], 3),
@@ -254,6 +263,53 @@ class MockJointBus:
         self.startup_done = False
         self.latch_disabled(reason or "全部失能")
         return True
+
+    def try_takeover(self):
+        """30.6 第 4 条（mock）：六颗使能着、模式 6、报警 0 → 接管，只写目标=当前位。"""
+        import time as _time
+        if self.disabled_latch:
+            return {"took_over": False, "enabled_count": 0, "blocked": "latch",
+                    "msg": "已经失能过：请拉空开断电后重上电"}
+        enabled = [n for n in self.order if n not in self.off and self.enabled]
+        if not enabled:
+            return {"took_over": False, "enabled_count": 0,
+                    "msg": "六颗都是失能状态：等正常启动序列"}
+        bad = []
+        for n in self.order:
+            mode = self.force_mode.get(n, MODE_PROFILE_POSITION)
+            err = self.error_bits.get(n, self._errors.get(n, 0))
+            if mode != MODE_PROFILE_POSITION:
+                bad.append(f"{n} 模式={mode}")
+            if err:
+                bad.append(f"{n} 报警 0x{int(err):04X}")
+            if n in self.silent:
+                bad.append(f"{n} 读不到")
+        if bad:
+            return {"took_over": False, "enabled_count": len(enabled), "bad": bad,
+                    "msg": ("臂还使能着，但不能接管：" + "，".join(bad)
+                            + "。先扶住臂（或确认臂在搁架上），再拉空开断电")}
+        before = {n: self.q[n] for n in self.order}
+        # 只发 0x0A：目标=当前位置（mock 的 set_target_turns 记 0x0A，不碰模式/使能）
+        for n in self.order:
+            self.motors[n].set_target_turns(self.cfg[n].turns(before[n]))
+        _time.sleep(0.05)
+        moved = {n: round(abs(self.q[n] - before[n]), 3) for n in self.order
+                 if abs(self.q[n] - before[n]) > 0.2}
+        if moved:
+            return {"took_over": False, "enabled_count": len(enabled),
+                    "moved": moved,
+                    "msg": f"接管时这些关节位置变了 {moved}°：请先扶住臂再拉空开"}
+        self.startup_done = True
+        self._ever_enabled = True
+        positions = {n: round(before[n], 3) for n in self.order}
+        for n in self.order:
+            self._targets[n] = before[n]
+        self.startup_report = {"ok": True, "took_over": True,
+                               "positions": positions,
+                               "msg": "已接管（本来就在使能保持里）：没有重跑启动序列"}
+        return {"took_over": True, "enabled_count": len(enabled),
+                "positions": positions,
+                "msg": "已接管（本来就在使能保持里）：没有重跑启动序列，原地保持"}
 
     def close(self):
         pass

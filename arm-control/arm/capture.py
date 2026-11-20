@@ -175,3 +175,19 @@ class Capture:
                     "files_used": len(files)}
         except Exception as exc:  # noqa: BLE001
             return {"ok": False, "error": str(exc)}
+
+
+def slice_ring(incident_dir, trigger_ts: float, before_s: float = 10.0,
+               after_s: float = 10.0, ring_dir=None,
+               ecb_ip: str = "192.168.1.30") -> dict:
+    """29.2：把环形抓包里事故前后一段切进 incidents/<编号>/pcap_slice.pcap。"""
+    d = Path(incident_dir)
+    ring = Path(ring_dir) if ring_dir is not None else (d.parents[2]
+                                                       / "_pcap_ring")
+    cap = Capture(ring, ecb_ip=ecb_ip)
+    try:
+        return cap.slice_window(trigger_ts - float(before_s),
+                                trigger_ts + float(after_s),
+                                d / "pcap_slice.pcap")
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc)}

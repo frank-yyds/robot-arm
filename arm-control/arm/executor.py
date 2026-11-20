@@ -116,6 +116,7 @@ class Executor:
                                      self.limits, recorder=None)
         self.recorder: Recorder | None = None
         self.session: Session | None = None
+        self.takeover_report: dict | None = None
         self._prev_errors: dict[str, int] = {}
         self._capture = None
         self.trace: TraceSampler | None = None
@@ -465,7 +466,20 @@ class Executor:
             rep = self.bus.preflight()
             self.connected = bool(rep.get("ok"))
             if self.connected:
-                self.msg = "ECB 已连接，ID↔SN 一致；等待使能"
+                # 30.6 第 4 条：重连时六颗还使能着 → 接管，不跑启动序列
+                self.takeover_report = None
+                try:
+                    tk = self.bus.try_takeover()
+                except Exception as exc:  # noqa: BLE001
+                    tk = {"took_over": False, "enabled_count": 0,
+                          "msg": f"接管检查失败：{exc}"}
+                self.takeover_report = tk
+                if tk.get("took_over"):
+                    self.msg = str(tk.get("msg") or "已接管，原地保持")
+                elif tk.get("enabled_count"):
+                    self.msg = str(tk.get("msg") or "臂还使能着，但不能接管")
+                else:
+                    self.msg = "ECB 已连接，ID↔SN 一致；六颗失能，等待使能"
             else:
                 self.msg = "预检未通过：" + "；".join(rep.get("mismatch", []))
         self.runs_dir.mkdir(parents=True, exist_ok=True)
@@ -506,13 +520,34 @@ class Executor:
                     joints_cfg=self.joint_cfg,
                     bus_stats=self._param_stats(),
                     iface=str(self.cfg.get("ecb_iface") or ""))
-                if self.mode == "hw" and bool(self.cfg.get("auto_start_capture", False)):
+                if self.mode == "hw":
+                    # 29.1：抓包由 tools/session_start.sh 拉起（要 sudo）；
+                    # 这里只接管已经在跑的那个 pid，并写进会话头。
                     from .capture import Capture
-                    cap = Capture(ecb_ip=self.ecb_ip)
-                    self._capture = cap
-                    self.session.attach_capture(cap.start())
+                    cap = Capture(self.runs_dir / "_pcap_ring",
+                                  iface=str(self.cfg.get("ecb_iface") or ""),
+                                  ecb_ip=self.ecb_ip)
+                    st_cap = cap.status()
+                    if st_cap.get("active"):
+                        self._capture = cap
+                        self.session.attach_capture(st_cap.get("pid"))
+                        self.session.event("capture", "抓包已接管：pid "
+                                           f"{st_cap.get('pid')}，"
+                                           f"{st_cap.get('files_count')} 个文件")
+                    elif bool(self.cfg.get("auto_start_capture", False)):
+                        self.session.attach_capture(cap.start().get("pid"))
             except Exception as exc:  # noqa: BLE001
                 self.msg += f"（会话头/抓包启动失败：{exc}）"
+        if self.session and self.takeover_report is not None:
+            try:
+                tk = self.takeover_report
+                self.session.event(
+                    "takeover",
+                    ("接管成功：" + str(tk.get("positions") or "")) if tk.get("took_over")
+                    else ("未接管：" + str(tk.get("msg") or "")),
+                    took_over=bool(tk.get("took_over")))
+            except Exception:  # noqa: BLE001
+                pass
         if self.session:
             try:
                 threading.Thread(target=self.session.enforce_quota,
@@ -1112,6 +1147,8 @@ class Executor:
             "payload_kg": self.payload_kg,
             "capacities": self.capacities(),
             "hold_failure": (dict(self.hold_failure) if self.hold_failure else None),
+            "ecb_lock": (self._ecb_lock_status()),
+            "takeover": (dict(self.takeover_report) if self.takeover_report else None),
             "disabled_latch": (self.bus.latch_status()
                                if self.bus and hasattr(self.bus, "latch_status")
                                else {"disabled_latch": False, "msg": ""}),
@@ -1286,6 +1323,14 @@ class Executor:
         except Exception:  # noqa: BLE001
             pass
         return False
+
+    def _ecb_lock_status(self) -> dict:
+        """30.6：ECB 独占锁现在被谁占着（给网页/回报看）。"""
+        try:
+            from . import ecblock
+            return ecblock.status()
+        except Exception as exc:  # noqa: BLE001
+            return {"held": None, "error": str(exc)}
 
     def _param_stats(self) -> dict:
         """29.4：会话头里要的六颗可读参数（读不到就留空，不猜）。"""

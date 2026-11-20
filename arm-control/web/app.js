@@ -3,7 +3,7 @@ import { OrbitControls } from './vendor/OrbitControls.js';
 import { TransformControls } from './vendor/TransformControls.js';
 
 // 每次改网页都同时改这里和 web/version.json；刷新后右上角应显示这个版本
-const WEB_VERSION = '2026-11-19.3';
+const WEB_VERSION = '2026-11-21.3';
 const webverEl = document.getElementById('pill-webver');
 if (webverEl) webverEl.textContent = `网页 v${WEB_VERSION}`;
 
@@ -92,6 +92,9 @@ class ArmView {
     this.caps = [];
     this.base = new THREE.Mesh(new THREE.BoxGeometry(1, 1, 1), this.mat);
     this.group.add(this.base);
+    // 30.4 第 5 条：底座按实物画成两段（方块 + 转台柱）
+    this.baseParts = [];
+    this.basePartsKey = '';
     this.probe = new THREE.Mesh(new THREE.CylinderGeometry(1, 1, 1, 18), this.mat);
     this.group.add(this.probe);
     this.tip = new THREE.Mesh(new THREE.SphereGeometry(1, 12, 10), this.mat);
@@ -103,7 +106,7 @@ class ArmView {
     this.group.add(this.axisLine);
     scene.add(this.group);
   }
-  setBodies(caps, base) {
+  setBodies(caps, base, parts) {
     while (this.caps.length < caps.length) {
       const m = new THREE.Mesh(new THREE.CylinderGeometry(1, 1, 1, 14), this.mat);
       const s = new THREE.Mesh(new THREE.SphereGeometry(1, 12, 10), this.sphereMat);
@@ -124,7 +127,31 @@ class ArmView {
       c.s.position.copy(mid);
       c.s.scale.set(b.r, b.r, b.r);
     });
-    if (base) {
+    if (parts && parts.length) {
+      // 两段底座：box / cylinder
+      this.base.visible = false;
+      const key = JSON.stringify(parts);
+      if (key !== this.basePartsKey) {
+        this.basePartsKey = key;
+        this.baseParts.forEach((m) => { this.group.remove(m); m.geometry.dispose(); });
+        this.baseParts = parts.map((p) => {
+          const geo = (p.shape === 'cylinder')
+            ? new THREE.CylinderGeometry(1, 1, 1, 24)
+            : new THREE.BoxGeometry(1, 1, 1);
+          const m = new THREE.Mesh(geo, this.mat);
+          this.group.add(m);
+          return m;
+        });
+      }
+      parts.forEach((p, i) => {
+        const m = this.baseParts[i];
+        if (!m) return;
+        m.position.set(...p.center);
+        if (p.shape === 'cylinder') m.scale.set(p.radius, p.length, p.radius);
+        else m.scale.set(...p.size);
+      });
+    } else if (base) {
+      this.base.visible = true;
       this.base.position.set(...base.center);
       this.base.scale.set(...base.size);
     }
@@ -153,7 +180,7 @@ class ArmView {
   setScene(s) {
     if (!s) { this.group.visible = false; return; }
     this.group.visible = true;
-    this.setBodies(s.capsules, s.base);
+    this.setBodies(s.capsules, s.base, s.base_parts);
     this.setProbe(s.probe);
   }
 }

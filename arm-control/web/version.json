@@ -1,4 +1,4 @@
 {
-  "version": "2026-11-19.3",
-  "note": "第二十九节：会话目录三层记录（meta/state.csv/events.jsonl）、事故自动快照+自动 summary.md、网页“标记”按钮（快捷键 M）、参数快照与开机体检、查记录工具 timeline/plot/pcap_check/replay_guard、网页面板（流程/步号）；29.5 摄像头按用户 11-19 决定不做"
+  "version": "2026-11-21.3",
+  "note": "30.4 配套：网页 3D 底座按实物画两段（120方×48.5 方块 + Ø73×31 转台柱），围栏底座区不变；执行器 scene 输出 base_parts（兼容旧 base）"
 }
