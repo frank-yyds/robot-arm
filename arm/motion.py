@@ -556,8 +556,9 @@ class Motion:
                 jump = float(np.max(np.abs(
                     np.asarray(res.q_deg, float) - q0a)))
                 if jump > LIFT_MAX_JUMP_DEG + 1e-9:
-                    worst = f"{self.order[int(np.argmax(np.abs(
-                        np.asarray(res.q_deg, float) - q0a)))]} 跳 {jump:.1f}°"
+                    idx = int(np.argmax(np.abs(
+                        np.asarray(res.q_deg, float) - q0a)))
+                    worst = f"{self.order[idx]} 跳 {jump:.1f}°"
                     continue
                 if best is None or jump < best[0]:
                     best = (jump, res)
