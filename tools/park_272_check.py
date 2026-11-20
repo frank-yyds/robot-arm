@@ -234,6 +234,37 @@ def main() -> int:
              f"enable_calls {n_enable_before}→{ex.bus.enable_calls}"))
     ex.disconnect()
 
+    # ---------- ⑨ 附加（30.5 第 3 条）：启动在任何一颗使能之前就停下 → 不置锁存
+    from arm.mock import MockJointBus
+    b = MockJointBus()
+    b.enabled = False
+    b.startup_done = False
+    b._ever_enabled = False
+    b.disable_all(True, "自检：启动在使能之前就停下")
+    lat9 = b.latch_status()
+    ok9a = lat9.get("disabled_latch") is False
+    msg9 = ""
+    try:
+        b.enable_all(True)
+        ok9b = True
+    except Exception as exc:  # noqa: BLE001
+        ok9b = False
+        msg9 = str(exc)
+    checks.append((
+        "⑨附加（30.5-3）：还没使能过就停下 → 不置锁存，可以直接再启动",
+        bool(ok9a and ok9b),
+        f"latch={lat9.get('disabled_latch')} 再启动={'成' if ok9b else msg9[:60]}"))
+
+    # ---------- ⑩ 附加（30.5-3）：使能过、之后失能 → 照样置锁存
+    b2 = MockJointBus()
+    b2.enable_all(True, allow_restart=True)
+    b2.disable_all(True, "自检：使能过再失能")
+    lat10 = b2.latch_status()
+    ok10 = (str(lat10.get("at") or "") != "")
+    checks.append((
+        "⑩附加（30.5-3）：使能过再失能 → 照样置锁存（要拉空开重上电）",
+        bool(ok10), f"latch={lat10.get('disabled_latch')} at={lat10.get('at')}"))
+
     ok = all(c[1] for c in checks)
     for name, passed, detail in checks:
         print(f"  {'过' if passed else '没过'}：{name}\n        （{detail}）")

@@ -1,4 +1,4 @@
 {
-  "version": "2026-11-21.1",
-  "note": "30.1 0x94 电流换算修正：0x94 电流原始值是 IQ14 × 0x53 满量程（原来错用了回读限流，读数偏小 2–11 倍）；ρ 仍 = |A| / 回读限流；新增 tools/cvp_current_check.py（mock 自检 + 真机 0x94 vs 0x04 对照）；mock 补满量程缓存"
+  "version": "2026-11-21.2",
+  "note": "30.2 起步反向分析工具(tools/reverse_start.py)；30.6 ECB 独占锁(arm/ecblock.py，所有真 ECB 通信经 EcbTransport 先拿锁)+重连接管(六颗使能着时不跑启动序列、只写目标=当前位置、不发 0x07/0x08/0x2A)+mock 自检；30.5 锁存边界(还没使能过就停下不置锁存)；抓包会话脚本 tools/session_start.sh/session_stop.sh；会话头接管抓包 pid"
 }

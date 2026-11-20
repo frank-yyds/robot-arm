@@ -190,6 +190,9 @@ class JointBus:
         self.motors = {n: ScaMotor(self.link, self.cfg[n].id) for n in self.order}
         self.discovered: dict[int, int] = {}
         self.connected = False
+        # 30.5 第 3 条 / 27.2 第 3 条：锁存只在“这次上电里至少有一颗被使能过、
+        # 之后又失能了”时才置位。启动在任何一颗使能之前就停下不算。
+        self._ever_enabled = False
         # 27.2 第 3 条：失能以后同一次上电里不再使能（唯一例外 18.3 第 7 条）。
         # 锁存写进 config/disabled_latch.json，只有用户确认“已断电重上电”才清。
         self.disabled_latch = False
@@ -324,6 +327,7 @@ class JointBus:
             if not self._enable_with_retry(m, name, report):
                 self._disable_all_quiet()
                 raise StartupRefused(f"{name} 使能两次都无应答；已全部失能")
+            self._ever_enabled = True
             # 使能后立刻零扭矩，避免“使能那一下出力”
             m.set_mode(MODE_CURRENT)
             m.set_current_a(0.0)
@@ -488,6 +492,84 @@ class JointBus:
         return report
 
     @staticmethod
+    def try_takeover(self) -> dict:
+        """30.6 第 4 条：重连时六颗还使能着 → “接管”，不跑启动序列。
+
+        条件：六颗都读得到、电源=1、模式=6、报警=0、位置过 A3 合理性检查。
+        满足时**只发 0x0A**（目标=当前位置），不发 0x07 / 0x08 / 0x2A，然后进入保持。
+        有任何一条不满足：一条写命令都不发，返回能不能接管的说明。
+        """
+        import time as _time
+        if self.disabled_latch:
+            return {"took_over": False, "enabled_count": 0, "blocked": "latch",
+                    "msg": "已经失能过（同一次上电不再使能/接管）：请拉空开断电后重上电"}
+        try:
+            st = self.read_all(full=True)
+        except Exception as exc:  # noqa: BLE001
+            return {"took_over": False, "enabled_count": 0,
+                    "msg": f"接管检查读不到状态：{exc}"}
+        enabled = [n for n in self.order if getattr(st.get(n), "enabled", None) is True]
+        if not enabled:
+            return {"took_over": False, "enabled_count": 0,
+                    "msg": "六颗都是失能状态：等正常启动序列"}
+        bad: list[str] = []
+        for n in self.order:
+            s = st.get(n)
+            if s is None or s.enabled is not True:
+                bad.append(f"{n} 电源≠1")
+                continue
+            if s.mode != MODE_PROFILE_POSITION:
+                bad.append(f"{n} 模式={s.mode}")
+            if s.error:
+                bad.append(f"{n} 报警 0x{int(s.error):04X}")
+            if s.out_deg is None:
+                bad.append(f"{n} 位置读不到或没通过合理性检查")
+        if bad:
+            return {"took_over": False, "enabled_count": len(enabled),
+                    "bad": bad,
+                    "msg": ("臂还使能着，但不能接管：" + "，".join(bad)
+                            + "。先扶住臂（或确认臂在搁架上），再拉空开断电")}
+        # 只发 0x0A：逐颗写目标=当前位置（模式 6 下写当前位置不会动）
+        before: dict[str, float] = {}
+        for n in self.order:
+            pos = self.motors[n].pos_turns(timeout=0.1, retries=2)
+            if pos is None:
+                return {"took_over": False, "enabled_count": len(enabled),
+                        "msg": f"{n} 接管前读不到位置：一条写命令都没发，先扶住臂再拉空开"}
+            before[n] = pos
+            self.motors[n].set_target_turns(pos)
+        _time.sleep(0.2)
+        moved: dict[str, float] = {}
+        for n in self.order:
+            p2 = self.motors[n].pos_turns(timeout=0.1, retries=2)
+            if p2 is None:
+                moved[n] = 99.0
+                continue
+            dq = abs(self.cfg[n].out_deg(p2) - self.cfg[n].out_deg(before[n]))
+            if dq > 0.2:
+                moved[n] = round(dq, 2)
+        if moved:
+            return {"took_over": False, "enabled_count": len(enabled),
+                    "moved": moved,
+                    "msg": (f"接管时这些关节位置变了 {moved}°（不是原地保持）："
+                            "请先扶住臂再拉空开；没有继续发写命令")}
+        self.startup_done = True
+        self._ever_enabled = True
+        positions = {}
+        for n in self.order:
+            c = self.cfg[n]
+            deg = c.out_deg(before[n])
+            positions[n] = round(deg, 3)
+            self._targets[n] = deg
+            self._enabled_cache[n] = True
+            self._trust[n] = (deg, _time.monotonic())
+        self.startup_report = {"ok": True, "took_over": True,
+                               "positions": positions,
+                               "msg": "已接管（本来就在使能保持里）：没有重跑启动序列"}
+        return {"took_over": True, "enabled_count": len(enabled),
+                "positions": positions,
+                "msg": "已接管（本来就在使能保持里）：没有重跑启动序列，原地保持"}
+
     def _enable_with_retry(m, name: str, report: dict) -> bool:
         """A7：第一次使能无应答，单独再试这一颗；第二次还不行才失败。"""
         if m.enable():
@@ -552,6 +634,9 @@ class JointBus:
 
     def latch_disabled(self, reason: str = ""):
         """27.2 第 3 条：记下“这一次上电里已经失能过”，之后不许再使能。"""
+        # 30.5 第 3 条：还没使能过就停下的（握手/枚举/ID↔SN/读不到），不置锁存
+        if not self._ever_enabled:
+            return False
         if not self.disabled_latch:
             self.disabled_latch = True
             self.disabled_latch_at = time.strftime("%Y-%m-%dT%H:%M:%S")
@@ -577,6 +662,7 @@ class JointBus:
         self.disabled_latch = False
         self.disabled_latch_at = None
         self.disabled_latch_reason = ""
+        self._ever_enabled = False
         if not self.is_mock:
             try:
                 cfgmod.save_disabled_latch({})
@@ -983,6 +1069,7 @@ class JointBus:
             pass
         if not m.enable():
             return False
+        self._ever_enabled = True
         time.sleep(0.1)
         # 20.9.1：先写目标=当前位置，再切位置模式，再写一次目标
         m.set_target_turns(pos_turns)

@@ -19,6 +19,9 @@ TAIL = 0xED
 DEFAULT_IP = "192.168.1.30"
 DEFAULT_PORT = 2000
 
+# 30.6 第 1 条：ECB 独占锁的文件路径（测试里可以覆盖）。None = 用默认 .ecb.lock
+ECB_LOCK_PATH = None
+
 
 class EcbError(RuntimeError):
     pass
@@ -93,11 +96,31 @@ class EcbTransport:
         self.timeout = float(timeout)
         self.retries = int(retries)
         self.debug = debug
-        self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self._sock.bind(("", 0))
-        # 26.7 7b：写目标走单独发送口，不排在读取的重试后面
-        self._wsock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self._wsock.bind(("", 0))
+        # 30.6：真 ECB 通信前先拿独占锁；被别的进程占着就拒绝启动（16.4 第 10 条）
+        self._ecb_lock = None
+        try:
+            from .ecblock import EcbLock
+            lock = EcbLock(f"{ip}:{int(port)}", path=ECB_LOCK_PATH)
+            lock.acquire()
+            self._ecb_lock = lock
+        except Exception as exc:  # noqa: BLE001
+            from .ecblock import EcbLockBusy
+            if isinstance(exc, EcbLockBusy):
+                raise
+            # 拿不到锁文件（例如只读文件系统）不挡通信，但记一句
+            self._ecb_lock = None
+            self._lock_error = str(exc)
+        try:
+            self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self._sock.bind(("", 0))
+            # 26.7 7b：写目标走单独发送口，不排在读取的重试后面
+            self._wsock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self._wsock.bind(("", 0))
+        except Exception:  # noqa: BLE001
+            if self._ecb_lock is not None:
+                self._ecb_lock.release()
+                self._ecb_lock = None
+            raise
         self._wlock = threading.Lock()
         self._lock = threading.RLock()
         self.tx = 0
@@ -380,6 +403,13 @@ class EcbTransport:
             self._sock.close()
         except Exception:  # noqa: BLE001
             pass
+        # 30.6：关掉连接时释放 ECB 独占锁
+        if getattr(self, "_ecb_lock", None) is not None:
+            try:
+                self._ecb_lock.release()
+            except Exception:  # noqa: BLE001
+                pass
+            self._ecb_lock = None
 
     @property
     def stats(self) -> dict:

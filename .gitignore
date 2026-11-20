@@ -10,3 +10,7 @@ __pycache__/
 
 # 失能锁存是运行时状态，不入库
 config/disabled_latch.json
+
+# 30.6 ECB 独占锁文件（运行时）
+.ecb.lock
+.ecb.lock.tmp
