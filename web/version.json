@@ -1,4 +1,4 @@
 {
-  "version": "2026-11-21.4",
-  "note": "自检工具在慢机器（笔记本 py3.10）上的两处修正：trend_guard_check 规划前等 mock 停在起点、注入按运动层 busy 计时；记录器 close 后写入健壮性（3b03b7f）；无功能改动"
+  "version": "2026-11-21.5",
+  "note": "mock_soak/read_bench/ap1_j3_velocity_i 传 allow_restart=True（mock 初始已使能，新守卫会拒）；笔记本 28.3 六小时长跑启动；无功能改动"
 }
