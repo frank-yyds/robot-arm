@@ -30,6 +30,12 @@ def run_case(move, faults, inject_after=1.2, trial_time=6.0):
     ex.bus.enable_all(True, allow_restart=True)
     ex.bus.set_targets_q({n: 0.0 for n in ex.bus.order}, confirm=False)
     ex.bus.target = {n: 0.0 for n in ex.bus.order}
+    # 等 mock 真的停在 0（慢机器上规划到执行之间臂还在动，会被"姿态和预演不一致"拦掉）
+    t_wait = time.monotonic()
+    while time.monotonic() - t_wait < 3.0:
+        if max(abs(ex.bus.q[n]) for n in ex.bus.order) < 0.3:
+            break
+        time.sleep(0.05)
     th = threading.Thread(target=lambda: _safe_move(ex, move), daemon=True)
     th.start()
     time.sleep(inject_after)
