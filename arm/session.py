@@ -257,6 +257,8 @@ class Session:
             except queue.Empty:
                 continue
             try:
+                if getattr(self, "_fh_closed", False):
+                    continue
                 if kind == "state":
                     self._state_fh.write(line + "\n")
                     if self._q.qsize() < 8:
@@ -442,6 +444,7 @@ class Session:
             self._thread.join(timeout=2.0)
         except Exception:  # noqa: BLE001
             pass
+        self._fh_closed = True
         for fh in (self._state_fh, self._events_fh):
             try:
                 fh.flush()

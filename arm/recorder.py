@@ -49,6 +49,7 @@ class Recorder:
         self._w = csv.writer(self._fh)
         self._w.writerow(HEADER)
         self._t0 = _dt.datetime.now()
+        self._closed = False
         # 第二十九节：同一份记录同时写进会话目录（三层记录）
         self.session = session
         if note:
@@ -62,10 +63,16 @@ class Recorder:
     def _row(self, kind, joint="", pos="", target="", current="", error="",
              power="", mode="", note=""):
         with self._lock:
+            if self._closed:
+                return
             t, tr = self._ts()
-            self._w.writerow([t, tr, kind, joint, pos, target, current,
-                              error, power, mode, note])
-            self._fh.flush()
+            try:
+                self._w.writerow([t, tr, kind, joint, pos, target, current,
+                                  error, power, mode, note])
+                self._fh.flush()
+            except (ValueError, OSError):
+                # 已经 close()（比如 disconnect 时别的线程还在写）：静默丢掉
+                self._closed = True
 
     def note(self, text: str):
         self._row("note", note=text)
@@ -110,12 +117,17 @@ class Recorder:
                 pass
 
     def poll(self, states: dict):
+        with self._lock:
+            if self._closed:
+                return
         if self.session:
             try:
                 self.session.state(states)
             except Exception:  # noqa: BLE001
                 pass
         with self._lock:
+            if self._closed:
+                return
             t, tr = self._ts()
             for name, st in states.items():
                 self._w.writerow([
@@ -131,6 +143,9 @@ class Recorder:
 
     def status(self, rows: dict[str, dict]):
         """A5：电源/模式/报警，每颗一行（位置由 poll 行覆盖）。"""
+        with self._lock:
+            if self._closed:
+                return
         if self.session:
             try:
                 for name, r in rows.items():
@@ -152,6 +167,8 @@ class Recorder:
             self._fh.flush()
 
     def close(self):
+        with self._lock:
+            self._closed = True
         if self.session:
             try:
                 self.session.close()
