@@ -104,7 +104,7 @@ def run_static(ex, label):
 def main():
     ex = Executor()
     ex.connect("hw")
-    print("enable", ex.bus.enable_all(True).get("ok"))
+    print("enable", ex.bus.enable_all(True, allow_restart=True).get("ok"))
     ex.motion.speed_scale = 0.5
     ex.park_block = None
     time.sleep(0.5)

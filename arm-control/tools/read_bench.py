@@ -28,7 +28,7 @@ def main():
     ex.connect("hw")
     time.sleep(0.3)
     try:
-        ex.bus.enable_all(True)
+        ex.bus.enable_all(True, allow_restart=True)
     except Exception as exc:  # noqa: BLE001
         print("enable failed", exc)
         return 1

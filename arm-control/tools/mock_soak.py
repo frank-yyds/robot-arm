@@ -79,7 +79,7 @@ class Soak:
         self._timers: list[threading.Timer] = []
         self.e = Executor()
         self.e.connect("mock")
-        self.e.bus.enable_all(True)
+        self.e.bus.enable_all(True, allow_restart=True)
         self.e.speed_scale = 0.5
         self.e._sync_motion_params()
         self.m = self.e.motion
@@ -174,7 +174,7 @@ class Soak:
                 pass
         if not getattr(e.bus, "startup_done", False):
             try:
-                e.bus.enable_all(True)
+                e.bus.enable_all(True, allow_restart=True)
             except Exception:  # noqa: BLE001
                 self.skipped += 1
                 return
