@@ -30,8 +30,26 @@ def run_case(move, faults, inject_after=1.2, trial_time=6.0):
     ex.bus.enable_all(True, allow_restart=True)
     ex.bus.set_targets_q({n: 0.0 for n in ex.bus.order}, confirm=False)
     ex.bus.target = {n: 0.0 for n in ex.bus.order}
+    # 等 mock 真的停在 0（慢机器上规划到执行之间臂还在动，会被"姿态和预演不一致"拦掉）
+    t_wait = time.monotonic()
+    while time.monotonic() - t_wait < 3.0:
+        if max(abs(ex.bus.q[n]) for n in ex.bus.order) < 0.3:
+            break
+        time.sleep(0.05)
+    try:
+        ex.exec_mode = "direct"
+    except Exception:  # noqa: BLE001
+        pass
     th = threading.Thread(target=lambda: _safe_move(ex, move), daemon=True)
     th.start()
+    # 慢机器上线程起来≠运动真的开始：等运动层进入 running/starting 再计时，
+    # 否则注入可能落在起步 1 s 的容忍窗口里，判成"启动反向"而不是"背离"
+    t_wait = time.monotonic()
+    while time.monotonic() - t_wait < 3.0:
+        st = ex.motion.status
+        if st.get("busy") or st.get("phase") in ("running", "starting"):
+            break
+        time.sleep(0.02)
     time.sleep(inject_after)
     t_inj = time.monotonic()
     if faults:
