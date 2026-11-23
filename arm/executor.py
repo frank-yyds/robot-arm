@@ -673,6 +673,8 @@ class Executor:
             time.sleep(max(0.0, period - (time.monotonic() - t0)))
 
     def _refresh(self):
+        if getattr(self, "_poll_hold", False):
+            return
         if self.use_actual():
             m = self.motion
             busy = m.status.get("busy")
@@ -1454,6 +1456,11 @@ class Executor:
             except Exception:  # noqa: BLE001
                 pass
         return out
+
+    def test_poll_hold(self, on: bool = True) -> dict:
+        """27.3：高频记录期间暂停空闲轮询（它每拍 read_all 会抢总线、把 trace 压到 65 Hz）。"""
+        self._poll_hold = bool(on)
+        return {"ok": True, "poll_hold": bool(on)}
 
     def test_read_profiles(self) -> dict:
         """27.3：回读六颗的梯形参数（0x1C/0x1D/0x1E）。"""
@@ -3598,6 +3605,9 @@ class Handler(BaseHTTPRequestHandler):
             if p == "/api/test/skip_resend":
                 EXEC.require_control(body)
                 return self._json(200, EXEC.test_skip_resend(bool(body.get("on", True))))
+            if p == "/api/test/poll_hold":
+                EXEC.require_control(body)
+                return self._json(200, EXEC.test_poll_hold(bool(body.get("on", True))))
             if p == "/api/test/cvp_crosscheck":
                 EXEC.require_control(body)
                 return self._json(200, EXEC.test_cvp_crosscheck(
