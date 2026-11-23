@@ -93,7 +93,7 @@
   "descent_j5_deg": null,
   "descent_j6_deg": null,
   "descent_q4_deg": null,
-  "contact_j4_z": null,
-  "contact_j4_z_at": null,
+  "contact_j4_z": 161.0,
+  "contact_j4_z_at": "2026-11-23T23:44:35",
   "_comment_a9": "A9 2026-11-17：收拢点/预停机点的 q1 统一取教的停机位置 q1（92.181°）；park_side 由它符号推出；接住高度记进 contact_j4_z，以后差 >5 mm 就原地保持。"
 }
