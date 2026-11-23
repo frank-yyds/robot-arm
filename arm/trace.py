@@ -96,7 +96,7 @@ class TraceSampler:
         targets = dict(getattr(bus, "_targets", {}))
         cvp = {}
         try:
-            cvp = bus.read_cvp_all(timeout=0.03, retries=1)
+            cvp = bus.read_cvp_all(timeout=0.03, retries=1, names=order)
         except Exception as exc:  # noqa: BLE001
             self.error = f"0x94 读失败：{exc}"
         errs = {}

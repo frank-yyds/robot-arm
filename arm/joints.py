@@ -836,14 +836,19 @@ class JointBus:
                 self._last_state[name] = st
         return out
 
-    def read_cvp_all(self, timeout: float = 0.05, retries: int = 2) -> dict[str, dict]:
-        """26.2：六颗一轮用 0x94 同时取位置/速度/电流（输出端角度）。"""
+    def read_cvp_all(self, timeout: float = 0.05, retries: int = 2,
+                     names=None) -> dict[str, dict]:
+        """26.2：六颗一轮用 0x94 同时取位置/速度/电流（输出端角度）。
+
+        names 给了就只读这几颗（27.3 高频记录时减少一轮的指令数、把节拍提上去）。
+        """
+        order = [str(x).upper() for x in names] if names else list(self.order)
         with self._lock:
             got = self.link.read_many(
-                [(self.motors[n].mid, 0x94, 7) for n in self.order],
+                [(self.motors[n].mid, 0x94, 7) for n in order],
                 timeout=timeout, retries=retries)
             out: dict[str, dict] = {}
-            for name in self.order:
+            for name in order:
                 d = got.get((self.motors[name].mid, 0x94))
                 if not d or len(d) < 7:
                     out[name] = {"ok": False}
