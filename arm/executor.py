@@ -1384,6 +1384,75 @@ class Executor:
         return {"ok": True, "skip_resend": bool(on),
                 "msg": f"skip_resend = {bool(on)}"}
 
+    def test_cvp_crosscheck(self, n: int = 50, joints=("J2", "J3")) -> dict:
+        """30.1 第 3 条：0x94 电流和单独读 0x04 电流对照（只读，不发写命令）。
+
+        报：每颗对照的差（占 0x53 满量程的 %）、比值中位数、六颗 0x53 满量程（原始 IQ8 和 A）。
+        """
+        if self.bus is None:
+            raise MotionError("还没连接")
+        bus = self.bus
+        fs = {}
+        for nm in bus.order:
+            m = bus.motors[nm]
+            raw = None
+            val = None
+            try:
+                d = bus.link.read_many([(m.mid, 0x53, 2)], timeout=0.1, retries=2)
+                dd = d.get((m.mid, 0x53))
+                raw = None if dd is None else int.from_bytes(dd, "big", signed=True)
+            except Exception:  # noqa: BLE001
+                raw = None
+            try:
+                val = m.current_max_a()
+            except Exception:  # noqa: BLE001
+                val = None
+            fs[nm] = {"raw_iq8": raw, "full_scale_a": val}
+        out = {"full_scales": fs, "compare": {}}
+        for nm in joints:
+            pairs = []
+            t0 = time.monotonic()
+            while len(pairs) < int(n) and time.monotonic() - t0 < 30.0:
+                try:
+                    cvp = bus.read_cvp_all(timeout=0.03, retries=1).get(nm) or {}
+                    st = bus.read_all(full=True).get(nm)
+                except Exception:  # noqa: BLE001
+                    continue
+                a94 = cvp.get("current_a")
+                a04 = None if st is None else st.current_a
+                if a94 is not None and a04 is not None:
+                    pairs.append((a04, a94))
+            if not pairs:
+                out["compare"][nm] = None
+                continue
+            scale = fs.get(nm, {}).get("full_scale_a") or 1.0
+            diffs = [abs(b - a) for a, b in pairs]
+            ratios = [b / a for a, b in pairs if abs(a) > 0.2]
+            diffs.sort()
+            out["compare"][nm] = {
+                "n": len(pairs),
+                "max_diff_pct_fs": round(max(diffs) / scale * 100.0, 3),
+                "median_ratio": (None if not ratios else
+                                 round(sorted(ratios)[len(ratios) // 2], 4)),
+            }
+        # 判据：差 ≤ 满量程 2%，比值中位 0.9–1.1
+        ok = True
+        for nm, r in out["compare"].items():
+            if r is None:
+                ok = False
+                continue
+            if r["max_diff_pct_fs"] > 2.0:
+                ok = False
+            if r["median_ratio"] is not None and not (0.9 <= r["median_ratio"] <= 1.1):
+                ok = False
+        out["ok"] = ok
+        if self.recorder:
+            try:
+                self.recorder.command("test_cvp_crosscheck", json.dumps(out, ensure_ascii=False)[:300])
+            except Exception:  # noqa: BLE001
+                pass
+        return out
+
     def test_read_profiles(self) -> dict:
         """27.3：回读六颗的梯形参数（0x1C/0x1D/0x1E）。"""
         out = {}
@@ -3527,6 +3596,10 @@ class Handler(BaseHTTPRequestHandler):
             if p == "/api/test/skip_resend":
                 EXEC.require_control(body)
                 return self._json(200, EXEC.test_skip_resend(bool(body.get("on", True))))
+            if p == "/api/test/cvp_crosscheck":
+                EXEC.require_control(body)
+                return self._json(200, EXEC.test_cvp_crosscheck(
+                    int(body.get("n") or 50), body.get("joints") or ("J2", "J3")))
             if p == "/api/test/read_profiles":
                 EXEC.require_control(body)
                 return self._json(200, EXEC.test_read_profiles())
