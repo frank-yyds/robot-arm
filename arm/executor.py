@@ -571,12 +571,14 @@ class Executor:
                 "msg": self.msg, "config_version": self.config_version}
 
     def start_trace(self, hz: float = 100.0, seconds: float = 10.0,
-                    joints=None, status_hz: float = 5.0, light: bool = False) -> dict:
+                    joints=None, status_hz: float = 5.0, light: bool = False,
+                    mode: str = "") -> dict:
         if self.trace and self.trace.status().get("active"):
             raise MotionError("高频采样已经在跑")
         if not isinstance(self.bus, JointBus) or not self.connected:
             raise MotionError("高频采样需要真机连接（模拟模式没有真实 ECB 总线）")
         self.trace = TraceSampler(self, hz=hz, seconds=seconds, joints=joints,
+                                  mode=mode,
                                   status_hz=status_hz, light=light)
         self.trace.start()
         self.msg = f"高频采样开始：{hz:g} Hz / {seconds:g} s"
@@ -3618,7 +3620,8 @@ class Handler(BaseHTTPRequestHandler):
                                         "trace": EXEC.start_trace(
                                             hz, sec, body.get("joints"),
                                             float(body.get("status_hz") or 5.0),
-                                            bool(body.get("light")))})
+                                            bool(body.get("light")),
+                                            str(body.get("mode") or ""))})
             if p == "/api/trace/stop":
                 EXEC.require_control(body)
                 return self._json(200, {"ok": True, "trace": EXEC.stop_trace()})

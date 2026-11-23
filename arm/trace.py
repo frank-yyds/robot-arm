@@ -21,8 +21,12 @@ from .sca import (DEG_PER_MOTOR_TURN, IQ24, R_CURRENT, R_ERROR, R_MODE,
 
 class TraceSampler:
     def __init__(self, ex, hz: float = 100.0, seconds: float = 10.0,
-                 joints=None, status_hz: float = 5.0, light: bool = False):
+                 joints=None, status_hz: float = 5.0, light: bool = False,
+                 mode: str = ""):
         self.ex = ex
+        # 27.3：mode="cvp" 时用 0x94 一次取位置/速度/电流（六颗一轮一条指令），
+        # 才能到 ≥100 Hz；默认空 = 原来的逐条指令模式
+        self.mode = str(mode or "")
         # B1 用：只采位置 + 电源/模式/报警，节拍能上 20 Hz
         self.light = bool(light)
         self.joints = ([str(x).upper() for x in joints] if joints else None)
@@ -85,6 +89,47 @@ class TraceSampler:
                 "error": self.error,
             }
 
+    def _sample_cvp(self, f, w, bus, order, ids, cm, tick, status_every, t0, dt):
+        """0x94 一轮取六颗位置/速度/电流；报警/电源/模式按原频率。"""
+        tstamp = time.strftime("%Y-%m-%dT%H:%M:%S")
+        tr = time.monotonic() - t0
+        targets = dict(getattr(bus, "_targets", {}))
+        cvp = {}
+        try:
+            cvp = bus.read_cvp_all(timeout=0.03, retries=1)
+        except Exception as exc:  # noqa: BLE001
+            self.error = f"0x94 读失败：{exc}"
+        errs = {}
+        pw = {}
+        modes = {}
+        if tick % 5 == 0:
+            try:
+                errs = bus.read_errors(timeout=0.03, retries=1)
+            except Exception:  # noqa: BLE001
+                errs = {}
+        if tick % status_every == 0:
+            try:
+                rows = bus.read_status(timeout=0.05)
+                for n, r in rows.items():
+                    pw[n] = r.get("power")
+                    modes[n] = r.get("mode")
+            except Exception:  # noqa: BLE001
+                pass
+        for n in order:
+            d = cvp.get(n) or {}
+            pos = d.get("pos_deg") if d.get("ok") else None
+            vel = d.get("vel_deg_s") if d.get("ok") else None
+            cur = d.get("current_a") if d.get("ok") else None
+            w.writerow([tstamp, f"{tr:.4f}", tick, n,
+                        "" if pos is None else f"{pos:.4f}",
+                        "" if targets.get(n) is None else f"{targets[n]:.4f}",
+                        "" if cur is None else f"{cur:.4f}",
+                        "" if vel is None else f"{vel:.3f}",
+                        "" if errs.get(n) is None else f"0x{int(errs[n]):04X}",
+                        "" if pw.get(n) is None else str(pw[n]),
+                        "" if modes.get(n) is None else str(modes[n]),
+                        f"{dt:.4f}"])
+
     def _run(self):
         bus = self.ex.bus
         order = [n for n in (self.joints or list(bus.order)) if n in bus.motors]
@@ -117,6 +162,21 @@ class TraceSampler:
                         break
                     dt = max(0.0, now - last_sample)
                     last_sample = now
+                    if self.mode == "cvp":
+                        self._sample_cvp(f, w, bus, order, ids, cm, tick,
+                                         status_every, t0, dt)
+                        self.samples = tick
+                        if tick % 10 == 0:
+                            f.flush()
+                        elapsed = time.monotonic() - t0
+                        self.actual_hz = tick / elapsed if elapsed > 0 else 0.0
+                        next_t += period
+                        sleep = next_t - time.monotonic()
+                        if sleep > 0:
+                            time.sleep(sleep)
+                        elif sleep < -0.2:
+                            next_t = time.monotonic()
+                        continue
                     items = []
                     for n in order:
                         mid = ids[n]
