@@ -23,24 +23,29 @@ PIDFILE="${RING}/tcpdump.pid"
 if [ -f "${PIDFILE}" ]; then
   OLD=$(cat "${PIDFILE}" 2>/dev/null || true)
   if [ -n "${OLD}" ] && kill -0 "${OLD}" 2>/dev/null; then
-    echo "已经有 tcpdump 在跑（PID ${OLD}，网口见 ${RING}/tcpdump.log）；先 session_stop.sh"
-    exit 0
+    echo "有旧 tcpdump 在跑（PID ${OLD}），先停掉它"
+    sudo -v
+    sudo -n kill "${OLD}" 2>/dev/null || true
+    sleep 1
   fi
+  rm -f "${PIDFILE}"
 fi
+# 旧版本用 %Y%m%d_%H%M%S 做文件名，tcpdump 不带 -G 不展开；清掉那个 0 字节垃圾
+rm -f "${RING}"/ecb_%Y*.pcap* 2>/dev/null || true
 
 echo "网口 ${IFACE} → ECB ${ECB_IP}；抓包目录 ${RING}（每个文件 100 MB，留 20 个）"
 echo "下面要输一次 sudo 密码（先 sudo -v 缓存凭据，再后台起 tcpdump；直接后台跑 sudo 读不到密码）"
 sudo -v || { echo "✗ sudo 没通过" >&2; exit 2; }
-sudo -n tcpdump -i "${IFACE}" -n -s 0 \
+sudo -n tcpdump -i "${IFACE}" -n -s 0 -U \
   -C 100 -W 20 \
-  -w "${RING}/ecb_%Y%m%d_%H%M%S.pcap" \
+  -w "${RING}/ecb_ring.pcap" \
   "udp and host ${ECB_IP}" \
   >"${RING}/tcpdump.log" 2>&1 &
 PID=$!
 echo "${PID}" > "${PIDFILE}"
 sleep 2
 if kill -0 "${PID}" 2>/dev/null; then
-  echo "✓ tcpdump 已起：PID ${PID}（网口 ${IFACE}）"
+  echo "✓ tcpdump 已起：PID ${PID}（网口 ${IFACE}）；文件 ${RING}/ecb_ring.pcap*（-U 立即落盘）"
   echo "  抓包文件：${RING}/ecb_*.pcap；日志：${RING}/tcpdump.log"
 else
   echo "✗ tcpdump 起来就退出了，看 ${RING}/tcpdump.log" >&2
