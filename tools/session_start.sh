@@ -29,15 +29,16 @@ if [ -f "${PIDFILE}" ]; then
 fi
 
 echo "网口 ${IFACE} → ECB ${ECB_IP}；抓包目录 ${RING}（每个文件 100 MB，留 20 个）"
-echo "下面要输一次 sudo 密码"
-sudo tcpdump -i "${IFACE}" -n -s 0 \
+echo "下面要输一次 sudo 密码（先 sudo -v 缓存凭据，再后台起 tcpdump；直接后台跑 sudo 读不到密码）"
+sudo -v || { echo "✗ sudo 没通过" >&2; exit 2; }
+sudo -n tcpdump -i "${IFACE}" -n -s 0 \
   -C 100 -W 20 \
   -w "${RING}/ecb_%Y%m%d_%H%M%S.pcap" \
   "udp and host ${ECB_IP}" \
   >"${RING}/tcpdump.log" 2>&1 &
 PID=$!
 echo "${PID}" > "${PIDFILE}"
-sleep 1
+sleep 2
 if kill -0 "${PID}" 2>/dev/null; then
   echo "✓ tcpdump 已起：PID ${PID}（网口 ${IFACE}）"
   echo "  抓包文件：${RING}/ecb_*.pcap；日志：${RING}/tcpdump.log"
