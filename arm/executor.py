@@ -1324,6 +1324,87 @@ class Executor:
             pass
         return False
 
+    # ---------------- 27.3/30.3 测试专用（不影响正常流程） ----------------
+    def test_write_profile(self, q) -> dict:
+        """30.3 e3：只写梯形参数（0x1F/0x20/0x21），不写目标、不切模式、不使能。"""
+        self._reject_if_parking()
+        if self.motion is None or not self._bus_startup_done():
+            raise MotionError("还没完成启动/使能，不能做这个测试")
+        if self.motion.status.get("busy"):
+            raise MotionError("正在运动")
+        segs = self.motion.plan_joint_move(q, label="test_write_profile")
+        seg = segs[-1]
+        wrote = {}
+        for n in self.bus.order:
+            c = self.bus.cfg[n]
+            vel = float((seg.get("vel_deg_s") or {}).get(n, c.motion_speed_deg_s))
+            acc = float((seg.get("acc_deg_s2") or {}).get(n,
+                        vel / max(c.motion_accel_time_s, 0.05)))
+            try:
+                self.bus.motors[n].set_profile_out(vel, acc, acc)
+                wrote[n] = {"vel_deg_s": round(vel, 3), "acc_deg_s2": round(acc, 3),
+                            "dec_deg_s2": round(acc, 3)}
+            except Exception as exc:  # noqa: BLE001
+                wrote[n] = {"error": str(exc)}
+        time.sleep(0.05)
+        if self.recorder:
+            try:
+                self.recorder.command("test_write_profile", str(wrote))
+            except Exception:  # noqa: BLE001
+                pass
+        return {"ok": True, "wrote": wrote, "msg": "只写了梯形参数，没有写目标"}
+
+    def test_write_targets(self, q) -> dict:
+        """30.3 e3 第二步 / e4：只写目标位置（0x0A），不重发、不切模式。"""
+        self._reject_if_parking()
+        if self.motion is None or not self._bus_startup_done():
+            raise MotionError("还没完成启动/使能，不能做这个测试")
+        if self.motion.status.get("busy"):
+            raise MotionError("正在运动")
+        q = [float(v) for v in q]
+        if len(q) != 6:
+            raise MotionError("需要 6 个关节角")
+        self.pending = None
+        self.preview = None
+        self.bus.set_targets_q({n: q[i] for i, n in enumerate(self.robot.joint_names)},
+                               confirm=False)
+        if self.recorder:
+            try:
+                self.recorder.command("test_write_targets",
+                                      " ".join(f"{n}{v:+.2f}" for n, v in
+                                               zip(self.robot.joint_names, q)))
+            except Exception:  # noqa: BLE001
+                pass
+        return {"ok": True, "q": [round(v, 3) for v in q],
+                "msg": "只写了目标，没有重发"}
+
+    def test_skip_resend(self, on: bool = True) -> dict:
+        """30.3 e4：关掉“写目标后 0.06 s 重发”（只对本次会话有效）。"""
+        self.bus.skip_resend = bool(on)
+        return {"ok": True, "skip_resend": bool(on),
+                "msg": f"skip_resend = {bool(on)}"}
+
+    def test_read_profiles(self) -> dict:
+        """27.3：回读六颗的梯形参数（0x1C/0x1D/0x1E）。"""
+        out = {}
+        for n in self.bus.order:
+            try:
+                pr = self.bus.motors[n].profile()
+            except Exception:  # noqa: BLE001
+                pr = None
+            out[n] = None if pr is None else {
+                "vel_rpm": round(float(pr[0]), 3),
+                "acc_rpm_s": round(float(pr[1]), 3),
+                "dec_rpm_s": round(float(pr[2]), 3),
+                "vel_deg_s": round(float(pr[0]) * 10.0 / 60.0, 3),
+                "acc_deg_s2": round(float(pr[1]) * 10.0 / 60.0, 3),
+                "dec_deg_s2": round(float(pr[2]) * 10.0 / 60.0, 3),
+            }
+        return {"ok": True, "profiles": out}
+
+    def _bus_startup_done(self) -> bool:
+        return bool(getattr(self.bus, "startup_done", False))
+
     def _ecb_lock_status(self) -> dict:
         """30.6：ECB 独占锁现在被谁占着（给网页/回报看）。"""
         try:
@@ -3437,6 +3518,18 @@ class Handler(BaseHTTPRequestHandler):
             if p == "/api/stop":
                 # 停是安全动作：不要求控制权，任何客户端都能停
                 return self._json(200, EXEC.stop_all("用户按停"))
+            if p == "/api/test/write_profile":
+                EXEC.require_control(body)
+                return self._json(200, EXEC.test_write_profile(body.get("q")))
+            if p == "/api/test/write_targets":
+                EXEC.require_control(body)
+                return self._json(200, EXEC.test_write_targets(body.get("q")))
+            if p == "/api/test/skip_resend":
+                EXEC.require_control(body)
+                return self._json(200, EXEC.test_skip_resend(bool(body.get("on", True))))
+            if p == "/api/test/read_profiles":
+                EXEC.require_control(body)
+                return self._json(200, EXEC.test_read_profiles())
             if p == "/api/mark":
                 # 29.3 用户标记：安全动作，不要求控制权（任何客户端都能标记）
                 return self._json(200, EXEC.mark(

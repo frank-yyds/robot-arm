@@ -229,6 +229,8 @@ class JointBus:
         # 30.1：0x53 电流满量程（A）。0x94 的电流原始值是 IQ14 乘满量程，
         # 不是乘限流；这里缓存一份，避免每拍都去读 0x53。
         self.current_full_scale_readback: dict[str, float | None] = {}
+        # 30.3 e4：测试里关掉“写目标后 0.06 s 重发”，只给测试工具用，不影响正常流程
+        self.skip_resend = False
 
     def reload_config(self, cfg: dict | None = None):
         """重新读 config/joints.json（sign/offset/限位），不重建电机连接。"""
@@ -941,7 +943,7 @@ class JointBus:
                 c = self.cfg[name]
                 res[name] = self.motors[name].set_target_turns(c.turns(q), priority=True)
                 self._targets[name] = q
-        if confirm:
+        if confirm and not self.skip_resend:
             self.confirm_targets(targets)
         return res
 
