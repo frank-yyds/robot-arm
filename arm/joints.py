@@ -493,7 +493,6 @@ class JointBus:
         self.startup_report = report
         return report
 
-    @staticmethod
     def try_takeover(self) -> dict:
         """30.6 第 4 条：重连时六颗还使能着 → “接管”，不跑启动序列。
 
