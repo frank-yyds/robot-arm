@@ -572,6 +572,7 @@ class JointBus:
                 "positions": positions,
                 "msg": "已接管（本来就在使能保持里）：没有重跑启动序列，原地保持"}
 
+    @staticmethod
     def _enable_with_retry(m, name: str, report: dict) -> bool:
         """A7：第一次使能无应答，单独再试这一颗；第二次还不行才失败。"""
         if m.enable():
