@@ -416,6 +416,7 @@ class JointBus:
 
         # 35.2 第 4 条：第一次写梯形参数之前，只读六颗 0x1C / 0x1D / 0x1E
         # （原始值记进会话记录；35.3 S4 要报“启动时读到的是正还是负”）
+        report["profile_before"] = {}
         try:
             pre = {}
             for i in range(0, len(self.order), 2):
@@ -436,14 +437,17 @@ class JointBus:
                             row[hex(c)] = None
                     pre[n] = row
             report["profile_before"] = pre
-            if self.recorder:
-                for n, row in pre.items():
+        except Exception as exc:  # noqa: BLE001
+            report["profile_before_error"] = str(exc)
+        if self.recorder and report["profile_before"]:
+            for n, row in report["profile_before"].items():
+                try:
                     self.recorder.command(
                         "profile_readback_before",
                         " ".join(f"{k}={None if v is None else v['raw_hex']}"
                                  for k, v in row.items()), joint=n)
-        except Exception:  # noqa: BLE001
-            report["profile_before"] = {}
+                except Exception:  # noqa: BLE001
+                    pass
 
         # ---- 3) 切 S 曲线保持，写梯形参数并回读 ----
         for name in self.order:
