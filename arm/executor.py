@@ -1388,13 +1388,17 @@ class Executor:
             m = self.bus.motors[n]
             c = self.bus.cfg[n]
             out[n] = {}
-            items = [(m.mid, cmd, 4) for cmd in cs]
-            try:
-                got = self.bus.link.read_many(items, timeout=0.08, retries=2)
-            except Exception as exc:  # noqa: BLE001
-                raise MotionError(f"读参数失败：{exc}") from exc
             for cmd in cs:
-                d = got.get((m.mid, cmd))
+                # 逐条读（一次读太多条在真总线上会整批超时）；读不到就 null
+                d = None
+                for _ in range(3):
+                    try:
+                        d = self.bus.link.read(m.mid, cmd, 4, timeout=0.12, retries=1)
+                    except Exception:  # noqa: BLE001
+                        d = None
+                    if d and len(d) >= 4:
+                        break
+                got = {(m.mid, cmd): d}
                 row = {"raw_hex": None if d is None else d.hex()}
                 if d and len(d) >= 4:
                     raw = struct.unpack(">i", d)[0]
