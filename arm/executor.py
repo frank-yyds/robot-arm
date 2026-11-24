@@ -1329,8 +1329,13 @@ class Executor:
         return False
 
     # ---------------- 27.3/30.3 测试专用（不影响正常流程） ----------------
-    def test_write_profile(self, q) -> dict:
-        """30.3 e3：只写梯形参数（0x1F/0x20/0x21），不写目标、不切模式、不使能。"""
+    def test_write_profile(self, q, negative_decel: bool = False) -> dict:
+        """只写梯形参数（0x1F/0x20/0x21），不写目标、不切模式、不使能。
+
+        35.3 第 4 条：negative_decel=True 时减速度写成负数（大小 = 加速度），
+        只写内存（不发 0x0D 存 EEPROM），用于负减速度对照。
+        35.2 第 2 条：本段不动的关节（|位移| ≤0.8°）加速度/减速度给下限。
+        """
         self._reject_if_parking()
         if self.motion is None or not self._bus_startup_done():
             raise MotionError("还没完成启动/使能，不能做这个测试")
@@ -1338,25 +1343,71 @@ class Executor:
             raise MotionError("正在运动")
         segs = self.motion.plan_joint_move(q, label="test_write_profile")
         seg = segs[-1]
+        q_now = self.motion.read_q()
         wrote = {}
         for n in self.bus.order:
             c = self.bus.cfg[n]
+            disp = float((seg.get("q_target") or [0] * 6)[self.robot.joint_names.index(n)]
+                         - q_now[self.robot.joint_names.index(n)])
             vel = float((seg.get("vel_deg_s") or {}).get(n, c.motion_speed_deg_s))
             acc = float((seg.get("acc_deg_s2") or {}).get(n,
                         vel / max(c.motion_accel_time_s, 0.05)))
+            if abs(disp) <= 0.8:
+                floor = c.motion_speed_deg_s / max(c.motion_accel_time_s, 0.05)
+                acc = max(acc, floor)
+            dec = -acc if negative_decel else acc
             try:
-                self.bus.motors[n].set_profile_out(vel, acc, acc)
+                self.bus.motors[n].set_profile_out(vel, acc, dec)
                 wrote[n] = {"vel_deg_s": round(vel, 3), "acc_deg_s2": round(acc, 3),
-                            "dec_deg_s2": round(acc, 3)}
+                            "dec_deg_s2": round(dec, 3), "disp_deg": round(disp, 3)}
             except Exception as exc:  # noqa: BLE001
                 wrote[n] = {"error": str(exc)}
         time.sleep(0.05)
         if self.recorder:
             try:
-                self.recorder.command("test_write_profile", str(wrote))
+                self.recorder.command(
+                    "test_write_profile",
+                    f"negative_decel={bool(negative_decel)} " + str(wrote))
             except Exception:  # noqa: BLE001
                 pass
-        return {"ok": True, "wrote": wrote, "msg": "只写了梯形参数，没有写目标"}
+        return {"ok": True, "wrote": wrote, "negative_decel": bool(negative_decel),
+                "msg": "只写了梯形参数，没有写目标"}
+
+    def test_read_params(self, joints=None, cmds=None) -> dict:
+        """35.3：只读若干原始参数（0x1B/0x7B/0x77/0x1C/0x1D/0x1E/0x53/0x0D/0x06/0x04/0x05）。
+
+        返回每颗每条的原始 hex；0x1C/1D/1E 另给 °/s 换算，0x53 给 A。
+        """
+        if self.bus is None:
+            raise MotionError("还没连接")
+        js = [str(x).upper() for x in (joints or self.bus.order)]
+        cs = [int(x, 0) if isinstance(x, str) else int(x)
+              for x in (cmds or (0x1B, 0x7B, 0x77, 0x1C, 0x1D, 0x1E, 0x53))]
+        out = {}
+        for n in js:
+            m = self.bus.motors[n]
+            c = self.bus.cfg[n]
+            out[n] = {}
+            items = [(m.mid, cmd, 4) for cmd in cs]
+            try:
+                got = self.bus.link.read_many(items, timeout=0.08, retries=2)
+            except Exception as exc:  # noqa: BLE001
+                raise MotionError(f"读参数失败：{exc}") from exc
+            for cmd in cs:
+                d = got.get((m.mid, cmd))
+                row = {"raw_hex": None if d is None else d.hex()}
+                if d and len(d) >= 4:
+                    raw = struct.unpack(">i", d)[0]
+                    row["raw_iq8"] = raw
+                    if cmd in (0x1C, 0x1D, 0x1E):
+                        row["deg_s"] = round(raw / 256.0 * 10.0 / 60.0, 3)
+                        row["rpm"] = round(raw / 256.0, 3)
+                    elif cmd == 0x53:
+                        row["a"] = round(raw / 256.0, 3)
+                    elif cmd in (0x06,):
+                        row["pos_deg"] = round(c.out_deg(raw / (1 << 24)), 3)
+                out[n][hex(cmd)] = row
+        return {"ok": True, "rows": out}
 
     def test_write_targets(self, q) -> dict:
         """30.3 e3 第二步 / e4：只写目标位置（0x0A），不重发、不切模式。"""
@@ -3598,7 +3649,12 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, EXEC.stop_all("用户按停"))
             if p == "/api/test/write_profile":
                 EXEC.require_control(body)
-                return self._json(200, EXEC.test_write_profile(body.get("q")))
+                return self._json(200, EXEC.test_write_profile(
+                    body.get("q"), bool(body.get("negative_decel"))))
+            if p == "/api/test/read_params":
+                EXEC.require_control(body)
+                return self._json(200, EXEC.test_read_params(
+                    body.get("joints"), body.get("cmds")))
             if p == "/api/test/write_targets":
                 EXEC.require_control(body)
                 return self._json(200, EXEC.test_write_targets(body.get("q")))

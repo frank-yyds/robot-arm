@@ -239,6 +239,13 @@ class MockJointBus:
                     f"{n} 启动核对不合格，已把这颗失能并停下："
                     + "；".join(issues))
         self.enabled = True
+        # 35.2 第 3 条：规划速度残留模型（默认关，只给自检用）
+        self.residual_model = False
+        self.residual = {}
+        self._plan_vel = {}
+        self._plan_acc = {}
+        self._prev_dir = {}
+        self._residual_log = []
         self.startup_done = True
         self._ever_enabled = True
         for n in self.order:
@@ -329,6 +336,22 @@ class MockJointBus:
                 # A3b 自检：这颗不听目标，按给定 °/s 往一个方向走
                 self.q[n] += float(self.drift[n]) * dt
                 self.v[n] = float(self.drift[n])
+                continue
+            if n in self.residual:
+                res = self.residual[n]
+                v0 = float(res["v"])
+                a = float(res["a"])
+                if v0 <= a * dt:
+                    move_res = v0 * v0 / (2.0 * a) if a > 0 else 0.0
+                    res["v"] = 0.0
+                else:
+                    move_res = v0 * dt - 0.5 * a * dt * dt
+                    res["v"] = v0 - a * dt
+                self.q[n] += float(res["dir"]) * move_res   # 残留速度沿上一段方向继续走
+                res["moved"] += move_res
+                self.v[n] = 0.0
+                if res["v"] <= 0.0:
+                    del self.residual[n]
                 continue
             err = self.target[n] - self.q[n]
             dist = abs(err)
@@ -518,8 +541,24 @@ class MockJointBus:
                     continue
                 self.log_write(n, 0x0A, turns)
                 lo, hi = self.cfg[n].soft_limits_deg
-                self.target[n] = max(lo, min(hi, float(q)))
+                new_t = max(lo, min(hi, float(q)))
+                old_t = self.target[n]
+                dir_new = 1.0 if new_t >= old_t else -1.0
+                if (self.residual_model and abs(new_t - old_t) > 1e-6
+                        and self._prev_dir.get(n) is not None
+                        and dir_new != self._prev_dir[n]):
+                    v_prev = float(self._plan_vel.get(n) or 0.0)
+                    a_new = float(self._plan_acc.get(n) or 40.0)
+                    if v_prev > 0.2:
+                        rev = v_prev * v_prev / (2.0 * a_new)
+                        self.residual[n] = {"v": v_prev, "dir": self._prev_dir[n],
+                                            "a": a_new, "moved": 0.0, "rev": rev}
+                        self._residual_log.append(
+                            {"joint": n, "predicted_rev_deg": round(rev, 3),
+                             "v_prev": round(v_prev, 3), "a_new": round(a_new, 3)})
+                self.target[n] = new_t
                 self._targets[n] = self.target[n]
+                self._prev_dir[n] = dir_new
         if confirm and dropped:
             # 行为确认：丢了的这颗速度/位置不会朝目标走，重发一次
             time.sleep(0.06)
@@ -539,14 +578,20 @@ class MockJointBus:
             self.last_resend = []
         return {n: True for n in targets}
 
-    def set_profiles_q(self, vel, acc=None):
+    def set_profiles_q(self, vel, acc=None, disp=None):
         self.writes += 1
         acc = acc or {}
         for n in self.order:
             if n in vel:
                 self.vmax[n] = max(0.2, abs(float(vel[n])))
                 a = abs(float(acc.get(n, vel[n] / max(self.cfg[n].motion_accel_time_s, 0.05))))
+                if disp is not None and abs(float(disp.get(n, 0.0))) <= 0.8:
+                    floor = self.cfg[n].motion_speed_deg_s / max(
+                        self.cfg[n].motion_accel_time_s, 0.05)
+                    a = max(a, floor)
                 self.amax[n] = max(0.2, a)
+                self._plan_vel[n] = abs(float(vel[n]))
+                self._plan_acc[n] = a
 
     def hold_all(self):
         """20.1：和真机 JointBus 同返回结构；silent 关节算“读不到”。"""
@@ -554,12 +599,19 @@ class MockJointBus:
             self.writes += 1
             self._tick()
             held = {}
+            kept = {}
             unconfirmed = []
             unreadable = []
             for n in self.order:
                 if n in self.silent:
                     unreadable.append(n)
                     unconfirmed.append({"name": n, "reason": "读不到位置"})
+                    continue
+                # 35.2 第 1 条：到位窗口内的关节不改写目标、不清速度
+                tgt_now = self._targets.get(n)
+                if tgt_now is not None and abs(self.q[n] - float(tgt_now)) <= 0.8:
+                    kept[n] = float(tgt_now)
+                    held[n] = self.q[n]
                     continue
                 self.target[n] = self.q[n]
                 self.v[n] = 0.0
@@ -570,7 +622,7 @@ class MockJointBus:
             for name, why in self.verify_ready():
                 if not any(x["name"] == name for x in unconfirmed):
                     unconfirmed.append({"name": name, "reason": why})
-            return {"ok": not unconfirmed, "held": held,
+            return {"ok": not unconfirmed, "held": held, "kept": kept,
                     "unconfirmed": unconfirmed, "unreadable": unreadable}
 
     # ---------------- 18.3 单颗失能 / 重新使能 ----------------

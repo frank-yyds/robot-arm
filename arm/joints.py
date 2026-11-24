@@ -414,6 +414,37 @@ class JointBus:
                 + "；".join(f"{n} {v:.2f} V" for n, v in low.items())
                 + f"（最高 {vmax:.2f} V）；已全部失能")
 
+        # 35.2 第 4 条：第一次写梯形参数之前，只读六颗 0x1C / 0x1D / 0x1E
+        # （原始值记进会话记录；35.3 S4 要报“启动时读到的是正还是负”）
+        try:
+            pre = {}
+            for i in range(0, len(self.order), 2):
+                chunk = self.order[i:i + 2]
+                items = [(self.motors[n].mid, c, 4) for n in chunk
+                         for c in (0x1C, 0x1D, 0x1E)]
+                got = self.link.read_many(items, timeout=0.06, retries=2)
+                for n in chunk:
+                    row = {}
+                    for c in (0x1C, 0x1D, 0x1E):
+                        d = got.get((self.motors[n].mid, c))
+                        if d and len(d) >= 4:
+                            raw = struct.unpack(">i", d)[0]
+                            row[hex(c)] = {"raw_hex": d.hex(),
+                                           "raw_iq8": raw,
+                                           "value_deg_s": round(raw / 256.0 * 10.0 / 60.0, 3)}
+                        else:
+                            row[hex(c)] = None
+                    pre[n] = row
+            report["profile_before"] = pre
+            if self.recorder:
+                for n, row in pre.items():
+                    self.recorder.command(
+                        "profile_readback_before",
+                        " ".join(f"{k}={None if v is None else v['raw_hex']}"
+                                 for k, v in row.items()), joint=n)
+        except Exception:  # noqa: BLE001
+            report["profile_before"] = {}
+
         # ---- 3) 切 S 曲线保持，写梯形参数并回读 ----
         for name in self.order:
             m = self.motors[name]
@@ -987,11 +1018,22 @@ class JointBus:
                 pass
         return resend
 
-    def set_profiles_q(self, vel: dict[str, float], acc: dict[str, float] | None = None):
+    def set_profiles_q(self, vel: dict[str, float], acc: dict[str, float] | None = None,
+                       disp: dict[str, float] | None = None):
+        """写梯形参数。
+
+        35.2 第 2 条：本段不动的关节（|位移| ≤0.8°）加速度/减速度不小于这颗正常
+        全速动作时的值（motion_speed ÷ motion_accel_time），避免“残留速度 + 很小加速度”
+        把不动的关节带着漂出去。动着的关节照旧。
+        """
         acc = acc or {}
         for name in self.order:
             if name in vel:
                 a = acc.get(name, vel[name] / max(self.cfg[name].motion_accel_time_s, 0.05))
+                if disp is not None and abs(float(disp.get(name, 0.0))) <= 0.8:
+                    floor = self.cfg[name].motion_speed_deg_s / max(
+                        self.cfg[name].motion_accel_time_s, 0.05)
+                    a = max(float(a), floor)
                 self.motors[name].set_profile_out(vel[name], a, a)
 
     def verify_ready(self, names=None) -> list[tuple[str, str]]:
@@ -1141,6 +1183,7 @@ class JointBus:
              "unreadable": [name, ...]}
         """
         held: dict[str, float] = {}
+        kept: dict[str, float] = {}
         unconfirmed: list[dict] = []
         unreadable: list[str] = []
         seen: set[str] = set()
@@ -1179,6 +1222,12 @@ class JointBus:
                                          float("inf"))
                     continue
                 self._trust[name] = (cand, time.monotonic())
+                # 35.2 第 1 条：到位窗口里（|实际 − 当前目标| ≤0.8°）的关节
+                # 不改写目标、不重切模式，保留原来的目标
+                tgt_now = self._targets.get(name)
+                if tgt_now is not None and abs(cand - float(tgt_now)) <= 0.8:
+                    kept[name] = float(tgt_now)
+                    continue
                 try:
                     m.set_target_turns(pos, priority=True)
                     m.set_mode(MODE_PROFILE_POSITION)
@@ -1192,7 +1241,7 @@ class JointBus:
         if held:
             for n, why in self.verify_ready(list(held)):
                 add(n, why)
-        return {"ok": not unconfirmed, "held": held,
+        return {"ok": not unconfirmed, "held": held, "kept": kept,
                 "unconfirmed": unconfirmed, "unreadable": unreadable}
 
     def stats(self) -> dict:

@@ -880,7 +880,8 @@ class Motion:
         if bad:
             self._abort("这些关节没有真正使能/不在位置模式，拒绝发目标："
                         + "，".join(f"{n}({m})" for n, m in bad))
-        self.bus.set_profiles_q(seg["vel_deg_s"], seg["acc_deg_s2"])
+        self.bus.set_profiles_q(seg["vel_deg_s"], seg["acc_deg_s2"],
+                                disp={n: float(d_all[i]) for i, n in enumerate(self.order)})
         with self._lock:
             self.status.update({"phase": "moving", "label": seg["label"],
                                 "target_q": seg["q_target"], "progress": 0.0})
@@ -1225,7 +1226,8 @@ class Motion:
         if hasattr(self.bus, "set_stream_mode"):
             stream_pos = bool(self.bus.set_stream_mode(MODE_POSITION))
         if not stream_pos:
-            self.bus.set_profiles_q(vel, acc)
+            self.bus.set_profiles_q(vel, acc,
+                                    disp={n: float(delta[i]) for i, n in enumerate(self.order)})
         with self._lock:
             self.status.update({"phase": "moving", "label": label,
                                 "target_q": [round(float(v), 4) for v in qf],
@@ -1378,7 +1380,9 @@ class Motion:
                     if stream_pos:
                         # 回到 S 曲线位置模式，后续单段/保持仍按原逻辑
                         self.bus.set_stream_mode(MODE_PROFILE_POSITION)
-                        self.bus.set_profiles_q(vel, acc)
+                        self.bus.set_profiles_q(
+                            vel, acc,
+                            disp={n: float(delta[i]) for i, n in enumerate(self.order)})
                     return
             if now - t_start > timeout:
                 self._abort(f"到达超时（{timeout:.1f} s）")
