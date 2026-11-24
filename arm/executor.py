@@ -1383,6 +1383,12 @@ class Executor:
         js = [str(x).upper() for x in (joints or self.bus.order)]
         cs = [int(x, 0) if isinstance(x, str) else int(x)
               for x in (cmds or (0x1B, 0x7B, 0x77, 0x1C, 0x1D, 0x1E, 0x53))]
+        # 只读白名单：0x0D 是“存储参数”写命令，绝不能当只读发（2026-11-24 误发过）
+        read_only = {0x04, 0x05, 0x06, 0x1B, 0x1C, 0x1D, 0x1E, 0x2B, 0x53,
+                     0x55, 0x77, 0x7B, 0xFF}
+        bad = [hex(c) for c in cs if c not in read_only]
+        if bad:
+            raise MotionError(f"这些不是只读命令，拒绝发送：{', '.join(bad)}")
         out = {}
         for n in js:
             m = self.bus.motors[n]
