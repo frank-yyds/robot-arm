@@ -85,9 +85,12 @@ def main(argv=None) -> int:
     except Exception:  # noqa: BLE001
         start_ts = None
 
+    # mock 会话绝不能拿真抓包来对账（runs/_pcap_ring 里可能正有真机会话的包）
+    is_mock = str(meta.get("connector") or "").lower().startswith("mock") or \
+        bool(meta.get("mock"))
     pcap_files = []
-    pcap_dir = Path(args.pcap_dir) if args.pcap_dir else None
-    if pcap_dir is None:
+    pcap_dir = None if is_mock else (Path(args.pcap_dir) if args.pcap_dir else None)
+    if not is_mock and pcap_dir is None:
         for cand in (d / "_pcap", Path("runs/_pcap_ring")):
             if cand.exists():
                 pcap_dir = cand
