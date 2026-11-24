@@ -23,11 +23,14 @@ import struct
 from pathlib import Path
 
 # pcap 全局头 magic：微秒（大端/小端）、纳秒（大端/小端）
+# 文件头 4 字节和写入端字节序相反：d4c3b2a1 是小端文件（tcpdump 在 x86/Mac 上写的），
+# a1b2c3d4 才是大端文件。原来这张表写反了，读 tcpdump 抓的文件会按大端解、
+# caplen 乱、第一个包就 break，pcap_check 永远看不到包（11-24 真机上发现）。
 _MAGIC = {
-    b"\xa1\xb2\xc3\xd4": ("<", 1e-6),
-    b"\xd4\xc3\xb2\xa1": (">", 1e-6),
-    b"\xa1\xb2\x3c\x4d": ("<", 1e-9),
-    b"\x4d\x3c\xb2\xa1": (">", 1e-9),
+    b"\xd4\xc3\xb2\xa1": ("<", 1e-6),
+    b"\xa1\xb2\xc3\xd4": (">", 1e-6),
+    b"\x4d\x3c\xb2\xa1": ("<", 1e-9),
+    b"\xa1\xb2\x3c\x4d": (">", 1e-9),
 }
 
 LINKTYPE_ETHERNET = 1
