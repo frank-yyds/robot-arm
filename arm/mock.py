@@ -77,6 +77,13 @@ class MockJointBus:
     def __init__(self, initial_deg=None):
         self.cfg = load_joint_configs()
         self.order = list(self.cfg)
+        # 35.2 第 3 条：规划速度残留模型（默认关，只给自检用）
+        self.residual_model = False
+        self.residual = {}
+        self._plan_vel = {}
+        self._plan_acc = {}
+        self._prev_dir = {}
+        self._residual_log = []
         self.q = {n: float((initial_deg or {}).get(n, 0.0)) for n in self.order}
         self.target = dict(self.q)
         self._targets = dict(self.q)
@@ -239,13 +246,6 @@ class MockJointBus:
                     f"{n} 启动核对不合格，已把这颗失能并停下："
                     + "；".join(issues))
         self.enabled = True
-        # 35.2 第 3 条：规划速度残留模型（默认关，只给自检用）
-        self.residual_model = False
-        self.residual = {}
-        self._plan_vel = {}
-        self._plan_acc = {}
-        self._prev_dir = {}
-        self._residual_log = []
         self.startup_done = True
         self._ever_enabled = True
         for n in self.order:
@@ -337,7 +337,7 @@ class MockJointBus:
                 self.q[n] += float(self.drift[n]) * dt
                 self.v[n] = float(self.drift[n])
                 continue
-            if n in self.residual:
+            if n in getattr(self, "residual", {}):
                 res = self.residual[n]
                 v0 = float(res["v"])
                 a = float(res["a"])
@@ -544,7 +544,7 @@ class MockJointBus:
                 new_t = max(lo, min(hi, float(q)))
                 old_t = self.target[n]
                 dir_new = 1.0 if new_t >= old_t else -1.0
-                if (self.residual_model and abs(new_t - old_t) > 1e-6
+                if (getattr(self, "residual_model", False) and abs(new_t - old_t) > 1e-6
                         and self._prev_dir.get(n) is not None
                         and dir_new != self._prev_dir[n]):
                     v_prev = float(self._plan_vel.get(n) or 0.0)
