@@ -1390,26 +1390,28 @@ class Executor:
             out[n] = {}
             for cmd in cs:
                 # 逐条读（一次读太多条在真总线上会整批超时）；读不到就 null
+                nbytes = {0x53: 2, 0x2B: 1, 0x55: 1, 0xFF: 2}.get(cmd, 4)
                 d = None
                 for _ in range(3):
                     try:
-                        d = self.bus.link.read(m.mid, cmd, 4, timeout=0.12, retries=1)
+                        d = self.bus.link.read(m.mid, cmd, nbytes, timeout=0.12, retries=1)
                     except Exception:  # noqa: BLE001
                         d = None
-                    if d and len(d) >= 4:
+                    if d and len(d) >= nbytes:
                         break
-                got = {(m.mid, cmd): d}
                 row = {"raw_hex": None if d is None else d.hex()}
-                if d and len(d) >= 4:
-                    raw = struct.unpack(">i", d)[0]
-                    row["raw_iq8"] = raw
-                    if cmd in (0x1C, 0x1D, 0x1E):
-                        row["deg_s"] = round(raw / 256.0 * 10.0 / 60.0, 3)
-                        row["rpm"] = round(raw / 256.0, 3)
-                    elif cmd == 0x53:
-                        row["a"] = round(raw / 256.0, 3)
-                    elif cmd in (0x06,):
-                        row["pos_deg"] = round(c.out_deg(raw / (1 << 24)), 3)
+                if d and len(d) >= 2:
+                    if cmd in (0x1C, 0x1D, 0x1E) and len(d) >= 4:
+                        raw = struct.unpack(">i", d)[0]
+                        rpm = raw / float(1 << 24) * 960.0
+                        row.update({"raw_iq24": raw, "rpm": round(rpm, 3),
+                                    "deg_s": round(rpm * 10.0 / 60.0, 3)})
+                    elif cmd == 0x53 and len(d) >= 2:
+                        raw = struct.unpack(">h", d)[0]
+                        row.update({"raw_iq8": raw, "a": round(raw / 256.0, 3)})
+                    elif cmd == 0x06 and len(d) >= 4:
+                        raw = struct.unpack(">i", d)[0]
+                        row["pos_deg"] = round(c.out_deg(raw / float(1 << 24)), 3)
                 out[n][hex(cmd)] = row
         return {"ok": True, "rows": out}
 
