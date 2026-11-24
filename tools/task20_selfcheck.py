@@ -94,6 +94,10 @@ check("20.1 六颗全失联：才全部失能", e.motion.status.get("phase") == 
 close_exec(e)
 
 # ---------------- 20.2 read_many 补发 / verify_ready ----------------
+# 用独立的锁文件：这个工具用的是假的 127.0.0.1:9，不该和真执行器的 .ecb.lock 抢
+import tempfile as _tf
+from arm import transport as _tr
+_tr.ECB_LOCK_PATH = _tf.NamedTemporaryFile(prefix="ecb_test_lock_", delete=False).name
 t = EcbTransport("127.0.0.1", 9)
 sent, rounds = [], [0]
 

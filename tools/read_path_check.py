@@ -175,6 +175,10 @@ def stale_step_phase(validate: bool):
 
 
 def main():
+    # 自检用假总线/独立锁文件，不能和真执行器的 .ecb.lock 抢
+    import tempfile as _tf
+    from arm import transport as _tr
+    _tr.ECB_LOCK_PATH = _tf.NamedTemporaryFile(prefix="ecb_test_lock_", delete=False).name
     ap = argparse.ArgumentParser()
     ap.add_argument("--n", type=int, default=100000)
     args = ap.parse_args()
