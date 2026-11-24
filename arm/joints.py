@@ -430,24 +430,17 @@ class JointBus:
                         d = got.get((self.motors[n].mid, c))
                         if d and len(d) >= 4:
                             raw = struct.unpack(">i", d)[0]
+                            rpm = raw / float(1 << 24) * 960.0
                             row[hex(c)] = {"raw_hex": d.hex(),
-                                           "raw_iq8": raw,
-                                           "value_deg_s": round(raw / 256.0 * 10.0 / 60.0, 3)}
+                                           "raw_iq24": raw,
+                                           "rpm": round(rpm, 3),
+                                           "value_deg_s": round(rpm * 10.0 / 60.0, 3)}
                         else:
                             row[hex(c)] = None
                     pre[n] = row
             report["profile_before"] = pre
         except Exception as exc:  # noqa: BLE001
             report["profile_before_error"] = str(exc)
-        if self.recorder and report["profile_before"]:
-            for n, row in report["profile_before"].items():
-                try:
-                    self.recorder.command(
-                        "profile_readback_before",
-                        " ".join(f"{k}={None if v is None else v['raw_hex']}"
-                                 for k, v in row.items()), joint=n)
-                except Exception:  # noqa: BLE001
-                    pass
 
         # ---- 3) 切 S 曲线保持，写梯形参数并回读 ----
         for name in self.order:

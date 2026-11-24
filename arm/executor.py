@@ -3825,6 +3825,17 @@ class Handler(BaseHTTPRequestHandler):
                 rep = EXEC.bus.enable_all(
                     bool(body.get("confirmed_supported")),
                     bool(body.get("power_cycle_confirmed")))
+                # 35.2 第 4 条：启动前只读到的 0x1C/0x1D/0x1E 记进会话
+                try:
+                    pb = (rep or {}).get("profile_before") or {}
+                    if pb and EXEC.recorder:
+                        for n, row in pb.items():
+                            EXEC.recorder.command(
+                                "profile_readback_before",
+                                " ".join(f"{k}={None if v is None else v['raw_hex']}"
+                                         for k, v in row.items()), joint=n)
+                except Exception:  # noqa: BLE001
+                    pass
                 EXEC.pending = None
                 EXEC.preview = None
                 EXEC.msg = "已使能（J6→J1），S 曲线模式就绪"
