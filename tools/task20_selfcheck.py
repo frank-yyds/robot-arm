@@ -194,6 +194,12 @@ close_exec(e)
 
 # 20.3 完成后 startup_done 置假（20.9.3）
 e = mk_exec()
+# 36.1 期间发现：停机成功会按 A9 第 5 条把“接住 J4 轴高度”记进真实的
+# config/park.json，把这个自检的点往真机记录上越推越远（20.2 起真机在 161.0，
+# 自检自己写成别的值）。mock 上改成只在内存里记，不写真实配置。
+e.park_cfg = dict(e.park_cfg or {})
+e.park_cfg["contact_j4_z"] = None
+e.park_cfg["contact_j4_z_at"] = None
 calls = {"n": 0}
 
 

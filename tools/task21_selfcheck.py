@@ -62,8 +62,9 @@ class TimedBus(MockJointBus):
 class SlowArrivalBus(TimedBus):
     """profile 速度压到 1°/s：目标流走完（T=0.5 s）后还要等真正到位。"""
 
-    def set_profiles_q(self, vel, acc=None):
-        super().set_profiles_q(vel, acc)
+    def set_profiles_q(self, vel, acc=None, disp=None):
+        # 35.2 之后 Motion 会传 disp；这里必须透传，否则 TypeError 被吞成自检失败
+        super().set_profiles_q(vel, acc, disp)
         self.vmax["J2"] = 1.0
         self.amax["J2"] = 2.0
 
