@@ -466,26 +466,10 @@ class JointBus:
                 self._disable_all_quiet()
                 raise StartupRefused(
                     f"{name} 没有进入 S 曲线位置模式（当前模式 {mode_now}）；已全部失能")
-            self._write_profile(name, c.motion_speed_deg_s)
-            time.sleep(0.05)
-            prof = m.profile()
-            if prof is None:
-                self._disable_all_quiet()
-                raise StartupRefused(f"{name} 梯形参数读不回来；已全部失能")
-            vel_deg_s = prof[0] * DEG_PER_MOTOR_TURN / 60.0
-            acc_deg_s2 = prof[1] * DEG_PER_MOTOR_TURN / 60.0
-            dec_deg_s2 = prof[2] * DEG_PER_MOTOR_TURN / 60.0
-            want_acc = c.motion_speed_deg_s / max(c.motion_accel_time_s, 0.05)
-            if abs(vel_deg_s - c.motion_speed_deg_s) > 1.0:
-                self._disable_all_quiet()
-                raise StartupRefused(
-                    f"{name} 梯形最大速度回读 {vel_deg_s:.1f}°/s ≠ "
-                    f"{c.motion_speed_deg_s:.1f}°/s；已全部失能")
-            if abs(acc_deg_s2 - want_acc) > max(2.0, want_acc * 0.1):
-                self._disable_all_quiet()
-                raise StartupRefused(
-                    f"{name} 梯形加速度回读 {acc_deg_s2:.1f}°/s² ≠ "
-                    f"{want_acc:.1f}°/s²；已全部失能")
+            prof = self._write_and_verify_profile(name, report)
+            vel_deg_s = prof["vel_deg_s"]
+            acc_deg_s2 = prof["acc_deg_s2"]
+            dec_deg_s2 = prof["dec_deg_s2"]
             self._targets[name] = c.out_deg(pos)
             for item in report["enabled"]:
                 if item["name"] == name:
@@ -641,7 +625,51 @@ class JointBus:
     def _write_profile(self, name: str, vel_deg_s: float):
         c = self.cfg[name]
         acc = vel_deg_s / max(c.motion_accel_time_s, 0.05)
-        self.motors[name].set_profile_out(vel_deg_s, acc, acc)
+        # 36.1 第 1 条：减速度写负数（大小不变）。0x1E 回读不带符号，核对按绝对值。
+        self.motors[name].set_profile_out(vel_deg_s, acc, -acc)
+
+    def _write_and_verify_profile(self, name: str, report: dict) -> dict:
+        """36.1 第 3 条：启动时回读 0x1C / 0x1D / 0x1E 三项都核。
+
+        哪一项不对，把这一颗的三项重写一次再回读；还不对就不往下走，
+        报明哪颗、哪一项、读到多少。减速度按绝对值比（回读不带符号）。
+        """
+        c = self.cfg[name]
+        want_vel = c.motion_speed_deg_s
+        want_acc = want_vel / max(c.motion_accel_time_s, 0.05)
+        m = self.motors[name]
+        last = []
+        for attempt in (0, 1):
+            self._write_profile(name, want_vel)
+            time.sleep(0.05)
+            prof = m.profile()
+            if prof is None:
+                self._disable_all_quiet()
+                raise StartupRefused(f"{name} 梯形参数读不回来；已全部失能")
+            vel = prof[0] * DEG_PER_MOTOR_TURN / 60.0
+            acc = prof[1] * DEG_PER_MOTOR_TURN / 60.0
+            dec = prof[2] * DEG_PER_MOTOR_TURN / 60.0
+            last = []
+            if abs(vel - want_vel) > 1.0:
+                last.append(f"最大速度 {vel:.1f}°/s ≠ {want_vel:.1f}°/s")
+            if abs(acc - want_acc) > max(2.0, want_acc * 0.1):
+                last.append(f"加速度 {acc:.1f}°/s² ≠ {want_acc:.1f}°/s²")
+            if abs(abs(dec) - want_acc) > max(2.0, want_acc * 0.1):
+                last.append(f"减速度 {abs(dec):.1f}°/s² ≠ {want_acc:.1f}°/s²（按绝对值）")
+            if not last:
+                if attempt:
+                    report.setdefault("profile_rewrite", []).append(
+                        {"joint": name, "result": "重写一次后通过"})
+                return {"vel_deg_s": vel, "acc_deg_s2": acc, "dec_deg_s2": dec,
+                        "rewritten": bool(attempt)}
+            if attempt == 0:
+                report.setdefault("profile_rewrite", []).append(
+                    {"joint": name, "result": "回读不符，重写一次",
+                     "mismatch": list(last)})
+        self._disable_all_quiet()
+        raise StartupRefused(
+            f"{name} 梯形参数回读三次核对不合格（重写一次后仍不符）："
+            + "；".join(last) + "；已全部失能")
 
     def _disable_all_quiet(self):
         for m in self.motors.values():
@@ -1031,7 +1059,8 @@ class JointBus:
                     floor = self.cfg[name].motion_speed_deg_s / max(
                         self.cfg[name].motion_accel_time_s, 0.05)
                     a = max(float(a), floor)
-                self.motors[name].set_profile_out(vel[name], a, a)
+                # 36.1 第 1 条：正常动作的减速度也写负数（大小 = 加速度）
+                self.motors[name].set_profile_out(vel[name], a, -a)
 
     def verify_ready(self, names=None) -> list[tuple[str, str]]:
         """检查每颗：电源必须为 1，模式必须为 S 曲线位置 6。

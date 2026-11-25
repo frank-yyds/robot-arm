@@ -81,9 +81,15 @@ class MockJointBus:
         self.residual_model = False
         self.residual = {}
         self._plan_vel = {}
+        self._prev_plan_vel = {}   # 上一段写入的规划速度（残留按它算）
         self._plan_acc = {}
         self._prev_dir = {}
         self._residual_log = []
+        # 36.1 第 4 条：减速度是否写负数（正常流程 True）。对照测试置 False 走旧模型。
+        self.decel_negative = True
+        self._dec_sign = {n: (-1.0 if self.decel_negative else 1.0) for n in self.order}
+        # 从正数刚换成负数的那一段仍带上一段残留：只在切换后的第一次写目标时放行
+        self._carry_residual = {n: False for n in self.order}
         self.q = {n: float((initial_deg or {}).get(n, 0.0)) for n in self.order}
         self.target = dict(self.q)
         self._targets = dict(self.q)
@@ -544,11 +550,16 @@ class MockJointBus:
                 new_t = max(lo, min(hi, float(q)))
                 old_t = self.target[n]
                 dir_new = 1.0 if new_t >= old_t else -1.0
+                # 36.1 第 4 条：减速度为负时，每段走完规划速度归零，下一段不带残留；
+                # 只有“刚由正数换成负数”的那一段还带上一段的残留（_carry_residual）。
+                dec_neg = float(self._dec_sign.get(n, -1.0)) < 0.0
+                allow_res = (not dec_neg) or self._carry_residual.get(n, False)
                 if (getattr(self, "residual_model", False) and abs(new_t - old_t) > 1e-6
                         and self._prev_dir.get(n) is not None
-                        and dir_new != self._prev_dir[n]):
-                    v_prev = float(self._plan_vel.get(n) or 0.0)
+                        and dir_new != self._prev_dir[n] and allow_res):
+                    v_prev = float(self._prev_plan_vel.get(n) or 0.0)
                     a_new = float(self._plan_acc.get(n) or 40.0)
+                    self._carry_residual[n] = False
                     if v_prev > 0.2:
                         rev = v_prev * v_prev / (2.0 * a_new)
                         self.residual[n] = {"v": v_prev, "dir": self._prev_dir[n],
@@ -578,6 +589,22 @@ class MockJointBus:
             self.last_resend = []
         return {n: True for n in targets}
 
+    def set_decel_negative(self, on: bool = True):
+        """36.1 第 4 条：对照测试切换减速度符号。
+
+        由正数换成负数时，按实测规则放行“切换那一段”的上一段残留一次；
+        切回正数时清掉放行标记，走旧的每段都带残留的模型。
+        """
+        old = bool(getattr(self, "decel_negative", True))
+        self.decel_negative = bool(on)
+        for n in self.order:
+            new_sign = -1.0 if on else 1.0
+            if not on:
+                self._carry_residual[n] = False
+            elif not old:
+                self._carry_residual[n] = True
+            self._dec_sign[n] = new_sign
+
     def set_profiles_q(self, vel, acc=None, disp=None):
         self.writes += 1
         acc = acc or {}
@@ -590,8 +617,14 @@ class MockJointBus:
                         self.cfg[n].motion_accel_time_s, 0.05)
                     a = max(a, floor)
                 self.amax[n] = max(0.2, a)
+                self._prev_plan_vel[n] = float(self._plan_vel.get(n) or 0.0)
                 self._plan_vel[n] = abs(float(vel[n]))
                 self._plan_acc[n] = a
+                # 36.1 第 4 条：记下这一颗当前减速度的符号；由正变负时放行一次残留
+                new_sign = -1.0 if getattr(self, "decel_negative", True) else 1.0
+                if float(self._dec_sign.get(n, new_sign)) > 0.0 and new_sign < 0.0:
+                    self._carry_residual[n] = True
+                self._dec_sign[n] = new_sign
 
     def hold_all(self):
         """20.1：和真机 JointBus 同返回结构；silent 关节算“读不到”。"""

@@ -1329,11 +1329,12 @@ class Executor:
         return False
 
     # ---------------- 27.3/30.3 测试专用（不影响正常流程） ----------------
-    def test_write_profile(self, q, negative_decel: bool = False) -> dict:
+    def test_write_profile(self, q, negative_decel: bool | None = None) -> dict:
         """只写梯形参数（0x1F/0x20/0x21），不写目标、不切模式、不使能。
 
-        35.3 第 4 条：negative_decel=True 时减速度写成负数（大小 = 加速度），
-        只写内存（不发 0x0D 存 EEPROM），用于负减速度对照。
+        36.1 第 1 条：正常流程一律写负减速度。不传 negative_decel 时写负数；
+        35.3 第 5 条留着的对照选项：显式传 False 才写正数（测试用，正常流程不用）。
+        只写内存（不发 0x0D 存 EEPROM）。
         35.2 第 2 条：本段不动的关节（|位移| ≤0.8°）加速度/减速度给下限。
         """
         self._reject_if_parking()
@@ -1355,7 +1356,7 @@ class Executor:
             if abs(disp) <= 0.8:
                 floor = c.motion_speed_deg_s / max(c.motion_accel_time_s, 0.05)
                 acc = max(acc, floor)
-            dec = -acc if negative_decel else acc
+            dec = acc if negative_decel is False else -acc
             try:
                 self.bus.motors[n].set_profile_out(vel, acc, dec)
                 wrote[n] = {"vel_deg_s": round(vel, 3), "acc_deg_s2": round(acc, 3),
@@ -1367,10 +1368,11 @@ class Executor:
             try:
                 self.recorder.command(
                     "test_write_profile",
-                    f"negative_decel={bool(negative_decel)} " + str(wrote))
+                    f"negative_decel={negative_decel is not False} " + str(wrote))
             except Exception:  # noqa: BLE001
                 pass
-        return {"ok": True, "wrote": wrote, "negative_decel": bool(negative_decel),
+        return {"ok": True, "wrote": wrote,
+                "negative_decel": negative_decel is not False,
                 "msg": "只写了梯形参数，没有写目标"}
 
     def test_read_params(self, joints=None, cmds=None) -> dict:
@@ -3661,8 +3663,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, EXEC.stop_all("用户按停"))
             if p == "/api/test/write_profile":
                 EXEC.require_control(body)
+                nd = body.get("negative_decel")
                 return self._json(200, EXEC.test_write_profile(
-                    body.get("q"), bool(body.get("negative_decel"))))
+                    body.get("q"), None if nd is None else bool(nd)))
             if p == "/api/test/read_params":
                 EXEC.require_control(body)
                 return self._json(200, EXEC.test_read_params(

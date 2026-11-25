@@ -241,8 +241,9 @@ def cmd_jog(args):
     m.set_mode(MODE_PROFILE_POSITION)
     m.set_target_turns(p0)
     time.sleep(0.1)
-    m.set_profile_out(max(0.5, min(5.0, abs(args.delta) / 2.0)),
-                      max(0.2, abs(args.delta) / 2.0))
+    _v = max(0.5, min(5.0, abs(args.delta) / 2.0))
+    _a = max(0.2, abs(args.delta) / 2.0)
+    m.set_profile_out(_v, _a, -_a)  # 36.1：负减速度
     p0 = m.pos_turns()
     # 电机的正方向：raw 增加（不乘 sign）
     target = p0 + args.delta / DEG_PER_MOTOR_TURN
@@ -274,7 +275,7 @@ def cmd_return(args):
     if target is None:
         raise SystemExit("没有 jog 前的位置记录")
     m.set_mode(MODE_PROFILE_POSITION)
-    m.set_profile_out(3.0, 3.0)
+    m.set_profile_out(3.0, 3.0, -3.0)  # 36.1：负减速度
     m.set_target_turns(target)
     t0 = time.monotonic()
     while time.monotonic() - t0 < 6.0:

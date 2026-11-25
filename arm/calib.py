@@ -396,7 +396,7 @@ class CalibSession:
         # 进入位置模式，准备方向核对（20.9.1：先写目标，再切模式，再写一次）
         pos_now = m.pos_turns() or 0.0
         m.set_target_turns(pos_now)
-        m.set_profile_out(5.0, 5.0)
+        m.set_profile_out(5.0, 5.0, -5.0)  # 36.1：减速度写负数
         m.set_mode(MODE_PROFILE_POSITION)
         m.set_target_turns(pos_now)
         self._set(stage="zeroed",
@@ -414,7 +414,7 @@ class CalibSession:
             raise RuntimeError("读不到位置")
         # 20.9.1：先写目标=当前位置，再切模式，再写一次
         m.set_target_turns(p0)
-        m.set_profile_out(5.0, 5.0)
+        m.set_profile_out(5.0, 5.0, -5.0)  # 36.1：减速度写负数
         m.set_mode(MODE_PROFILE_POSITION)
         m.set_target_turns(p0)
         time.sleep(0.2)
@@ -454,7 +454,7 @@ class CalibSession:
         try:
             # 20.9.1：先写目标=0，再切模式，再写一次
             m.set_target_turns(0.0)
-            m.set_profile_out(5.0, 5.0)
+            m.set_profile_out(5.0, 5.0, -5.0)  # 36.1：减速度写负数
             m.set_mode(MODE_PROFILE_POSITION)
             m.set_target_turns(0.0)
             t0 = time.monotonic()
@@ -478,7 +478,7 @@ class CalibSession:
         m = self.motor
         assert m is not None
         m.set_mode(MODE_PROFILE_POSITION)
-        m.set_profile_out(5.0, 5.0)
+        m.set_profile_out(5.0, 5.0, -5.0)  # 36.1：减速度写负数
         m.set_target_turns(0.0)
         t0 = time.monotonic()
         p = None

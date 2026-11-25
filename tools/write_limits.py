@@ -80,8 +80,8 @@ def main(argv=None) -> int:
         try:
             m.set_target_turns(m.pos_turns() or 0.0)
             m.set_mode(6)
-            m.set_profile_out(cfg.motion_speed_deg_s,
-                              cfg.motion_speed_deg_s / max(cfg.motion_accel_time_s, 0.05))
+            acc = cfg.motion_speed_deg_s / max(cfg.motion_accel_time_s, 0.05)
+            m.set_profile_out(cfg.motion_speed_deg_s, acc, -acc)  # 36.1：负减速度
             m.set_target_turns(m.pos_turns() or 0.0)
         except Exception:  # noqa: BLE001
             pass

@@ -85,6 +85,19 @@ def main(argv=None) -> int:
     except Exception:  # noqa: BLE001
         start_ts = None
 
+    # 会话结束时刻：events 最后一条的墙上时间（没有就用包的时间范围兜底）
+    end_ts = None
+    for e in reversed(events):
+        w = e.get("wall")
+        if not w:
+            continue
+        try:
+            import datetime as _dt
+            end_ts = _dt.datetime.fromisoformat(str(w)).timestamp()
+        except Exception:  # noqa: BLE001
+            end_ts = None
+        break
+
     # mock 会话绝不能拿真抓包来对账（runs/_pcap_ring 里可能正有真机会话的包）
     is_mock = str(meta.get("connector") or "").lower().startswith("mock") or \
         bool(meta.get("mock"))
@@ -121,6 +134,34 @@ def main(argv=None) -> int:
                             "src": w.get("src", "executor"),
                             "mono": w.get("mono")})
 
+    # 36.5：按源端口分组；一个执行器可能有两个口（0x0A 的 send_now 单独一口）
+    port_table = {}
+    for p in packets:
+        if p.get("sport") is None or p["sport"] < 0:
+            continue
+        row = port_table.setdefault(p["sport"], {"first": None, "last": None, "n": 0})
+        row["n"] += 1
+        r = p.get("rel")
+        if r is None:
+            continue
+        if row["first"] is None or r < row["first"]:
+            row["first"] = r
+        if row["last"] is None or r > row["last"]:
+            row["last"] = r
+
+    exec_ports = set()
+    if pcap_files and start_ts and port_table:
+        lo_w = start_ts - 1.0
+        hi_w = (end_ts if end_ts else start_ts + 1e9) + 2.0
+        for sport, row in port_table.items():
+            f = None if row["first"] is None else start_ts + row["first"]
+            l = None if row["last"] is None else start_ts + row["last"]
+            if f is not None and l is not None and l >= lo_w and f <= hi_w:
+                exec_ports.add(sport)
+        packets_for_match = [p for p in packets if p.get("sport") in exec_ports]
+    else:
+        packets_for_match = packets
+
     # ---- 1) events 里的写命令，抓包里有没有 ----
     missing_in_pcap = []
     if pcap_files:
@@ -131,7 +172,7 @@ def main(argv=None) -> int:
             lo = (e.get("mono") or 0.0) - args.tol_ms / 1000.0
             hi = (e.get("mono") or 0.0) + args.tol_ms / 1000.0
             hit = None
-            for i, p in enumerate(packets):
+            for i, p in enumerate(packets_for_match):
                 if i in used or p["cmd"] != cmd:
                     continue
                 if p.get("rel") is not None and not (lo - 1.0 <= p["rel"] <= hi + 1.0):
@@ -172,20 +213,33 @@ def main(argv=None) -> int:
                 j = hit + 1
 
     # ---- 2) 抓包里的写命令，events 里有没有 ----
-    missing_in_events = [p for i, p in enumerate(packets) if i not in used]
+    missing_in_events = [p for i, p in enumerate(packets_for_match) if i not in used]
 
     # ---- 3) 不是执行器发的 ----
     foreign = []
     if pcap_files:
-        ports = {p["sport"] for p in packets}
-        exec_port = min(ports) if ports else None
-        foreign = [p for p in packets if p["sport"] != exec_port]
+        # 只报本会话时间窗里、源端口不属于本会话的包（别的会话的包不混进来）
+        end_rel = None
+        if start_ts and end_ts:
+            end_rel = end_ts - start_ts
+        foreign = [p for p in packets
+                   if p.get("sport") not in exec_ports
+                   and p.get("rel") is not None
+                   and p["rel"] >= -5.0
+                   and (end_rel is None or p["rel"] <= end_rel + 5.0)]
     else:
         foreign = [p for p in packets if p.get("src") != "executor"]
 
     print(f"# 会话 {d.name}；对账源：{source}")
-    print(f"# events 写命令 {len(writes_ev)} 条；抓包写命令 {len(packets)} 条；"
-          f"窗口 ±{args.tol_ms:g} ms")
+    if port_table:
+        print("# 36.5 按源端口分组：")
+        for sport, row in sorted(port_table.items(), key=lambda kv: kv[1]["first"] or 0):
+            f = "?" if row["first"] is None else f"{row['first']:.2f}"
+            l = "?" if row["last"] is None else f"{row['last']:.2f}"
+            mark = "本会话" if sport in exec_ports else "不属于本会话"
+            print(f"  端口 {sport}：{row['n']} 条，{f}s → {l}s（{mark}）")
+    print(f"# events 写命令 {len(writes_ev)} 条；抓包写命令 {len(packets_for_match)} 条"
+          f"（本会话端口 {len(exec_ports)} 个）；窗口 ±{args.tol_ms:g} ms")
     print(f"执行器记了但没发出去：{len(missing_in_pcap)}")
     for e in missing_in_pcap[:20]:
         print(f"  - {e.get('mono')}s {e.get('joint')} cmd=0x{int(e.get('cmd', 0)):02X} "
@@ -193,6 +247,16 @@ def main(argv=None) -> int:
     print(f"发出去了但执行器没记：{len(missing_in_events)}")
     for p in missing_in_events[:20]:
         print(f"  - {p.get('cmd')} addr={p.get('addr')} 数据 {p.get('data')}")
+    if missing_in_events:
+        kinds = {e.get("kind") for e in events}
+        notes = []
+        if all(p.get("cmd") == 0x0A for p in missing_in_events):
+            if "takeover" in kinds:
+                notes.append("接管：30.6 接管只发 0x0A，事件里记 takeover 不是 cmd")
+            if "test_write_targets" in kinds:
+                notes.append("测试写目标：/api/test/write_targets 的 0x0A 记成 test_write_targets，不是 cmd")
+        if notes:
+            print("  说明：" + "；".join(notes))
     print(f"不是执行器发的：{len(foreign)}")
     for p in foreign[:20]:
         print(f"  - 源 {'端口 ' + str(p.get('sport')) if p.get('sport') is not None else p.get('src')}"
