@@ -195,9 +195,18 @@ def cmd_compare(args) -> int:
     ok_mock = a.get("mock_on_start") is True and not a.get("ecb_ip")
     print(f"28.3 第 2 条（只连 mock：ecb_ip 空 且 mock_on_start 真）："
           f"{'✓ 满足' if ok_mock else '✗ 不满足'}")
-    if args.require_mock and not ok_mock:
-        return 3
-    return 0 if not args.require_mock or bad == 0 else 2
+    if args.require_mock:
+        # 按 28.3 第 2 条比对时，ecb_ip 和 mock_on_start 这两项本来就该和基准不同
+        # （基准是 Mac 真机配置），只要求其它项一致；这两项的一致反而说明没改成 mock。
+        unexpected = [k for k in KEYS_28
+                      if k not in ("ecb_ip", "mock_on_start") and a.get(k) != b.get(k)]
+        if unexpected:
+            print("  除这两项外还有不一致：" + "，".join(unexpected))
+            return 2
+        if not ok_mock:
+            return 3
+        return 0
+    return 0 if bad == 0 else 2
 
 
 def main(argv=None) -> int:

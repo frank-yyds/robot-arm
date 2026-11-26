@@ -4128,9 +4128,25 @@ def main(argv=None) -> int:
     ap.add_argument("--open", action="store_true", help="打开浏览器")
     ap.add_argument("--no-web", action="store_true", help="只提供 API，不服务网页")
     ap.add_argument("--debug", action="store_true")
+    ap.add_argument("--config", default=None,
+                    help="执行器配置文件（默认 config/executor.json）。"
+                         "28.3 第 2 条：笔记本上用它指仓库外的 mock-only 配置")
     args = ap.parse_args(argv)
 
-    cfg = cfgmod.load_executor()
+    if args.config:
+        import json as _json
+        from pathlib import Path as _Path
+        _p = _Path(args.config)
+        if not _p.exists():
+            print(f"✗ 配置文件不存在：{_p}", file=sys.stderr)
+            return 2
+        try:
+            cfg = dict(_json.loads(_p.read_text(encoding="utf-8")))
+        except Exception as exc:  # noqa: BLE001
+            print(f"✗ 配置文件读不了：{exc}", file=sys.stderr)
+            return 2
+    else:
+        cfg = cfgmod.load_executor()
     if args.host:
         cfg["bind_host"] = args.host
     if args.port:
