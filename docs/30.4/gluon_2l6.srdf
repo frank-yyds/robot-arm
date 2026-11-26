@@ -1,0 +1,78 @@
+<?xml version="1.0"?>
+<robot name="gluon_2l6">
+  <!-- 25.4：一个规划组 arm，base_link → flange；命名姿态见下。
+       自碰撞矩阵：2026-11-19 按 25.4 第 3 条用 10000 组随机关节角采样得到
+       （脚本见回报）：只有 base_link↔link2/link3/link5 撞过，其余从没撞过 → 关掉。 -->
+  <group name="arm">
+    <chain base_link="base_link" tip_link="flange"/>
+  </group>
+  <group_state name="zero" group="arm">
+    <joint name="joint1" value="0.000000"/>
+    <joint name="joint2" value="0.000000"/>
+    <joint name="joint3" value="0.000000"/>
+    <joint name="joint4" value="0.000000"/>
+    <joint name="joint5" value="0.000000"/>
+    <joint name="joint6" value="0.000000"/>
+  </group_state>
+  <group_state name="ready" group="arm">
+    <joint name="joint1" value="0.000000"/>
+    <joint name="joint2" value="0.523599"/>
+    <joint name="joint3" value="1.047198"/>
+    <joint name="joint4" value="0.000000"/>
+    <joint name="joint5" value="-1.570796"/>
+    <joint name="joint6" value="0.000000"/>
+  </group_state>
+  <group_state name="pose_c" group="arm">
+    <joint name="joint1" value="0.000000"/>
+    <joint name="joint2" value="1.047198"/>
+    <joint name="joint3" value="0.523599"/>
+    <joint name="joint4" value="0.000000"/>
+    <joint name="joint5" value="-1.570796"/>
+    <joint name="joint6" value="0.000000"/>
+  </group_state>
+  <group_state name="park" group="arm">
+    <joint name="joint1" value="1.608914"/>
+    <joint name="joint2" value="1.436291"/>
+    <joint name="joint3" value="0.052081"/>
+    <joint name="joint4" value="1.177937"/>
+    <joint name="joint5" value="0.000065"/>
+    <joint name="joint6" value="0.000010"/>
+  </group_state>
+  <disable_collisions link1="base_link" link2="flange" reason="Never"/>
+  <disable_collisions link1="base_link" link2="gripper_center" reason="Never"/>
+  <disable_collisions link1="base_link" link2="link1" reason="Never"/>
+  <!-- 30.4：base_link 几何按实物改后，20000 组随机状态里 base_link↔link2 一次都没撞
+       （原来它会幻影撞肩部）；按采样加进 Never。base_link↔link3/link5 仍偶发撞在
+       方块 z≈0 的四个直角上（实物四角 R16，碰撞按直角保守），保留检查。 -->
+  <disable_collisions link1="base_link" link2="link2" reason="Never"/>
+  <disable_collisions link1="base_link" link2="link4" reason="Never"/>
+  <disable_collisions link1="base_link" link2="link6" reason="Never"/>
+  <disable_collisions link1="flange" link2="gripper_center" reason="Never"/>
+  <disable_collisions link1="flange" link2="link1" reason="Never"/>
+  <disable_collisions link1="flange" link2="link2" reason="Never"/>
+  <disable_collisions link1="flange" link2="link3" reason="Never"/>
+  <disable_collisions link1="flange" link2="link4" reason="Never"/>
+  <disable_collisions link1="flange" link2="link5" reason="Never"/>
+  <disable_collisions link1="flange" link2="link6" reason="Never"/>
+  <disable_collisions link1="gripper_center" link2="link1" reason="Never"/>
+  <disable_collisions link1="gripper_center" link2="link2" reason="Never"/>
+  <disable_collisions link1="gripper_center" link2="link3" reason="Never"/>
+  <disable_collisions link1="gripper_center" link2="link4" reason="Never"/>
+  <disable_collisions link1="gripper_center" link2="link5" reason="Never"/>
+  <disable_collisions link1="gripper_center" link2="link6" reason="Never"/>
+  <disable_collisions link1="link1" link2="link2" reason="Never"/>
+  <disable_collisions link1="link1" link2="link3" reason="Never"/>
+  <disable_collisions link1="link1" link2="link4" reason="Never"/>
+  <disable_collisions link1="link1" link2="link5" reason="Never"/>
+  <disable_collisions link1="link1" link2="link6" reason="Never"/>
+  <disable_collisions link1="link2" link2="link3" reason="Never"/>
+  <disable_collisions link1="link2" link2="link4" reason="Never"/>
+  <disable_collisions link1="link2" link2="link5" reason="Never"/>
+  <disable_collisions link1="link2" link2="link6" reason="Never"/>
+  <disable_collisions link1="link3" link2="link4" reason="Never"/>
+  <disable_collisions link1="link3" link2="link5" reason="Never"/>
+  <disable_collisions link1="link3" link2="link6" reason="Never"/>
+  <disable_collisions link1="link4" link2="link5" reason="Never"/>
+  <disable_collisions link1="link4" link2="link6" reason="Never"/>
+  <disable_collisions link1="link5" link2="link6" reason="Never"/>
+</robot>

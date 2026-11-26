@@ -1,0 +1,118 @@
+<?xml version="1.0"?>
+<!--
+  GLUON 2L6-4L3 复刻臂(J1/J2 标准 PR60,J3 标准 NE30,J4-J6 Lite NE30),空法兰。
+  数据源:运动学参数.md §3(关节表)、§6(简化几何)、§7(限位)。2026-11-17 PC 生成,
+  已用 sim/urdf_fk_check.py 对拍 §5 自检姿态和解析 FK。
+  约定:
+    - 单位 m / rad。所有 link 坐标系在零位时和基座系 B 平行(+x 指向工作区,+y 在人左手边,+z 向上,z=0 是木板表面)。
+    - 关节正方向 = 运动学参数.md §3 的正方向。电机实际转向的 sign(J1 +1, J2 -1, J3 +1, J4 -1, J5 -1, J6 -1)
+      由执行器处理,不写在这里。
+    - 限位 = 执行器运动中实际用的"安全限位"(J1/J3/J4/J5 ±133°,J2 ±88°,J6 ±163°)。
+    - velocity = 60°/s(电机限速);现阶段实际只跑 20°/s,在 MoveIt 的 joint_limits.yaml 里用缩放系数 0.33 限。
+    - effort 是占位值,位置规划不用。没有 inertial(要仿真时再按 sim/gravity_torque.py 的质量表补)。
+    - 几何是圆柱/方块的简化外形,visual 和 collision 相同;打印支架没画,铝管圆柱两头加长到盖住支架的位置。
+    - flange 系:z = 工具轴(零位时朝 +y),原点在 J6 输出法兰面中心。gripper_center 只是坐标系,没有几何(夹爪还没装回)。
+-->
+<robot name="gluon_2l6">
+
+  <material name="grey"><color rgba="0.75 0.75 0.78 1"/></material>
+  <material name="dark"><color rgba="0.20 0.20 0.22 1"/></material>
+  <material name="white"><color rgba="0.92 0.92 0.92 1"/></material>
+
+  <!-- base: #32 底座方块 122.6 x 122.6 x 83.5 -->
+  <link name="base_link">
+    <!-- 30.4：按实物 #32 底座改：方块 120 方（四角 R16，碰撞按直角保守）z 0…48.5；
+         转台柱 z 48.5…79.5 最大 Ø73；顶面 z 79.5 = J1 法兰面。 -->
+    <visual><origin xyz="0 0 0.02425"/><geometry><box size="0.120 0.120 0.0485"/></geometry><material name="white"/></visual>
+    <collision><origin xyz="0 0 0.02425"/><geometry><box size="0.120 0.120 0.0485"/></geometry></collision>
+    <visual><origin xyz="0 0 0.064"/><geometry><cylinder radius="0.0365" length="0.031"/></geometry><material name="white"/></visual>
+    <collision><origin xyz="0 0 0.064"/><geometry><cylinder radius="0.0365" length="0.031"/></geometry></collision>
+  </link>
+
+  <!-- link1: J1 PR60 壳体(轴 z,B 系 z 84.5…148.8,直径 80) -->
+  <link name="link1">
+    <visual><origin xyz="0 0 -0.00385"/><geometry><cylinder radius="0.040" length="0.0643"/></geometry><material name="dark"/></visual>
+    <collision><origin xyz="0 0 -0.00385"/><geometry><cylinder radius="0.040" length="0.0643"/></geometry></collision>
+  </link>
+  <joint name="joint1" type="revolute">
+    <parent link="base_link"/><child link="link1"/>
+    <origin xyz="0 0 0.1205"/><axis xyz="0 0 1"/>
+    <limit lower="-2.3213" upper="2.3213" velocity="1.0472" effort="20"/>
+  </joint>
+
+  <!-- link2: J2 PR60 壳体(轴 y,y 80.5…144.8)+ 上臂管(z 160.5…298.0,直径 35)+ J3 NE30 壳体(轴 y,y 93.0…159.8,直径 52) -->
+  <link name="link2">
+    <visual><origin xyz="0 -0.00385 0" rpy="1.5707963 0 0"/><geometry><cylinder radius="0.040" length="0.0643"/></geometry><material name="dark"/></visual>
+    <collision><origin xyz="0 -0.00385 0" rpy="1.5707963 0 0"/><geometry><cylinder radius="0.040" length="0.0643"/></geometry></collision>
+    <visual><origin xyz="0 0 0.10875"/><geometry><cylinder radius="0.0175" length="0.1375"/></geometry><material name="grey"/></visual>
+    <collision><origin xyz="0 0 0.10875"/><geometry><cylinder radius="0.0175" length="0.1375"/></geometry></collision>
+    <visual><origin xyz="0 0.0099 0.2035" rpy="1.5707963 0 0"/><geometry><cylinder radius="0.026" length="0.0668"/></geometry><material name="dark"/></visual>
+    <collision><origin xyz="0 0.0099 0.2035" rpy="1.5707963 0 0"/><geometry><cylinder radius="0.026" length="0.0668"/></geometry></collision>
+  </link>
+  <joint name="joint2" type="revolute">
+    <parent link="link1"/><child link="link2"/>
+    <origin xyz="0 0.1165 0"/><axis xyz="0 1 0"/>
+    <limit lower="-1.5359" upper="1.5359" velocity="1.0472" effort="20"/>
+  </joint>
+
+  <!-- link3: 前臂管(B 系 (0,37.3),z 350.0…471.0)+ J4 NE30 壳体(轴 y,y -4.0…60.8) -->
+  <link name="link3">
+    <visual><origin xyz="0 -0.0792 0.0865"/><geometry><cylinder radius="0.0175" length="0.121"/></geometry><material name="grey"/></visual>
+    <collision><origin xyz="0 -0.0792 0.0865"/><geometry><cylinder radius="0.0175" length="0.121"/></geometry></collision>
+    <visual><origin xyz="0 -0.0881 0.173" rpy="1.5707963 0 0"/><geometry><cylinder radius="0.026" length="0.0648"/></geometry><material name="dark"/></visual>
+    <collision><origin xyz="0 -0.0881 0.173" rpy="1.5707963 0 0"/><geometry><cylinder radius="0.026" length="0.0648"/></geometry></collision>
+  </link>
+  <joint name="joint3" type="revolute">
+    <parent link="link2"/><child link="link3"/>
+    <origin xyz="0 0 0.2035"/><axis xyz="0 1 0"/>
+    <limit lower="-2.3213" upper="2.3213" velocity="1.0472" effort="10"/>
+  </joint>
+
+  <!-- link4: J5 NE30 壳体(轴 z,B 系 (0,116.5),z 455.7…520.5) -->
+  <link name="link4">
+    <visual><origin xyz="0 0.0792 -0.0089"/><geometry><cylinder radius="0.026" length="0.0648"/></geometry><material name="dark"/></visual>
+    <collision><origin xyz="0 0.0792 -0.0089"/><geometry><cylinder radius="0.026" length="0.0648"/></geometry></collision>
+  </link>
+  <joint name="joint4" type="revolute">
+    <parent link="link3"/><child link="link4"/>
+    <origin xyz="0 -0.0792 0.173"/><axis xyz="0 1 0"/>
+    <limit lower="-2.3213" upper="2.3213" velocity="1.0472" effort="5"/>
+  </joint>
+
+  <!-- link5: J6 NE30 壳体(轴 y,z=576.2,y 75.2…140.0) -->
+  <link name="link5">
+    <visual><origin xyz="0 -0.0089 0.0792" rpy="1.5707963 0 0"/><geometry><cylinder radius="0.026" length="0.0648"/></geometry><material name="dark"/></visual>
+    <collision><origin xyz="0 -0.0089 0.0792" rpy="1.5707963 0 0"/><geometry><cylinder radius="0.026" length="0.0648"/></geometry></collision>
+  </link>
+  <joint name="joint5" type="revolute">
+    <parent link="link4"/><child link="link5"/>
+    <origin xyz="0 0.0792 0"/><axis xyz="0 0 1"/>
+    <limit lower="-2.3213" upper="2.3213" velocity="1.0472" effort="5"/>
+  </joint>
+
+  <!-- link6: J6 输出法兰盘(y 140.0…144.0,直径 45) -->
+  <link name="link6">
+    <visual><origin xyz="0 0.0255 0" rpy="1.5707963 0 0"/><geometry><cylinder radius="0.0225" length="0.004"/></geometry><material name="grey"/></visual>
+    <collision><origin xyz="0 0.0255 0" rpy="1.5707963 0 0"/><geometry><cylinder radius="0.0225" length="0.004"/></geometry></collision>
+  </link>
+  <joint name="joint6" type="revolute">
+    <parent link="link5"/><child link="link6"/>
+    <origin xyz="0 0 0.0792"/><axis xyz="0 1 0"/>
+    <limit lower="-2.8449" upper="2.8449" velocity="1.0472" effort="5"/>
+  </joint>
+
+  <!-- flange: 法兰面中心;z_f = 工具轴 = link6 的 +y,x_f = -x_6,y_f = +z_6 -->
+  <link name="flange"/>
+  <joint name="joint6-flange" type="fixed">
+    <parent link="link6"/><child link="flange"/>
+    <origin xyz="0 0.0275 0" rpy="1.5707963 0 3.1415927"/>
+  </joint>
+
+  <!-- gripper_center: 夹爪 v2 夹持中心,沿工具轴 139.15,绕工具轴 psi = -19.2°(装回后复核符号)。只是坐标系。 -->
+  <link name="gripper_center"/>
+  <joint name="flange-gripper_center" type="fixed">
+    <parent link="flange"/><child link="gripper_center"/>
+    <origin xyz="0 0 0.13915" rpy="0 0 -0.3351"/>
+  </joint>
+
+</robot>
