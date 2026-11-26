@@ -43,10 +43,10 @@
   <disable_collisions link1="base_link" link2="link1" reason="Never"/>
   <!-- 30.4：base_link 几何按实物改后，20000 组随机状态里 base_link↔link2 一次都没撞
        （原来它会幻影撞肩部）；按采样加进 Never。base_link↔link3/link5 仍偶发撞在
-       方块 z≈0 的四个直角上（实物四角 R16，碰撞按直角保守），保留检查。 -->
+       方块 z≈0 的四个直角上（实物四角 R16，碰撞按直角保守），保留检查。
+       37.3：base_link↔link4/link6 从 Never 改回检查（采样没撞到≠撞不到；link4 在
+       link3/link5 之间，link6 以后挂夹爪）。base_link↔link2 保留 Never（几何碰不到）。 -->
   <disable_collisions link1="base_link" link2="link2" reason="Never"/>
-  <disable_collisions link1="base_link" link2="link4" reason="Never"/>
-  <disable_collisions link1="base_link" link2="link6" reason="Never"/>
   <disable_collisions link1="flange" link2="gripper_center" reason="Never"/>
   <disable_collisions link1="flange" link2="link1" reason="Never"/>
   <disable_collisions link1="flange" link2="link2" reason="Never"/>
