@@ -1,0 +1,134 @@
+{
+ "session": "20261126_091146_hw",
+ "started": "2026-11-26T09:11:46.532",
+ "root": "/Users/frank/robot-arm/arm-control/runs",
+ "connector": "hw 192.168.1.30:2000",
+ "host": "tianchengdeMac-mini.local",
+ "platform": "macOS-27.2.1-arm64-arm-64bit-Mach-O",
+ "python": "3.13.11",
+ "config_version": "2425722138f7-b7f17e34fbd9-6cddf0e51596",
+ "config_shas": {
+  "config_version": "2425722138f7-b7f17e34fbd9-6cddf0e51596",
+  "joints_sha": "2425722138f7",
+  "tcp_sha": "b7f17e34fbd9",
+  "urdf_sha": "6cddf0e51596",
+  "joints_version": "2026-11-10.1",
+  "tcp_version": "2026-11-09.1"
+ },
+ "web_version": "2026-11-23.1",
+ "iface": "",
+ "git": {
+  "commit": "8cb0170",
+  "dirty": true,
+  "dirty_list": [
+   "onfig/park_state.json"
+  ]
+ },
+ "params": {
+  "J1": {
+   "current_limit_a": null,
+   "speed_limit_rpm": null,
+   "pos_limits_r": [
+    -14.0,
+    14.0
+   ],
+   "pos_kp": null,
+   "vel_kp": null,
+   "vel_ki": null
+  },
+  "J2": {
+   "current_limit_a": null,
+   "speed_limit_rpm": null,
+   "pos_limits_r": [
+    -9.5,
+    9.5
+   ],
+   "pos_kp": null,
+   "vel_kp": null,
+   "vel_ki": null
+  },
+  "J3": {
+   "current_limit_a": null,
+   "speed_limit_rpm": null,
+   "pos_limits_r": [
+    -14.0,
+    14.0
+   ],
+   "pos_kp": null,
+   "vel_kp": null,
+   "vel_ki": null
+  },
+  "J4": {
+   "current_limit_a": null,
+   "speed_limit_rpm": null,
+   "pos_limits_r": [
+    -14.0,
+    14.0
+   ],
+   "pos_kp": null,
+   "vel_kp": null,
+   "vel_ki": null
+  },
+  "J5": {
+   "current_limit_a": null,
+   "speed_limit_rpm": null,
+   "pos_limits_r": [
+    -14.0,
+    14.0
+   ],
+   "pos_kp": null,
+   "vel_kp": null,
+   "vel_ki": null
+  },
+  "J6": {
+   "current_limit_a": null,
+   "speed_limit_rpm": null,
+   "pos_limits_r": [
+    -17.0,
+    17.0
+   ],
+   "pos_kp": null,
+   "vel_kp": null,
+   "vel_ki": null
+  }
+ },
+ "params_diff": {
+  "J1": {
+   "current_limit_a": [
+    3.0,
+    null
+   ]
+  },
+  "J2": {
+   "current_limit_a": [
+    3.0,
+    null
+   ]
+  },
+  "J3": {
+   "current_limit_a": [
+    3.0,
+    null
+   ]
+  },
+  "J4": {
+   "current_limit_a": [
+    3.0,
+    null
+   ]
+  },
+  "J5": {
+   "current_limit_a": [
+    3.0,
+    null
+   ]
+  },
+  "J6": {
+   "current_limit_a": [
+    3.0,
+    null
+   ]
+  }
+ },
+ "params_changed_outside": false
+}

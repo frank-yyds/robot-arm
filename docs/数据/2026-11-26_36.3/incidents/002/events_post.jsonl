@@ -1,0 +1,20 @@
+{"mono": 366.4084, "wall": "2026-11-26T09:17:52.942", "kind": "incident", "joint": "", "text": "写目标丢了（已重发）", "phase": "", "step": "", "snapshot": "/Users/frank/robot-arm/arm-control/runs/20261126_091146_hw/incidents/002"}
+{"mono": 366.4086, "wall": "2026-11-26T09:17:52.942", "kind": "command_move", "joint": "J1", "text": "move_joints", "target_deg": 0.0}
+{"mono": 366.4087, "wall": "2026-11-26T09:17:52.942", "kind": "command_move", "joint": "J2", "text": "move_joints", "target_deg": 30.0}
+{"mono": 366.4087, "wall": "2026-11-26T09:17:52.942", "kind": "command_move", "joint": "J3", "text": "move_joints", "target_deg": 30.0}
+{"mono": 366.4087, "wall": "2026-11-26T09:17:52.942", "kind": "command_move", "joint": "J4", "text": "move_joints", "target_deg": 90.0}
+{"mono": 366.4088, "wall": "2026-11-26T09:17:52.942", "kind": "command_move", "joint": "J5", "text": "move_joints", "target_deg": 0.0}
+{"mono": 366.4088, "wall": "2026-11-26T09:17:52.942", "kind": "command_move", "joint": "J6", "text": "move_joints", "target_deg": 0.0}
+{"mono": 368.7734, "wall": "2026-11-26T09:17:55.307", "kind": "arrived_error", "joint": "J1", "text": "move_joints 到位误差 -0.002°", "target_deg": 0.0}
+{"mono": 368.7737, "wall": "2026-11-26T09:17:55.307", "kind": "arrived_error", "joint": "J2", "text": "move_joints 到位误差 +0.093°", "target_deg": 30.0}
+{"mono": 368.774, "wall": "2026-11-26T09:17:55.307", "kind": "arrived_error", "joint": "J3", "text": "move_joints 到位误差 -0.188°", "target_deg": 30.0}
+{"mono": 368.7741, "wall": "2026-11-26T09:17:55.307", "kind": "arrived_error", "joint": "J4", "text": "move_joints 到位误差 +0.001°", "target_deg": 90.0}
+{"mono": 368.7742, "wall": "2026-11-26T09:17:55.307", "kind": "arrived_error", "joint": "J5", "text": "move_joints 到位误差 -0.001°", "target_deg": 0.0}
+{"mono": 368.7743, "wall": "2026-11-26T09:17:55.307", "kind": "arrived_error", "joint": "J6", "text": "move_joints 到位误差 -0.001°", "target_deg": 0.0}
+{"mono": 368.7744, "wall": "2026-11-26T09:17:55.308", "kind": "trend_segment", "joint": "J1", "text": "move_joints（到位）最大落后 0.00°、最小 u —、最大 ρ 0.00、触发 无"}
+{"mono": 368.7746, "wall": "2026-11-26T09:17:55.308", "kind": "trend_segment", "joint": "J2", "text": "move_joints（到位）最大落后 0.00°、最小 u 2.44140625、最大 ρ 0.51、触发 无"}
+{"mono": 368.7753, "wall": "2026-11-26T09:17:55.308", "kind": "trend_segment", "joint": "J3", "text": "move_joints（到位）最大落后 0.05°、最小 u 0.91552734375、最大 ρ 0.18、触发 无"}
+{"mono": 368.7755, "wall": "2026-11-26T09:17:55.309", "kind": "trend_segment", "joint": "J4", "text": "move_joints（到位）最大落后 0.00°、最小 u —、最大 ρ 0.00、触发 无"}
+{"mono": 368.7757, "wall": "2026-11-26T09:17:55.309", "kind": "trend_segment", "joint": "J5", "text": "move_joints（到位）最大落后 0.00°、最小 u —、最大 ρ 0.00、触发 无"}
+{"mono": 368.7759, "wall": "2026-11-26T09:17:55.309", "kind": "trend_segment", "joint": "J6", "text": "move_joints（到位）最大落后 0.00°、最小 u —、最大 ρ 0.00、触发 无"}
+{"mono": 368.7761, "wall": "2026-11-26T09:17:55.309", "kind": "execute_done", "joint": "", "text": "全部段到达"}
