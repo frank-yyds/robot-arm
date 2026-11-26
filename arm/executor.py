@@ -647,6 +647,17 @@ class Executor:
                 self._capture = None
         except Exception:  # noqa: BLE001
             pass
+        # 29.1 修订：断开时把抓包转写收尾，并把统计写进会话（Y14 要报这个）
+        tee = getattr(self, "_packet_tee", None)
+        if tee is not None:
+            try:
+                stat = tee.stat()
+                tee.close()
+                if self.session:
+                    self.session.event("capture", "抓包转写收尾：" + str(stat))
+            except Exception:  # noqa: BLE001
+                pass
+            self._packet_tee = None
         if self.recorder:
             self.recorder.close()
         self.session = None
