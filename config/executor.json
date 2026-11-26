@@ -19,5 +19,7 @@
   "default_exec_mode": "preview",
   "mock_on_start": false,
   "motion_speed_scale": 0.5,
-  "motion_speed_scale_note": "21.4.4 全局速度倍率，第一次上真机默认 50%，网页可调（0.25/0.5/0.75/1.0）"
+  "motion_speed_scale_note": "21.4.4 全局速度倍率，第一次上真机默认 50%，网页可调（0.25/0.5/0.75/1.0）",
+  "idle_park_s": 600,
+  "idle_park_s_note": "37.1 第 6 条：空闲多少秒自动停机（用户 2026-11-26 定）。连真 ECB 时不能关、不能大于 600；改了要先问用户。mock 自检可设几秒。"
 }

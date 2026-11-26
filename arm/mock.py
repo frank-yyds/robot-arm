@@ -136,6 +136,16 @@ class MockJointBus:
         self.drop_write_prob = 0.0
         self.write_dropped = 0
         self.write_resent = 0
+        # 37.1 第 2 条自检：按颗注入“写目标丢失”次数（确定性，不用概率）
+        self.drop_targets: dict[str, int] = {}
+        # 37.1 第 2 条自检：默认像真机一样“丢一次就重发”；设 False 模拟真丢
+        self.auto_resend_on_drop = True
+        # 37.1 第 2 条自检：和真机同量级的读数噪声（36.3 第 2 条量到的）
+        self.pos_noise_deg = 0.0      # 位置 ±0.005°
+        self.vel_noise_std = 0.0      # 速度标准差 0.7°/s
+        self._noise_rng = random.Random(20261126)
+        # 记录的梯形参数写入（mock 不真发 0x1F/20/21，这里留给 0x21 符号自检用）
+        self.last_profiles: dict[str, tuple[float, float, float]] = {}
         # 30.5 第 3 条：只在“使能过、之后又失能”时才置锁存
         self._ever_enabled = True if self.enabled else False
         # 27.2 第 3 条：失能后这一次上电不再使能（mock 不写真实配置文件）
@@ -508,6 +518,14 @@ class MockJointBus:
                     speed_limit_rpm=360.0,
                     pos_limit_lo_r=c.eeprom_limits_deg[0] / 10.0,
                     pos_limit_hi_r=c.eeprom_limits_deg[1] / 10.0)
+            if self.pos_noise_deg or self.vel_noise_std:
+                for st in out.values():
+                    if st.out_deg is not None and self.pos_noise_deg:
+                        st.out_deg += self._noise_rng.uniform(
+                            -self.pos_noise_deg, self.pos_noise_deg)
+                    if st.velocity_deg_s is not None and self.vel_noise_std:
+                        st.velocity_deg_s += self._noise_rng.gauss(
+                            0.0, self.vel_noise_std)
             return out
 
     # ---------------- 写 ----------------
@@ -546,6 +564,12 @@ class MockJointBus:
                     self.write_dropped += 1
                     continue
                 self.log_write(n, 0x0A, turns)
+                # 37.1 第 2 条自检：这一颗的“写目标丢失”注入
+                if self.drop_targets.get(n, 0) > 0:
+                    self.drop_targets[n] -= 1
+                    dropped.append(n)
+                    self.write_dropped += 1
+                    continue
                 lo, hi = self.cfg[n].soft_limits_deg
                 new_t = max(lo, min(hi, float(q)))
                 old_t = self.target[n]
@@ -570,7 +594,7 @@ class MockJointBus:
                 self.target[n] = new_t
                 self._targets[n] = self.target[n]
                 self._prev_dir[n] = dir_new
-        if confirm and dropped:
+        if confirm and dropped and self.auto_resend_on_drop:
             # 行为确认：丢了的这颗速度/位置不会朝目标走，重发一次
             time.sleep(0.06)
             resent = []
@@ -617,6 +641,14 @@ class MockJointBus:
                         self.cfg[n].motion_accel_time_s, 0.05)
                     a = max(a, floor)
                 self.amax[n] = max(0.2, a)
+                # 37.1 第 5 条：mock 也记下正常流程写入的梯形参数（减速度写负数）
+                try:
+                    self.last_profiles[n] = (float(vel[n]), float(a), -float(a))
+                    self.log_write(n, 0x1F, float(vel[n]))
+                    self.log_write(n, 0x20, float(a))
+                    self.log_write(n, 0x21, -float(a))
+                except Exception:  # noqa: BLE001
+                    pass
                 self._prev_plan_vel[n] = float(self._plan_vel.get(n) or 0.0)
                 self._plan_vel[n] = abs(float(vel[n]))
                 self._plan_acc[n] = a
@@ -786,9 +818,29 @@ class MockMotor:
             return None
         return self.bus.cfg[self.name].turns(self.bus.q[self.name])
 
-    def set_target_turns(self, turns):
+    def set_target_turns(self, turns, priority: bool = False):
         self.bus._emit_write(self.name, 0x0A, float(turns))
+        # 37.1 第 2 条自检：重发也可以被“写丢”注入（连丢两次才会走到 target_lost）
+        if self.bus.drop_targets.get(self.name, 0) > 0:
+            self.bus.drop_targets[self.name] -= 1
+            self.bus.write_dropped += 1
+            return True
+        # 37.1 第 2 条：重发走的是单颗 set_target_turns，mock 必须真的改目标
+        cfg = self.bus.cfg[self.name]
+        q = cfg.out_deg(float(turns))   # turns 是电机圈数，输出端角度要按 sign 换算
+        lo, hi = cfg.soft_limits_deg
+        self.bus.target[self.name] = max(lo, min(hi, q))
+        self.bus._targets[self.name] = self.bus.target[self.name]
         return True
 
     def set_profile_out(self, *a, **kw):
+        # 37.1 第 5 条：mock 也记下写入的梯形参数（0x1F/20/21），供“0x21 全负数”自检
+        try:
+            vel, acc, dec = (list(a) + [None, None, None])[:3]
+            self.bus.last_profiles[self.name] = (float(vel), float(acc), float(dec))
+            self.bus.log_write(self.name, 0x1F, float(vel))
+            self.bus.log_write(self.name, 0x20, float(acc))
+            self.bus.log_write(self.name, 0x21, float(dec))
+        except Exception:  # noqa: BLE001
+            pass
         return True

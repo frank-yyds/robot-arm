@@ -86,6 +86,8 @@ class Executor:
         self.models_dir = self._path(self.cfg.get("models_dir", "models"))
         self.serve_web = bool(self.cfg.get("serve_web", True))
         self.push_hz = max(10.0, float(self.cfg.get("state_push_hz", 20)))
+        # 37.1 第 6 条：空闲自动停机秒数（真 ECB 不许 >600、不许关；mock 可更短）
+        self.idle_park_s = float(self.cfg.get("idle_park_s", 600.0))
         self.trace_hz = max(5.0, min(200.0, float(self.cfg.get("trace_hz", 100))))
         self.trace_seconds = max(1.0, min(60.0, float(self.cfg.get("trace_seconds", 10))))
         self.hb_timeout = float(self.cfg.get("heartbeat_timeout_s", 0.5))
@@ -190,6 +192,14 @@ class Executor:
         self.park_step = {"phase": "idle", "reason": "", "z": None, "step": 0,
                           "I0": None, "I2": None, "I1": None, "contact_z": None}
         self.park_block: dict | None = None
+        # 37.1 第 6 条：空闲自动停机（用户 2026-11-26 定）
+        # 空闲计时从最近一次“会改变臂状态的操作”起算；心跳/state/SSE/trace/只读不算
+        self._last_op_at = time.monotonic()
+        self._idle_triggered = False
+        self._idle_running = False
+        self._idle_last_trigger_at = 0.0
+        self._idle_blocked_reason = ""
+        self._on_shelf = False
         self.j2_bracket = str(getattr(self.joint_cfg.get("J2"), "j2_bracket", "PLA"))
         # 24 节 A3b：保持失效检测 / A5：状态/命令记录
         self.hold_guard = {"active": False, "hist": {}, "resent": {},
@@ -368,8 +378,24 @@ class Executor:
             return True
         return bool(self.motion and self.motion.status.get("busy"))
 
-    def stop_all(self, reason: str = "用户按停", quiet: bool = False) -> dict:
-        """20.3：统一的停；停机线程、校准、拖动、普通运动都收到。"""
+    def stop_all(self, reason: str = "用户按停", quiet: bool = False,
+                 source: str | None = None) -> dict:
+        """20.3：统一的停；停机线程、校准、拖动、普通运动都收到。
+
+        37.1 第 3 条：按停记来源。source=web/agent/None → "按停（网页）/
+        "按停（agent）/按停（来源没写）"，只替换默认的"用户按停"；心跳超时、
+        关网页那些有自己的原因文字，不变。
+        """
+        src = str(source or "").lower()
+        if src == "web":
+            label = "按停（网页）"
+        elif src == "agent":
+            label = "按停（agent）"
+        else:
+            label = "按停（来源没写）"
+        if reason == "用户按停":
+            reason = label
+        self._mark_operation("stop")
         self._park_stop.set()
         if self.calib.active:
             try:
@@ -384,12 +410,27 @@ class Executor:
         if self.motion:
             self.motion.stop(reason)
         if not quiet:
-            self.msg = f"已按停：{reason}"
-            # 29.2：用户按停要自动存快照
+            text = reason
+            # 37.1 第 4 条：空闲（没在运动）按停时，当场 hold_all 并把 kept 记进事件
+            try:
+                busy = bool(self.motion and self.motion.status.get("busy"))
+            except Exception:  # noqa: BLE001
+                busy = False
+            if self.bus is not None and not busy:
+                try:
+                    res = self.bus.hold_all()
+                    kept = dict((res or {}).get("kept") or {})
+                    if kept:
+                        text += "；kept=" + "，".join(
+                            f"{n}={float(v):.3f}°" for n, v in kept.items())
+                except Exception:  # noqa: BLE001
+                    pass
+            self.msg = f"已按停：{text}"
+            # 29.2：按停要自动存快照；37.1 第 3 条记来源
             if self.session:
                 try:
-                    self.session.event("user_stop", reason)
-                    self.session.incident("用户按停", detail={"原因": reason})
+                    self.session.event("user_stop", text)
+                    self.session.incident(reason, detail={"原因": text})
                 except Exception:  # noqa: BLE001
                     pass
         return {"ok": True}
@@ -460,6 +501,12 @@ class Executor:
             self.msg = "模拟模式（6 轴）"
             self.connected = True
         else:
+            # 37.1 第 6 条自检 ⑦：真 ECB 配置里 idle_park_s 必须 0 < s ≤ 600
+            if not (0 < float(self.idle_park_s) <= 600.0):
+                raise MotionError(
+                    "config/executor.json 的 idle_park_s 必须是 0 < 秒数 ≤ 600"
+                    f"（现在是 {self.idle_park_s:g}）：连真 ECB 时不允许关掉或调大，"
+                    "要改这个数先问用户（37.1 第 6 条）")
             self.bus = JointBus(ip, port, self.joint_cfg, debug=debug)
             self.mode = "hw"
             self.ip = f"{ip}:{port}"
@@ -590,8 +637,10 @@ class Executor:
                     mode: str = "") -> dict:
         if self.trace and self.trace.status().get("active"):
             raise MotionError("高频采样已经在跑")
-        if not isinstance(self.bus, JointBus) or not self.connected:
-            raise MotionError("高频采样需要真机连接（模拟模式没有真实 ECB 总线）")
+        if not self.connected:
+            raise MotionError("高频采样要连上（真机或 mock）")
+        if not isinstance(self.bus, JointBus) and not getattr(self.bus, "is_mock", False):
+            raise MotionError("高频采样需要 JointBus（真机或 mock）")
         self.trace = TraceSampler(self, hz=hz, seconds=seconds, joints=joints,
                                   mode=mode,
                                   status_hz=status_hz, light=light)
@@ -601,13 +650,25 @@ class Executor:
 
     def stop_trace(self) -> dict:
         if not self.trace:
+            self._poll_hold = False
             return {"ok": True, "active": False}
-        r = self.trace.stop()
+        tr = self.trace
+        r = tr.stop()
+        self._poll_hold = False
         self.msg = "高频采样已停止"
-        return {**r, **self.trace.status()}
+        return {**r, **tr.status()}
 
     def disconnect(self):
         self._park_stop.set()
+        # 37.3 第 2 条查到：_poll_loop 在 disconnect 后一直跑（20 Hz 预演算 FK/围栏），
+        # 自检一次进程里反复 connect/disconnect 会越积越多、拖垮慢机器。这里停掉并 join。
+        try:
+            self._poll_stop.set()
+            t = getattr(self, "_poll_thread", None)
+            if t is not None and t.is_alive() and t is not threading.current_thread():
+                t.join(timeout=1.0)
+        except Exception:  # noqa: BLE001
+            pass
         if self.sweep_runner and self.sweep_runner.status.get("active"):
             try:
                 self.sweep_runner.stop()
@@ -698,44 +759,70 @@ class Executor:
                 self.msg = f"轮询异常：{exc}"
             time.sleep(max(0.0, period - (time.monotonic() - t0)))
 
-    def _refresh(self):
-        if getattr(self, "_poll_hold", False):
+    def _on_trace_latest(self, tr, states):
+        """37.1 第 1 条：trace 每轮把读数交给执行器（poll_hold 期间用它跑保护）。"""
+        if self.trace is tr:
+            self._trace_latest_at = time.time()
+
+    def _on_trace_finished(self, tr):
+        """37.1 第 1 条：trace 正常结束/出错/被停 → poll_hold 自动关。"""
+        if self.trace is not tr:
             return
-        if self.use_actual():
-            m = self.motion
-            busy = m.status.get("busy")
-            if busy:
-                q = m.status.get("current_q")
-                states = self._last_states
-            else:
-                full = time.monotonic() - self._last_full > 5.0
-                states = self.bus.read_all(full=full)
-                if full:
-                    self._last_full = time.monotonic()
-                self._last_states = states
-                q = [states[n].out_deg for n in self.robot.joint_names]
-                if any(v is None for v in q):
-                    # A3：读不到或读数异常时，不能拿零位预演姿态冒充实际
-                    q = None if getattr(self.bus, "startup_done", False) else None
-            if q is None:
-                if getattr(self.bus, "startup_done", False):
-                    # 使能中读不到：保留上一帧画面，只报异常
-                    if self._last_states:
-                        states = self._last_states
-                    bad = [n for n in self.robot.joint_names
-                           if states.get(n) is not None
-                           and getattr(states[n], "pos_invalid", False)]
-                    if bad:
-                        self.msg = "读数异常（不合理跳变）：" + "、".join(bad) \
-                                   + "；已停止把它当保持目标/规划起点"
-                    q = None
-                else:
-                    # 连接了但还没使能/读不到位置：退回零位预演模型
-                    states = self.preview_bus.read_all()
-                    q = [0.0] * 6
+        was = bool(getattr(self, "_poll_hold", False))
+        self._poll_hold = False
+        if was:
+            self.msg = (self.msg + "；poll_hold 已自动关闭").strip("；")
+
+    def _refresh(self):
+        """37.1 第 1 条改：poll_hold 只停总线读取，保护/网页照常跑。
+
+        - poll_hold 且 trace 在跑、采六颗：用 trace 最近一轮读数，不读总线；
+        - 否则正常读总线；poll_hold 没有可用的 trace 时自动关掉。
+        """
+        tr = self.trace
+        hold = bool(getattr(self, "_poll_hold", False))
+        use_trace = (hold and tr is not None
+                     and tr.status().get("active")
+                     and len(tr.latest_states) == len(self.robot.joint_names))
+        if use_trace:
+            states = {n: tr.latest_states.get(n) for n in self.robot.joint_names}
+            q = [None if states[n] is None else states[n].out_deg
+                 for n in self.robot.joint_names]
         else:
-            states = self.preview_bus.read_all()
-            q = [0.0] * 6
+            if hold:
+                self._poll_hold = False
+            if self.use_actual():
+                m = self.motion
+                busy = m.status.get("busy")
+                if busy:
+                    q = m.status.get("current_q")
+                    states = self._last_states
+                else:
+                    full = time.monotonic() - self._last_full > 5.0
+                    states = self.bus.read_all(full=full)
+                    if full:
+                        self._last_full = time.monotonic()
+                    self._last_states = states
+                    q = [states[n].out_deg for n in self.robot.joint_names]
+                    if any(v is None for v in q):
+                        q = None if getattr(self.bus, "startup_done", False) else None
+                if q is None:
+                    if getattr(self.bus, "startup_done", False):
+                        if self._last_states:
+                            states = self._last_states
+                        bad = [n for n in self.robot.joint_names
+                               if states.get(n) is not None
+                               and getattr(states[n], "pos_invalid", False)]
+                        if bad:
+                            self.msg = "读数异常（不合理跳变）：" + "、".join(bad) \
+                                       + "；已停止把它当保持目标/规划起点"
+                        q = None
+                    else:
+                        states = self.preview_bus.read_all()
+                        q = [0.0] * 6
+            else:
+                states = self.preview_bus.read_all()
+                q = [0.0] * 6
         now = time.monotonic()
         pos_age = {}
         for n in self.robot.joint_names:
@@ -761,6 +848,10 @@ class Executor:
                 self.cache["near_limit"] = fr.near_limit
             except Exception as exc:  # noqa: BLE001
                 self.msg = f"场景计算异常：{exc}"
+        try:
+            self._idle_tick()
+        except Exception:  # noqa: BLE001
+            pass
 
     # ---------------- 24 节 A2/A3/A3b/A5 辅助 ----------------
     # 写命令（需要记录的那些）；读命令不记
@@ -1098,6 +1189,161 @@ class Executor:
         except Exception as exc:  # noqa: BLE001
             return {"ok": False, "error": str(exc)}
 
+    # ---------------- 37.1 第 6 条：空闲自动停机 ----------------
+    def _mark_operation(self, what: str = ""):
+        """记一次“会改变臂状态的操作”：空闲计时从头算。"""
+        self._last_op_at = time.monotonic()
+        self._idle_triggered = False
+        self._idle_blocked_reason = ""
+
+    def idle_continue(self) -> dict:
+        """网页“继续保持”按钮：把空闲计时清零。"""
+        self._mark_operation("idle_continue")
+        return {"ok": True, "msg": "空闲计时已从头算",
+                **self._idle_state()}
+
+    def _idle_state(self) -> dict:
+        limit = float(getattr(self, "idle_park_s", 600.0))
+        elapsed = time.monotonic() - getattr(self, "_last_op_at", time.monotonic())
+        try:
+            st = self.cache.get("states") or {}
+            six_on = bool(getattr(self.bus, "startup_done", False)) and all(
+                st.get(n) is not None and st[n].enabled is True
+                for n in self.robot.joint_names)
+        except Exception:  # noqa: BLE001
+            six_on = False
+        try:
+            busy = bool(self.motion and self.motion.status.get("busy")) \
+                or bool(self.park_active) or bool(getattr(self, "drag_active", False)) \
+                or bool(getattr(self.calib, "active", False))
+        except Exception:  # noqa: BLE001
+            busy = False
+        enabled = bool(self.connected and self.bus is not None and six_on and not busy)
+        remain = max(0.0, limit - elapsed)
+        return {"enabled": enabled, "remaining_s": round(remain, 1),
+                "limit_s": round(limit, 1), "park_s": round(remain, 1),
+                "blocked": self._idle_blocked_reason,
+                "triggered": bool(self._idle_triggered)}
+
+    def _idle_abnormal_reason(self) -> str | None:
+        """空闲到点时如果状态异常，返回原因；正常返回 None（不停机）。"""
+        if self.hold_failure:
+            return "保持失效"
+        if self.park_block:
+            return "启动比对还没解除"
+        try:
+            lat = self.check_alarm_latch()
+            if not lat.get("ok"):
+                return "报警码非 0：" + "，".join(lat.get("bad") or [])
+        except Exception as exc:  # noqa: BLE001
+            return f"读报警失败：{exc}"
+        try:
+            st = self.cache.get("states") or {}
+            bad = [n for n in self.robot.joint_names
+                   if st.get(n) is not None and getattr(st[n], "pos_invalid", False)]
+            if bad:
+                return "读数异常：" + "、".join(bad)
+        except Exception:  # noqa: BLE001
+            pass
+        if self.end_effector != "flange":
+            return f"末端是 {self.end_effector}，停机只对空法兰开放"
+        try:
+            cons = self.park_config().get("park_consistency")
+            if cons and not cons.get("ok"):
+                return "停机点配置对不上：" + "；".join(cons.get("problems") or [])
+        except Exception as exc:  # noqa: BLE001
+            return f"停机点检查失败：{exc}"
+        return None
+
+    def _idle_tick(self):
+        """在 _refresh 里每拍检查一次；到点自动停机/失能（用户 2026-11-26 定）。"""
+        if self._idle_triggered or self._idle_running or self._idle_blocked_reason:
+            return
+        if not self.connected or self.bus is None:
+            return
+        if not getattr(self.bus, "startup_done", False):
+            return
+        try:
+            st = self.cache.get("states") or {}
+            if not all(st.get(n) is not None and st[n].enabled is True
+                       for n in self.robot.joint_names):
+                return
+        except Exception:  # noqa: BLE001
+            return
+        if (self.motion and self.motion.status.get("busy")) or self.park_active \
+                or getattr(self, "drag_active", False) or getattr(self.calib, "active", False):
+            return
+        limit = float(getattr(self, "idle_park_s", 600.0) or 600.0)
+        if time.monotonic() - getattr(self, "_last_op_at", time.monotonic()) < limit:
+            return
+        why = self._idle_abnormal_reason()
+        if why:
+            self._idle_blocked_reason = why
+            text = f"空闲超时，状态异常（{why}），没有自动停机"
+            self.msg = text
+            if self.recorder:
+                try:
+                    self.recorder.command("idle_blocked", text)
+                except Exception:  # noqa: BLE001
+                    pass
+            return
+        self._idle_triggered = True
+        self._idle_last_trigger_at = time.monotonic()
+        on_shelf = bool(self._on_shelf)
+        if on_shelf:
+            text = "空闲 10 分钟，自动失能（臂在搁架上）"
+            self.msg = text
+            if self.recorder:
+                try:
+                    self.recorder.command("idle_auto_disable", text)
+                except Exception:  # noqa: BLE001
+                    pass
+            try:
+                self.bus.disable_all(True, "空闲 10 分钟，自动失能")
+            except Exception as exc:  # noqa: BLE001
+                self.msg = f"{text}：失败 {exc}"
+            return
+        # 臂在空中：走正常停机流程，速度 25%
+        text = "空闲 10 分钟，自动停机"
+        self.msg = text
+        if self.recorder:
+            try:
+                self.recorder.command("idle_auto_park", text)
+            except Exception:  # noqa: BLE001
+                pass
+
+        def worker():
+            self._idle_running = True
+            try:
+                if self.motion and self.motion.status.get("phase") in (
+                        "aborted", "error", "stopping"):
+                    self.recover()   # 规则同网页：按钮要先恢复就先恢复
+                prev = self.speed_scale
+                self.speed_scale = min(0.25, prev)
+                try:
+                    if self.motion:
+                        self.motion.speed_scale = self.speed_scale
+                    self.park(False, prereq={"gripper_empty": True,
+                                             "workspace_clear": True,
+                                             "shelf_ready": True})
+                finally:
+                    self.speed_scale = prev
+                    if self.motion:
+                        self.motion.speed_scale = prev
+            except Exception as exc:  # noqa: BLE001
+                self.msg = f"空闲自动停机失败：{exc}"
+                if self.recorder:
+                    try:
+                        self.recorder.command(
+                            "idle_blocked",
+                            f"空闲自动停机失败：{exc}；按停机流程规则原地保持")
+                    except Exception:  # noqa: BLE001
+                        pass
+            finally:
+                self._idle_running = False
+
+        threading.Thread(target=worker, daemon=True).start()
+
     def state(self) -> dict:
         with self._lock:
             cache = dict(self.cache)
@@ -1202,6 +1448,7 @@ class Executor:
                                  round(time.monotonic() - self.hold["since"], 1)),
                      "warn": self.hold.get("warn", ""),
                      "threshold": gravity.HOLD_WARN_RATIO},
+            "idle": self._idle_state(),
             "flow": {"phase": (self.motion.status.get("phase")
                                if self.motion else ""),
                      "label": (self.motion.status.get("label")
@@ -1374,6 +1621,7 @@ class Executor:
         35.2 第 2 条：本段不动的关节（|位移| ≤0.8°）加速度/减速度给下限。
         """
         self._reject_if_parking()
+        self._mark_operation("test_write_profile")
         if self.motion is None or not self._bus_startup_done():
             raise MotionError("还没完成启动/使能，不能做这个测试")
         if self.motion.status.get("busy"):
@@ -1559,9 +1807,23 @@ class Executor:
         return out
 
     def test_poll_hold(self, on: bool = True) -> dict:
-        """27.3：高频记录期间暂停空闲轮询（它每拍 read_all 会抢总线、把 trace 压到 65 Hz）。"""
-        self._poll_hold = bool(on)
-        return {"ok": True, "poll_hold": bool(on)}
+        """37.1 第 1 条：只暂停空闲轮询的总线读取，保护/网页状态照常用 trace 读数跑。
+
+        只有 trace 正在跑、且采六颗全部时才允许打开；trace 结束会自动关。
+        """
+        on = bool(on)
+        if on:
+            tr = self.trace
+            if tr is None or not tr.status().get("active"):
+                raise MotionError("poll_hold 只能在 trace 正在跑时打开（37.1 第 1 条）")
+            js = tr.joints
+            if js is not None and len(js) != len(self.robot.joint_names):
+                raise MotionError("poll_hold 只能在 trace 采六颗全部时打开；"
+                                  f"现在只采 {len(js)} 颗")
+            if getattr(tr, "mode", "") not in ("cvp",):
+                raise MotionError("poll_hold 要配 trace 的 cvp 模式（0x94 一轮六颗）")
+        self._poll_hold = on
+        return {"ok": True, "poll_hold": on}
 
     def test_read_profiles(self) -> dict:
         """27.3：回读六颗的梯形参数（0x1C/0x1D/0x1E）。"""
@@ -1926,6 +2188,9 @@ class Executor:
             m = self.planning_motion()
         if m.status.get("busy"):
             raise MotionError("正在运动")
+        if not preview:
+            self._mark_operation("jog")
+            self._on_shelf = False
         joint = joint.upper()
         if joint not in self.robot.joint_names:
             raise MotionError(f"未知关节 {joint}")
@@ -2000,6 +2265,9 @@ class Executor:
             raise MotionError("正在运动")
         if len(q) != 6:
             raise MotionError("需要 6 个关节角")
+        if not preview:
+            self._mark_operation("move_joints")
+            self._on_shelf = False
         segs = m.plan_joint_move(q, descend=descend, label="move_joints")
         self.pending = segs
         self.preview = preview_payload(segs[-1], self.robot, self.fence,
@@ -2013,6 +2281,9 @@ class Executor:
                  descend: bool = False, preset: str | None = None,
                  free_yaw: bool = False) -> dict:
         self._reject_if_parking()
+        if not preview:
+            self._mark_operation("move_tcp")
+            self._on_shelf = False
         if not preview:
             self._ready_for_motion()
             m = self.motion
@@ -2043,6 +2314,9 @@ class Executor:
     def move_through(self, waypoints, descend_flags=None, labels=None,
                      preview: bool = False) -> dict:
         self._reject_if_parking()
+        if not preview:
+            self._mark_operation("move_through")
+            self._on_shelf = False
         if not preview:
             self._ready_for_motion()
             m = self.motion
@@ -2105,6 +2379,8 @@ class Executor:
 
     def park(self, preview: bool = False, prereq: dict | None = None) -> dict:
         self._reject_if_parking()
+        if not preview:
+            self._mark_operation("park")
         cons = self.park_config().get("park_consistency") or {"ok": True, "problems": []}
         if not cons.get("ok"):
             raise MotionError("停机点配置对不上，拒绝停机：" + "；".join(cons["problems"]))
@@ -2593,6 +2869,9 @@ class Executor:
 
     def unpark(self, preview: bool = False, confirmed: bool = False) -> dict:
         """从停机启动：J2/J3 同步抬回预停机点（离开搁架）。"""
+        if not preview:
+            self._mark_operation("unpark")
+            self._on_shelf = False
         self._reject_if_parking()
         m = self.planning_motion()
         if m.status.get("busy"):
@@ -2685,6 +2964,7 @@ class Executor:
     def recover(self) -> dict:
         """16.4 第 7 条：中止后保持状态的出口“恢复”。"""
         self._reject_if_parking()
+        self._mark_operation("recover")
         if not self.bus or not self.motion:
             raise MotionError("还没连接")
         if self.motion.status.get("busy"):
@@ -3696,7 +3976,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, EXEC.release(str(body.get("token") or "")))
             if p == "/api/stop":
                 # 停是安全动作：不要求控制权，任何客户端都能停
-                return self._json(200, EXEC.stop_all("用户按停"))
+                return self._json(200, EXEC.stop_all(
+                    "用户按停", source=body.get("source")))
             if p == "/api/test/write_profile":
                 EXEC.require_control(body)
                 nd = body.get("negative_decel")
@@ -3877,6 +4158,8 @@ class Handler(BaseHTTPRequestHandler):
                     pass
                 EXEC.pending = None
                 EXEC.preview = None
+                EXEC._mark_operation("enable")
+                EXEC._on_shelf = True
                 EXEC.msg = "已使能（J6→J1），S 曲线模式就绪"
                 check = {"has_parked": False, "ok": None}
                 try:
@@ -3962,6 +4245,7 @@ class Handler(BaseHTTPRequestHandler):
                 if not body.get("confirmed"):
                     raise MotionError("全部失能要二次确认")
                 ok = EXEC.bus.disable_all(True, body.get("reason", "user"))
+                EXEC._mark_operation("disable_all")
                 EXEC.pending = None
                 EXEC.preview = None
                 EXEC.msg = "已全部失能"
@@ -4080,6 +4364,9 @@ class Handler(BaseHTTPRequestHandler):
                     EXEC.motion.yaw_deg = EXEC.yaw_deg
                 EXEC.preview_motion.yaw_deg = EXEC.yaw_deg
                 return self._json(200, {"ok": True, "yaw": EXEC.yaw_deg})
+            if p == "/api/idle/continue":
+                EXEC.require_control(body)
+                return self._json(200, EXEC.idle_continue())
             if p == "/api/speed_scale":
                 EXEC.require_control(body)
                 return self._json(200, EXEC.set_speed_scale(

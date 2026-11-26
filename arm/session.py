@@ -71,6 +71,13 @@ def runs_bytes(root: Path) -> int:
     return total
 
 
+# 37.3 第 2 条查到：Executor.connect() 每次都调 enforce_quota，而 runs/ 大时
+# runs_bytes() 要 0.5 s（笔记本 14.9 GB / 1346 个目录）；自检一进程里连 100 次就卡死。
+# 这里限频：同一个 runs 根目录 10 分钟内最多扫一次。
+_QUOTA_CACHE: dict[str, tuple[float, dict]] = {}
+_QUOTA_MIN_INTERVAL_S = 600.0
+
+
 class Session:
     """一次连接（会话）的记录器。线程安全；写盘在独立线程。"""
 
@@ -407,11 +414,22 @@ class Session:
 
     # ---------------- 磁盘保留 ----------------
     def enforce_quota(self, max_bytes: int = MAX_RUNS_BYTES) -> dict:
-        """29.7 第 4 条：记录目录超过上限就删最旧的会话（快照目录不删）。"""
+        """29.7 第 4 条：记录目录超过上限就删最旧的会话（快照目录不删）。
+
+        37.3：同一次执行器进程里 10 分钟内只真扫一次（避免每次 connect 都扫整个 runs/）；
+        超限时仍然会真删，删完把结果缓存。
+        """
+        key = str(self.root.resolve())
+        now = time.monotonic()
+        hit = _QUOTA_CACHE.get(key)
+        if hit and now - hit[0] < _QUOTA_MIN_INTERVAL_S:
+            return {**hit[1], "cached": True}
         total = runs_bytes(self.root)
         removed = []
         if total <= max_bytes:
-            return {"ok": True, "bytes": total, "removed": []}
+            res = {"ok": True, "bytes": total, "removed": []}
+            _QUOTA_CACHE[key] = (now, res)
+            return res
         sessions = sorted([p for p in self.root.iterdir()
                            if p.is_dir() and p.name != "_pcap_ring"
                            and not p.name.startswith("_")],
@@ -431,7 +449,9 @@ class Session:
                 continue
             if total <= max_bytes:
                 break
-        return {"ok": total <= max_bytes, "bytes": total, "removed": removed}
+        res = {"ok": total <= max_bytes, "bytes": total, "removed": removed}
+        _QUOTA_CACHE[key] = (now, res)
+        return res
 
     def close(self):
         try:

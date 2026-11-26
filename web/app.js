@@ -726,6 +726,7 @@ function applyState(s) {
   if (CALIB_OPEN) updateCalib(s.calib);
   if (MEASURE_OPEN) updateMeasureUI(s);
   STATE = s;
+  updateIdleBanner(s);
   updateTrace(s);
   const nowUi = performance.now();
   if (!gizmoDragging && nowUi - lastUiAt > 80) {
@@ -1161,6 +1162,29 @@ function updateLatchBanner(s) {
     + (lat.reason ? `（失能原因：${lat.reason}）` : '');
 }
 
+function updateIdleBanner(s) {
+  const el = document.getElementById('idle-banner');
+  const txt = document.getElementById('idle-text');
+  const btn = document.getElementById('btn-idle-continue');
+  if (!el || !txt) return;
+  const idle = s.idle || null;
+  if (!idle || !idle.enabled || idle.remaining_s > 60) {
+    el.style.display = 'none';
+    return;
+  }
+  el.style.display = 'flex';
+  if (idle.blocked) {
+    txt.textContent = `空闲超时：${idle.blocked}，没有自动停机`;
+    if (btn) btn.style.display = 'none';
+    return;
+  }
+  txt.textContent = `空闲 ${Math.max(1, Math.round(idle.remaining_s))} 秒后自动停机（50%→25%）`;
+  if (btn) btn.style.display = '';
+  if (!idle._warned) {
+    idle._warned = true;
+  }
+}
+
 function updateHoldFailure(s) {
   const hf = s.hold_failure;
   const el = document.getElementById('hold-fail-banner');
@@ -1398,6 +1422,12 @@ $('btn-exec').addEventListener('click', async () => {
 });
 
 $('btn-stop').addEventListener('click', doStop);
+$('btn-idle-continue')?.addEventListener('click', async () => {
+  try {
+    const r = await apiPost('/api/idle/continue', {});
+    log(r.msg || '空闲计时已从头算', 'w');
+  } catch (e) { log('继续保持失败：' + e.message, 'b'); }
+});
 
 async function doMark() {
   const kinds = ['撞到', '歪了', '异响', '抖动', '其他'];
@@ -1412,7 +1442,7 @@ $('btn-mark').addEventListener('click', doMark);
 
 function doStop() {
   const drag = STATE && STATE.drag && STATE.drag.active;
-  const p = drag ? apiPost('/api/drag/stop', {}) : postRaw('/api/stop', {});
+  const p = drag ? apiPost('/api/drag/stop', {}) : postRaw('/api/stop', { source: 'web' });
   p.then((r) => log(
     drag ? (r && r.warning ? r.warning : '已退出拖动，切回位置保持') : '已按停（原地保持）',
     r && r.warning ? 'b' : 'w'))

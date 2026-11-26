@@ -997,15 +997,18 @@ class JointBus:
 
     # ---------------- 写 ----------------
     def set_targets_q(self, targets: dict[str, float], confirm: bool = True) -> dict[str, bool]:
-        """写目标；26.7 7b 用优先发送口，26.7 7 用行为确认送到。"""
+        """写目标；26.7 7b 用优先发送口。
+
+        37.1 第 2 条：不再在这里 sleep 等 0.06 s 判速度/重发（那是判噪声）；
+        改成运动层按位置判（Motion._check_target_confirm）。confirm 参数保留兼容，
+        不再触发旧的 confirm_targets。
+        """
         res = {}
         with self._lock:
             for name, q in targets.items():
                 c = self.cfg[name]
                 res[name] = self.motors[name].set_target_turns(c.turns(q), priority=True)
                 self._targets[name] = q
-        if confirm and not self.skip_resend:
-            self.confirm_targets(targets)
         return res
 
     def confirm_targets(self, targets: dict[str, float], wait: float = 0.06) -> list[str]:

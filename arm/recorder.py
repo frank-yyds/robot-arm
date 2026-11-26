@@ -25,7 +25,10 @@ INCIDENT_KINDS = {
     "abort": "中止 / 原地保持",
     "hold_failure": "保持失效",
     "read_anomaly": "读数被合理性检查拒掉",
+    # 37.1 第 2 条：第一次按位置判重发只记事件（target_confirm_resend，不存快照）；
+    # 重发后还不走才存快照、原地保持（target_lost）。
     "write_resend": "写目标丢了（已重发）",
+    "target_lost": "写目标丢了",
     "disable_joint": "单颗失能",
     "contact_mismatch": "接触高度比对不符",
     "catch_failed": "搁架没接住",

@@ -57,12 +57,12 @@
       0.0012
     ],
     "park": [
-      92.184,
-      82.2934,
-      2.984,
-      67.4908,
-      0.0037,
-      0.0006
+      92.1786,
+      82.4759,
+      1.6699,
+      53.642,
+      0.0073,
+      0.0012
     ]
   },
   "catch_ratio": 0.5,
@@ -87,7 +87,7 @@
   "descent_min_j4_z": 130.5,
   "descent_note": "18.3 第 4/5 步：从预停机点按 1 mm/步下降（q2+q3=90，J4 轴按 z 公式）；腕部 J4/J5/J6 默认用教的 park 点 (poses.park[3:6]，现在 J4≈45.5°, J5≈0°) 复现教的斜腕，也可用 descent_q4_deg/descent_j5_deg/descent_j6_deg 覆盖；J2 电流 ≤0.5·I₀ 算接住；最低 z=130.5（J2≈87.3°，安全限位 ±88°）。",
   "park_taught": true,
-  "park_taught_at": "2026-11-17T23:05:59",
+  "park_taught_at": "2026-11-26T21:27:29",
   "park_taught_source": "web: current actual q",
   "version": "2026-11-12.1",
   "descent_j5_deg": null,

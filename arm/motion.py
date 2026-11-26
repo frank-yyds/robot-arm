@@ -36,6 +36,10 @@ class MotionError(RuntimeError):
 # 启动容忍：每段开始，若某颗起始误差 >5°，允许 1 s 内最多 3° 的反向空程；
 # 一旦朝目标动，仍用原来的 >5° 且 0.3 s 不降 1° 判据。超过 3° 立即中止。
 START_GRACE_S = 1.0
+# 37.1 第 2 条：写目标后按位置判“收到没有”，不再按 0.06 s 速度判（判的是噪声）
+TARGET_CONFIRM_DEG = 0.05          # 朝目标走了 ≥0.05° 算收到（静止 3 s 最多漂 0.011°）
+TARGET_CONFIRM_ARM_DEG = 0.2       # t_c = t_lag + sqrt(0.2 / a)，给加速爬升留余量
+T_CONFIRM_LAG_S = 0.5712           # t_lag：37.2 用 65 个关节段实测的最大值（0.5712 s）
 # 27.2 第 2 条：前臂俯仰检查（实测 q2+q3 比应到大 2° 以上，持续 0.2 s 就中止）
 PITCH_TOL_DEG = 2.0
 PITCH_HOLD_S = 0.2
@@ -772,6 +776,57 @@ class Motion:
         except Exception:  # noqa: BLE001
             pass
 
+    def _check_target_confirm(self, confirm: dict, q, now: float):
+        """37.1 第 2 条：按位置判目标收到没有；第一次重发只记事件，第二次才中止。"""
+        for n in list(confirm.keys()):
+            info = confirm[n]
+            try:
+                i = self.order.index(n)
+            except ValueError:
+                confirm.pop(n, None)
+                continue
+            v = q[i] if q is not None else None
+            if v is None:
+                continue
+            tc = T_CONFIRM_LAG_S + math.sqrt(TARGET_CONFIRM_ARM_DEG / info["a"])
+            if now - info["t0"] < tc:
+                continue
+            moved = (float(v) - float(info["q0"])) * float(info["dir"])
+            if moved >= TARGET_CONFIRM_DEG:
+                confirm.pop(n, None)
+                continue
+            if not info["resent"]:
+                try:
+                    m = self.bus.motors[n]
+                    cfg = self.bus.cfg[n]
+                    m.set_target_turns(cfg.turns(info["target"]), priority=True)
+                    self.bus._targets[n] = info["target"]
+                except Exception:  # noqa: BLE001
+                    pass
+                info["resent"] = True
+                info["t0"] = now
+                info["q0"] = float(v)
+                if self.recorder:
+                    try:
+                        self.recorder.command(
+                            "target_confirm_resend",
+                            f"{n} 写目标后 {tc:.2f}s 只朝目标走了 {moved:.3f}°"
+                            f"（<{TARGET_CONFIRM_DEG}°），重发一次", joint=n,
+                            target_deg=float(info["target"]))
+                    except Exception:  # noqa: BLE001
+                        pass
+                continue
+            if self.recorder:
+                try:
+                    self.recorder.command(
+                        "target_lost",
+                        f"{n} 重发后又 {tc:.2f}s 没动（朝目标走了 {moved:.3f}°）",
+                        joint=n, target_deg=float(info["target"]))
+                except Exception:  # noqa: BLE001
+                    pass
+            self._abort(f"写目标丢了：{n} 在 {tc:.2f}s 内没朝目标走"
+                        f"（{moved:.3f}° < {TARGET_CONFIRM_DEG}°）")
+
     def _abort(self, reason: str):
         """中止 = 原地保持；只有六颗全部读不到（通信完全断）才全部失能。"""
         self._trend_log("中止")
@@ -797,6 +852,21 @@ class Motion:
         elif unconfirmed:
             reason += "；未确认保持：" + "，".join(
                 f"{x.get('name')}({x.get('reason')})" for x in unconfirmed)
+        kept = dict((res or {}).get("kept") or {})
+        # 35.2 的“到位窗口内不改写目标”会让 kept 关节的目标和实际差 ≤0.8°。
+        # 中止时把内部目标记成实际位置（真机已在窗口内，不发新目标；mock 直接对齐），
+        # 这样“原地保持”和 kept 记录一致。
+        for n, v in kept.items():
+            try:
+                self.bus._targets[n] = float(v)
+                if hasattr(self.bus, "target"):
+                    self.bus.target[n] = float(v)
+            except Exception:  # noqa: BLE001
+                pass
+        if kept:
+            # 37.1 第 4 条：中止时 hold_all 的 kept 记进 abort 事件和快照
+            reason += "；kept=" + "，".join(
+                f"{n}={float(v):.3f}°" for n, v in kept.items())
         with self._lock:
             self.status["phase"] = "aborted"
             self.status["reason"] = reason
@@ -894,6 +964,15 @@ class Motion:
             for n, q in zip(self.order, q_target):
                 self.recorder.command("command_move", seg["label"], n, float(q))
         t0 = time.monotonic()
+        # 37.1 第 2 条：只对这一段位移 >0.8° 的关节做位置确认
+        confirm = {}
+        for i, n in enumerate(self.order):
+            if abs(float(d_all[i])) > 0.8:
+                a = max(0.05, float(a_all[i]))
+                confirm[n] = {"target": float(q_target[i]),
+                              "dir": 1.0 if float(d_all[i]) > 0 else -1.0,
+                              "a": a, "t0": t0, "resent": False,
+                              "q0": float(q_from[i])}
         # 计划 T 只按匀速估，实际还有加速段/摩擦/轮询；给足余量
         timeout = max(5.0, seg["T"] * 1.5 + 3.0)
         last_ok = {n: t0 for n in self.order}
@@ -990,6 +1069,10 @@ class Motion:
                         f"{lo_s:.0f}..{hi_s:.0f}°（撞限位）")
                 if st.error:
                     self._abort(f"{n} 报警 0x{st.error:04X} {st.error_text}")
+            if confirm:
+                # 37.1 第 2 条：先按位置确认目标收到没有（重发/中止由它决定），
+                # 再走下面的落后/趋势保护
+                self._check_target_confirm(confirm, q, now)
             if None not in q:
                 # 22.2/22.3：把这一拍的指令位置/速度和实际回读交给钩子。
                 elapsed = now - t0
@@ -1050,6 +1133,11 @@ class Motion:
                 in_start = now - t0 <= START_GRACE_S
                 sample = {"t": round(now - t0, 3), "joints": {}}
                 for i, n in enumerate(self.order):
+                    # 37.1 第 2 条：还在做“写目标确认”的关节先不交给趋势保护，
+                    # 由 _check_target_confirm 决定重发/中止（否则 0.5 s 的“不动”
+                    # 会赶在第二次 t_c 之前把它拦下）
+                    if confirm and n in confirm:
+                        continue
                     st = states[n]
                     if st.out_deg is None:
                         continue
@@ -1139,6 +1227,8 @@ class Motion:
                         trend["stuck_since"].pop(n, None)
                 # 26.2 第 4 条：不规划在动的关节也要兜底（被带走）
                 for i, n in enumerate(self.order):
+                    if confirm and n in confirm:
+                        continue        # 37.1 第 2 条：等写目标确认，别越过它先中止
                     st = states[n]
                     if st.out_deg is None:
                         continue
@@ -1222,6 +1312,8 @@ class Motion:
             v = min(float(self.bus.cfg[n].motion_speed_deg_s), v)
             vel[n] = v
             acc[n] = v / max(self.bus.cfg[n].motion_accel_time_s, 0.05)
+        # 目标流是连续下发，不做单目标“位置确认”；这里给共享保护代码一个空集合
+        confirm = {}
         stream_pos = False
         if hasattr(self.bus, "set_stream_mode"):
             stream_pos = bool(self.bus.set_stream_mode(MODE_POSITION))
@@ -1229,7 +1321,9 @@ class Motion:
             self.bus.set_profiles_q(vel, acc,
                                     disp={n: float(delta[i]) for i, n in enumerate(self.order)})
         with self._lock:
-            self.status.update({"phase": "moving", "label": label,
+            # 直接调 _run_chunks 的自检（task21）也应当让“按停”看到 busy，
+            # 否则按停会把 phase 洗成 idle、后面的中止流程接不上（37.1 回归发现）。
+            self.status.update({"busy": True, "phase": "moving", "label": label,
                                 "target_q": [round(float(v), 4) for v in qf],
                                 "progress": 0.0})
         if self.recorder:
@@ -1320,6 +1414,13 @@ class Motion:
                                     f"{START_REVERSE_DEG:g}°")
                     if maxerr > 5.0:
                         for i, n in enumerate(self.order):
+                            # 37.1 第 2 条：还在做“写目标确认”的关节不交给落后保护，
+                            # 由 _check_target_confirm 决定重发/中止（否则会在第二次
+                            # t_c 之前先被落后保护拦下，就看不到“写目标丢了”）
+                            if confirm and n in confirm:
+                                err_ref[n] = None
+                                err_ref_t[n] = now
+                                continue
                             e = (abs(float(q[i]) - float(cmd[i]))
                                  if q[i] is not None else None)
                             lim = stall_lim[i]
@@ -1427,11 +1528,20 @@ class Motion:
                     self._run_segment(group[0])
                 if i < len(groups) - 1 and pause_between > 0:
                     time.sleep(pause_between)
+            # 37.1：目标流结束前按的停不能被“done”盖掉（原来会判成正常完成）
+            if self._stop.is_set():
+                self._abort(self._stop_reason)
             with self._lock:
                 self.status.update({"busy": False, "phase": "done",
                                     "finished": time.time(), "progress": 1.0})
             if self.recorder:
-                self.recorder.command("execute_done", "全部段到达")
+                note = "全部段到达"
+                try:
+                    if self.status.get("pitch_dev_max") is not None:
+                        note += f"；pitch_dev_max={float(self.status['pitch_dev_max']):.3f}°"
+                except Exception:  # noqa: BLE001
+                    pass
+                self.recorder.command("execute_done", note)
             return {"ok": True, "segments": segments}
         except MotionError as exc:
             with self._lock:

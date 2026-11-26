@@ -15,6 +15,7 @@ import threading
 import time
 from pathlib import Path
 
+from .joints import JointState
 from .sca import (DEG_PER_MOTOR_TURN, IQ24, R_CURRENT, R_ERROR, R_MODE,
                   R_POSITION, R_POWER, R_VELOCITY, VELOCITY_FULL_RPM)
 
@@ -43,6 +44,11 @@ class TraceSampler:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
+        # 37.1 第 1 条：最近一轮读数给执行器用（poll_hold 期间 _refresh 不再读总线，
+        # 保持失效检测/保持力矩/围栏都用这一份）
+        self.latest_states: dict[str, JointState] = {}
+        self.latest_q: list[float | None] = []
+        self.latest_at = 0.0
 
     def start(self):
         if self._thread and self._thread.is_alive():
@@ -50,7 +56,8 @@ class TraceSampler:
         bus = self.ex.bus
         if bus is None or not getattr(bus, "connected", False):
             raise RuntimeError("还没有连接真机，不能高频采样")
-        if not hasattr(bus, "link") or not hasattr(bus, "motors"):
+        if not getattr(bus, "is_mock", False) and (
+                not hasattr(bus, "link") or not hasattr(bus, "motors")):
             raise RuntimeError("当前不是真机 JointBus，不能高频采样")
         self._stop.clear()
         self.error = ""
@@ -88,6 +95,19 @@ class TraceSampler:
                 "path": (str(self.path) if self.path else None),
                 "error": self.error,
             }
+
+    def _publish_latest(self, states: dict[str, JointState], order):
+        """把这一轮读数发出去；只有六颗全采时才给执行器当全量状态用。"""
+        q = [states[n].out_deg if n in states else None for n in order]
+        with self._lock:
+            self.latest_states = dict(states)
+            self.latest_q = q
+            self.latest_at = time.time()
+        if len(order) == 6:
+            try:
+                self.ex._on_trace_latest(self, states)
+            except Exception:  # noqa: BLE001
+                pass
 
     def _sample_cvp(self, f, w, bus, order, ids, cm, tick, status_every, t0, dt):
         """0x94 一轮取六颗位置/速度/电流；报警/电源/模式按原频率。"""
@@ -129,9 +149,88 @@ class TraceSampler:
                         "" if pw.get(n) is None else str(pw[n]),
                         "" if modes.get(n) is None else str(modes[n]),
                         f"{dt:.4f}"])
+        states = {}
+        for n in order:
+            d = cvp.get(n) or {}
+            ok = bool(d.get("ok"))
+            states[n] = JointState(
+                name=n, id=ids[n], enabled=True if ok else None,
+                out_deg=d.get("pos_deg") if ok else None,
+                current_a=d.get("current_a") if ok else None,
+                velocity_deg_s=d.get("vel_deg_s") if ok else None,
+                error=errs.get(n), target_deg=targets.get(n),
+                mode=modes.get(n),
+                pos_read_at=time.time() if ok else None)
+        self._publish_latest(states, order)
+
+    def _run_mock(self, bus):
+        """mock 分支：37.1 的 poll_hold/自动停机自检要在 mock 上用同一套 trace。"""
+        order = [n for n in (self.joints or list(bus.order)) if n in bus.cfg]
+        period = 1.0 / self.hz
+        t0 = time.monotonic()
+        next_t = t0
+        last_sample = t0
+        tick = 0
+        try:
+            assert self.path is not None
+            with self.path.open("w", newline="", encoding="utf-8") as f:
+                w = csv.writer(f)
+                w.writerow(["time", "t_rel", "sample", "joint", "pos_deg",
+                            "target_deg", "current_a", "velocity_deg_s",
+                            "error", "power", "mode", "dt_s"])
+                f.flush()
+                while not self._stop.is_set():
+                    tick += 1
+                    now = time.monotonic()
+                    if now - t0 > self.seconds:
+                        break
+                    dt = max(0.0, now - last_sample)
+                    last_sample = now
+                    states_all = bus.read_all(full=True)
+                    states = {}
+                    for n in order:
+                        st = states_all.get(n)
+                        if st is None:
+                            continue
+                        states[n] = st
+                        w.writerow([
+                            time.strftime("%Y-%m-%dT%H:%M:%S"),
+                            f"{now - t0:.4f}", tick, n,
+                            "" if st.out_deg is None else f"{st.out_deg:.4f}",
+                            "" if st.target_deg is None else f"{st.target_deg:.4f}",
+                            "" if st.current_a is None else f"{st.current_a:.4f}",
+                            "" if st.velocity_deg_s is None else f"{st.velocity_deg_s:.3f}",
+                            "" if st.error is None else f"0x{int(st.error):04X}",
+                            "", "", f"{dt:.4f}"])
+                    self._publish_latest(states, order)
+                    self.samples = tick
+                    if tick % 10 == 0:
+                        f.flush()
+                    elapsed = time.monotonic() - t0
+                    self.actual_hz = tick / elapsed if elapsed > 0 else 0.0
+                    next_t += period
+                    sleep = next_t - time.monotonic()
+                    if sleep > 0:
+                        time.sleep(sleep)
+                    elif sleep < -0.2:
+                        next_t = time.monotonic()
+                f.flush()
+        except Exception as exc:  # noqa: BLE001
+            self.error = f"采样异常：{exc}"
+        finally:
+            end_mono = time.monotonic()
+            self.finished = time.time()
+            with self._lock:
+                self.actual_hz = self.samples / max(1e-6, end_mono - t0)
+            try:
+                self.ex._on_trace_finished(self)
+            except Exception:  # noqa: BLE001
+                pass
 
     def _run(self):
         bus = self.ex.bus
+        if getattr(bus, "is_mock", False):
+            return self._run_mock(bus)
         order = [n for n in (self.joints or list(bus.order)) if n in bus.motors]
         cm: dict[str, float | None] = {}
         # 电流满量程 0x53 只读一次；读不到就记 None
@@ -235,6 +334,36 @@ class TraceSampler:
                                     "" if power is None else str(power),
                                     "" if mode is None else str(mode),
                                     f"{dt:.4f}"])
+                    states = {}
+                    for n in order:
+                        mid = ids[n]
+                        cfg = bus.cfg[n]
+                        p = got.get((mid, R_POSITION))
+                        pos = None
+                        if p and len(p) >= 4:
+                            pos = cfg.out_deg(struct.unpack(">i", p)[0] / IQ24)
+                        c = got.get((mid, R_CURRENT))
+                        cur = None
+                        if c and len(c) >= 4 and cm.get(n):
+                            cur = struct.unpack(">i", c)[0] / IQ24 * cm[n]
+                        v = got.get((mid, R_VELOCITY))
+                        vel = None
+                        if v and len(v) >= 4:
+                            rpm = struct.unpack(">i", v)[0] / IQ24 * VELOCITY_FULL_RPM
+                            vel = cfg.sign * rpm * DEG_PER_MOTOR_TURN / 60.0
+                        e = got.get((mid, R_ERROR))
+                        err = None
+                        if e and len(e) >= 2:
+                            err = struct.unpack(">H", e)[0]
+                        pw = got.get((mid, R_POWER))
+                        md = got.get((mid, R_MODE))
+                        states[n] = JointState(
+                            name=n, id=mid, enabled=True if pos is not None else None,
+                            out_deg=pos, current_a=cur, velocity_deg_s=vel,
+                            error=err, target_deg=targets.get(n),
+                            mode=(md[0] if md else None),
+                            pos_read_at=time.time() if pos is not None else None)
+                    self._publish_latest(states, order)
                     self.samples = tick
                     if tick % 10 == 0:
                         f.flush()
@@ -255,3 +384,8 @@ class TraceSampler:
             self.finished = time.time()
             with self._lock:
                 self.actual_hz = self.samples / max(1e-6, end_mono - t0)
+            # 37.1 第 1 条：trace 正常结束/出错/被停，poll_hold 都要自动关
+            try:
+                self.ex._on_trace_finished(self)
+            except Exception:  # noqa: BLE001
+                pass

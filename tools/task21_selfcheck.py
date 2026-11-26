@@ -87,8 +87,10 @@ def run_thread(fn):
             fn()
         except BaseException as exc:  # noqa: BLE001
             box.append(exc)
+            print(f"  （自检线程异常：{type(exc).__name__}: {exc}）")
 
     t = threading.Thread(target=wrapped, daemon=True)
+    t.box = box
     t.start()
     return t, box
 
@@ -137,8 +139,15 @@ for trial in range(3):
     targets_after = [x for x in after if x[1] == "target"]
     check(f"21.1 目标流按停 #{trial + 1} 停前在动", moving,
           f"delay {delay:.2f}s")
+    bad_held = {n: (round(bus.target[n], 4), round(bus.q[n], 4))
+                for n in bus.order if abs(bus.target[n] - bus.q[n]) > 1e-6}
+    try:
+        box = th.box
+    except Exception:  # noqa: BLE001
+        box = []
     check(f"21.1 目标流按停 #{trial + 1} 原地保持", aborted and bus.enabled
-          and all_held(bus), m.status.get("reason", "")[:60])
+          and all_held(bus), f"{m.status.get('reason', '')[:40]} phase={m.status.get('phase')} "
+          f"enabled={bus.enabled} not_held={bad_held} box={box}")
     check(f"21.1 目标流按停 #{trial + 1} 写目标延迟 ≤100ms", lat <= STOP_LATENCY_S,
           f"{lat * 1000:.1f} ms")
     check(f"21.1 目标流按停 #{trial + 1} 不再发新目标", len(targets_after) <= 1,
