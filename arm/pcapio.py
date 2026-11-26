@@ -19,7 +19,10 @@
 """
 from __future__ import annotations
 
+import socket
 import struct
+import threading
+import time
 from pathlib import Path
 
 # pcap 全局头 magic：微秒（大端/小端）、纳秒（大端/小端）
@@ -215,3 +218,92 @@ def iter_write_frames(paths, ecb_ip: str = "192.168.1.30",
                 out.append((ts, addr, cmd, data.hex(), sport))
     out.sort(key=lambda r: r[0])
     return out
+
+
+# ---------------- 29.1 修订（2026-11-26）：执行器内的抓包转写 ----------------
+class PacketTee:
+    """把执行器发出去的帧抄成经典 pcap（和 tcpdump 的格式一样，pcap_check 能读）。
+
+    为什么不用 tcpdump：Mac 上开 BPF 要 sudo，agent 拿不到密码；会话一长还要环。
+    这个转写不需要任何权限、不受环容量限制，写的是**发送前的那串字节**（发送口和
+    主口都转），所以 pcap_check 的"记了没发 / 发了没记"照样对得上。
+
+    文件：<dir>/ecb_tee_<日期时间>.pcap，目录默认 runs/_pcap_ring/。
+    """
+
+    def __init__(self, out_dir, tag: str = "", flush_every: int = 20):
+        self.dir = Path(out_dir)
+        self.path = self.dir / f"ecb_tee_{time.strftime('%Y%m%d_%H%M%S')}{'_' + tag if tag else ''}.pcap"
+        self.flush_every = max(1, int(flush_every))
+        self._fh = None
+        self._lock = threading.Lock()
+        self.packets = 0
+        self.bytes = 0
+        self.started = None
+
+    @staticmethod
+    def _frame(src_ip: str, dst_ip: str, sport: int, dport: int,
+               raw: bytes) -> bytes:
+        """造 Ethernet/IPv4/UDP 帧。MAC 用占位（对账只看 IP/端口/负载）。"""
+        udp_len = 8 + len(raw)
+        ip_len = 20 + udp_len
+        eth = b"\x00" * 12 + b"\x08\x00"
+        iph = struct.pack(">BBHHHBBH4s4s", 0x45, 0, ip_len, 0, 0, 64, 17, 0,
+                          socket.inet_aton(src_ip), socket.inet_aton(dst_ip))
+        chk = 0
+        for i in range(0, 20, 2):
+            chk += (iph[i] << 8) + iph[i + 1]
+        chk = (chk & 0xFFFF) + (chk >> 16)
+        chk = (chk & 0xFFFF) + (chk >> 16)
+        iph = iph[:10] + struct.pack(">H", (~chk) & 0xFFFF) + iph[12:]
+        udph = struct.pack(">HHHH", int(sport) & 0xFFFF, int(dport) & 0xFFFF,
+                           udp_len, 0)
+        return eth + iph + udph + raw
+
+    def start(self):
+        self.dir.mkdir(parents=True, exist_ok=True)
+        self._fh = open(self.path, "wb")
+        self._fh.write(struct.pack("<IHHiIII", 0xA1B2C3D4, 2, 4, 0, 0, 65535,
+                                   LINKTYPE_ETHERNET))
+        self._fh.flush()
+        self.started = time.time()
+        return self
+
+    def feed(self, raw: bytes, dst_ip: str, dst_port: int, sport: int = 0):
+        """执行器每发一帧调用一次（发之前/发之后都行，只记字节）。"""
+        if self._fh is None:
+            return
+        try:
+            frame = self._frame("127.0.0.1", dst_ip, sport or 0, dst_port, raw)
+        except Exception:  # noqa: BLE001
+            return
+        ts = time.time()
+        sec = int(ts)
+        usec = int((ts - sec) * 1e6)
+        rec = struct.pack("<IIII", sec, usec, len(frame), len(frame))
+        with self._lock:
+            if self._fh is None:
+                return
+            try:
+                self._fh.write(rec + frame)
+                self.packets += 1
+                self.bytes += len(rec) + len(frame)
+                if self.packets % self.flush_every == 0:
+                    self._fh.flush()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def stat(self) -> dict:
+        return {"path": str(self.path), "packets": self.packets,
+                "bytes": self.bytes,
+                "started": None if self.started is None else round(self.started, 3)}
+
+    def close(self):
+        with self._lock:
+            if self._fh is not None:
+                try:
+                    self._fh.flush()
+                    self._fh.close()
+                except Exception:  # noqa: BLE001
+                    pass
+                self._fh = None

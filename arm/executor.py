@@ -500,6 +500,21 @@ class Executor:
             self.bus.anomaly_hook = self._on_read_anomaly
             self.bus.write_resend_hook = self._on_write_resend
             self.bus.link.event_hook = self._on_bus_event
+            # 29.1 修订（2026-11-26）：本机抓包不依赖 sudo。执行器把发出去的每一帧
+            # 转写一份经典 pcap（第二次"独立见证"：走的是发送前的字节，不是 recorder
+            # 的行），和 tools/pcap_check.py 读的格式一样。
+            try:
+                from .pcapio import PacketTee
+                tee_dir = self.runs_dir / "_pcap_ring"
+                self._packet_tee = PacketTee(tee_dir, tag=self.mode)
+                self._packet_tee.start()
+                self.bus.link.tee_hook = self._packet_tee.feed
+                self.msg += f"；抓包转写：{self._packet_tee.path}"
+            except Exception as exc:  # noqa: BLE001
+                self._packet_tee = None
+                self.msg += f"（抓包转写起不来：{exc}）"
+        else:
+            self._packet_tee = None
         if self.session and self.mode == "mock" and hasattr(self.bus, "write_log_path"):
             self.bus.write_log_path = str(self.session.dir / "mock_writes.jsonl")
 
@@ -785,6 +800,16 @@ class Executor:
         except Exception:  # noqa: BLE001
             pass
         return f"原始 {hexs}"
+
+    def _packet_tee_stat(self) -> dict:
+        """抓包转写的现状（网页/回报里看）；没开就返回空。"""
+        tee = getattr(self, "_packet_tee", None)
+        if tee is None:
+            return {}
+        try:
+            return tee.stat()
+        except Exception:  # noqa: BLE001
+            return {}
 
     def _on_bus_event(self, addr: int, cmd: int, data: bytes, ok):
         """A5：EcbTransport 的写命令钩子。只记写命令，读不回灌记录。"""

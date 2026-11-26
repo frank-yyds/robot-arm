@@ -85,7 +85,7 @@ def main(argv=None) -> int:
     except Exception:  # noqa: BLE001
         start_ts = None
 
-    # 会话结束时刻：events 最后一条的墙上时间（没有就用包的时间范围兜底）
+    # 会话结束时刻：events 最后一条的墙上时间（没有就用"会话开始 + 12 小时"兜底）
     end_ts = None
     for e in reversed(events):
         w = e.get("wall")
@@ -97,6 +97,8 @@ def main(argv=None) -> int:
         except Exception:  # noqa: BLE001
             end_ts = None
         break
+    if end_ts is None and start_ts is not None:
+        end_ts = start_ts + 12 * 3600.0
 
     # mock 会话绝不能拿真抓包来对账（runs/_pcap_ring 里可能正有真机会话的包）
     is_mock = str(meta.get("connector") or "").lower().startswith("mock") or \
@@ -108,10 +110,38 @@ def main(argv=None) -> int:
             if cand.exists():
                 pcap_dir = cand
                 break
-    if pcap_dir is not None and pcap_dir.exists():
+    # 29.1 修订：会话目录里有执行器自己转写的 pcap（ecb_tee_*.pcap）就优先它，
+    # 不再去公共环里翻（环里可能是几小时前 tcpdump 的老文件）
+    own_tee = []
+    if not is_mock:
+        own_tee = sorted(d.glob("ecb_tee_*.pcap")) + sorted(d.glob("ecb_tee_*.pcap*"))
+    if own_tee:
+        pcap_files = list(dict.fromkeys(own_tee))
+    elif pcap_dir is not None and pcap_dir.exists():
         pcap_files = sorted(pcap_dir.glob("*.pcap")) + \
             sorted(pcap_dir.glob("*.pcap*"))
         pcap_files = list(dict.fromkeys(pcap_files))
+        # 29.1 修订（2026-11-26）：只拿本会话时间窗内的抓包文件。
+        # 环里会同时留着 tcpdump 的老文件（可能是几天前的）和执行器自己的转写
+        # （runs/_pcap_ring/ecb_tee_*.pcap）；不筛的话时间窗对不上、越跑越乱。
+        try:
+            import datetime as _dt
+            lo_ts = _dt.datetime.fromisoformat(str(meta.get("started"))).timestamp() - 60.0
+        except Exception:  # noqa: BLE001
+            lo_ts = None
+        # 上限不做过滤：环文件是滚动写的，mtime 是"最后写"的时刻，
+        # 一场会话最后一个文件可能比会话结束晚十几分钟；按"包时刻"在下面筛就够了
+        kept = []
+        for f in pcap_files:
+            try:
+                mtime = f.stat().st_mtime
+            except Exception:  # noqa: BLE001
+                kept.append(f)
+                continue
+            if lo_ts is not None and mtime < lo_ts:
+                continue
+            kept.append(f)
+        pcap_files = kept
 
     source = "mock"
     packets = []

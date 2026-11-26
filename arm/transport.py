@@ -121,6 +121,8 @@ class EcbTransport:
                 self._ecb_lock.release()
                 self._ecb_lock = None
             raise
+        # 29.1 修订（2026-11-26）：抓包转写钩子（执行器设；把发出去的帧抄一份成 pcap）
+        self.tee_hook = None
         self._wlock = threading.Lock()
         self._lock = threading.RLock()
         self.tx = 0
@@ -155,6 +157,22 @@ class EcbTransport:
         d = self.by_cmd.setdefault(cmd, {"tx": 0, "rx": 0, "timeout": 0})
         d[key] = d.get(key, 0) + n
 
+    def _tee(self, raw: bytes, sock=None) -> None:
+        """把一帧发出去的原始字节交给抓包转写（失败不影响通信）。"""
+        hook = getattr(self, "tee_hook", None)
+        if hook is None:
+            return
+        try:
+            sport = 0
+            if sock is not None:
+                try:
+                    sport = sock.getsockname()[1]
+                except Exception:  # noqa: BLE001
+                    sport = 0
+            hook(raw, self.ip, self.port, sport)
+        except Exception:  # noqa: BLE001
+            pass
+
     def _send(self, raw: bytes) -> None:
         try:
             self._sock.sendto(raw, (self.ip, self.port))
@@ -162,6 +180,7 @@ class EcbTransport:
             self.tx_fail += 1
             raise EcbError(f"UDP 发不出去：{exc}") from exc
         self.tx += 1
+        self._tee(raw, self._sock)
 
     def _collect(self, seconds: float) -> list[Frame]:
         frames: list[Frame] = []
@@ -284,6 +303,7 @@ class EcbTransport:
         with self._wlock:
             self._wsock.sendto(raw, (self.ip, self.port))
         self.tx += 1
+        self._tee(raw, self._wsock)
         self._stat(cmd, "tx")
         if self.event_hook is not None:
             try:
