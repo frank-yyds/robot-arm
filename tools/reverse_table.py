@@ -19,6 +19,8 @@ import re
 import statistics
 from pathlib import Path
 
+import trace_match as tm
+
 SPEED_RE = re.compile(r"=\s*([-\d.]+)\s*RPM\s*=\s*([-\d.]+)\s*°/s")
 RAW_RE = re.compile(r"原始\s+([0-9a-fA-F]+)")
 
@@ -86,6 +88,17 @@ def action_info(act):
     return info
 
 
+def wall_dt(s: str | None):
+    """'2026-11-23T23:05:20.609' -> datetime（trace_match 要 datetime 入参）。"""
+    if not s:
+        return None
+    try:
+        import datetime as _dt
+        return _dt.datetime.fromisoformat(s)
+    except ValueError:
+        return None
+
+
 def load_trace(path: Path):
     rows = []
     for r in csv.DictReader(path.open(encoding="utf-8")):
@@ -116,7 +129,8 @@ def trace_secs(path: Path):
 
 
 def analyze_joint(trace_rows, joint, act_start_sec, q0_default):
-    seq = [r for r in trace_rows if r["joint"] == joint and r["pos"] is not None]
+    # 37.2 起 trace_rows 已经是这一颗的行（含 joint 的行已由 TraceFile.samples 滤好）
+    seq = [r for r in trace_rows if r["pos"] is not None]
     seq.sort(key=lambda r: r["t"])
     if len(seq) < 8:
         return None
@@ -161,23 +175,17 @@ def main(argv=None):
     rows = load_events(sess)
     actions = actions_from_events(rows)
     infos = [action_info(x) for x in actions]
-    traces = [load_trace(Path(p)) for p in sorted(Path().glob(a.traces))] if a.traces else []
-    # trace 关联：trace 第一行的日期时间落在动作 [start-1s, end+0.5s] 里
+    # 37.2 第 1 条：按动作的起止时刻找"覆盖它的"trace（不按最新文件拿）。
+    # 覆盖判据和容差见 tools/trace_match.py。
+    index = tm.build_index([a.traces]) if a.traces else []
     trace_by_action = {}
-    used = set()
     for i, inf in enumerate(infos):
-        s = wall_secs(inf["start_wall"])
-        e = wall_secs(inf["end_wall"]) or s
-        if s is None:
+        t0, t1 = wall_dt(inf["start_wall"]), wall_dt(inf["end_wall"])
+        if t0 is None or t1 is None:
             continue
-        for ti, tr in enumerate(traces):
-            if ti in used or not tr:
-                continue
-            t0 = tr[0]["wall"]
-            if t0 and s <= t0[11:19] <= e:
-                trace_by_action[i] = tr
-                used.add(ti)
-                break
+        tr = tm.find_trace_covering(index, t0, t1, inf["targets"])
+        if tr is not None:
+            trace_by_action[i] = tr
     out = {"session": str(sess), "actions": []}
     prev = {}
     for i, inf in enumerate(infos):
@@ -197,7 +205,7 @@ def main(argv=None):
                    "written_raw": {k: (prof.get(k) or {}).get("raw_hex") for k in (0x1F, 0x20, 0x21)},
                    "prev_dir": pv.get("dir"), "prev_written_vel_deg_s": pv.get("vel"),
                    "readback_1c_1d_1e": None}
-            an = None if tr is None else analyze_joint(tr, j, inf["start_wall"], tgt)
+            an = None if tr is None else analyze_joint(tr.samples(j), j, inf["start_wall"], tgt)
             if an:
                 row.update(an)
                 dir_now = 1 if an["disp"] > 0 else -1

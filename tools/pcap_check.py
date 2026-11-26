@@ -55,6 +55,52 @@ def load_mock_writes(session: Path) -> list[dict]:
     return out
 
 
+def _write_sign(p: dict) -> int | None:
+    """写命令数据的符号：+1/0/−1；解不出返回 None。
+
+    pcap 的 `data` 是 4 字节大端的十六进制（0x21 就是 int32 倍数），取最高位符号；
+    mock 的 `data` 是已经换算好的十进制值（mock_writes.jsonl 的 value）。
+    """
+    data = p.get("data")
+    if data in (None, ""):
+        return None
+    txt = str(data).strip()
+    if len(txt) == 8 and all(c in "0123456789abcdefABCDEF" for c in txt):
+        try:
+            iv = int.from_bytes(bytes.fromhex(txt), "big", signed=True)
+        except ValueError:
+            return None
+        return (iv > 0) - (iv < 0)
+    try:
+        fv = float(txt)
+    except ValueError:
+        return None
+    return (fv > 0) - (fv < 0)
+
+
+def sign_stats_0x21(packets: list[dict]) -> dict:
+    """37.2 第 3 条：0x21 写指令的总条数、负数、正数（应当全是负数）。
+
+    只加统计输出，不对账逻辑做任何改动。
+    """
+    tot = neg = pos = zero = unknown = 0
+    for p in packets:
+        if int(p.get("cmd", -1)) != 0x21:
+            continue
+        tot += 1
+        sgn = _write_sign(p)
+        if sgn is None:
+            unknown += 1
+        elif sgn < 0:
+            neg += 1
+        elif sgn > 0:
+            pos += 1
+        else:
+            zero += 1
+    return {"total": tot, "negative": neg, "positive": pos,
+            "zero": zero, "unknown": unknown}
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("session")
@@ -270,6 +316,14 @@ def main(argv=None) -> int:
             print(f"  端口 {sport}：{row['n']} 条，{f}s → {l}s（{mark}）")
     print(f"# events 写命令 {len(writes_ev)} 条；抓包写命令 {len(packets_for_match)} 条"
           f"（本会话端口 {len(exec_ports)} 个）；窗口 ±{args.tol_ms:g} ms")
+    st = sign_stats_0x21(packets_for_match)
+    extra = ""
+    if st["zero"]:
+        extra += f"，零 {st['zero']}"
+    if st["unknown"]:
+        extra += f"，解不出符号 {st['unknown']}"
+    print(f"# 0x21 写指令符号（37.2）：总 {st['total']} 条，负数 {st['negative']}，"
+          f"正数 {st['positive']}{extra}（应全负）")
     print(f"执行器记了但没发出去：{len(missing_in_pcap)}")
     for e in missing_in_pcap[:20]:
         print(f"  - {e.get('mono')}s {e.get('joint')} cmd=0x{int(e.get('cmd', 0)):02X} "
