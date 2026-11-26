@@ -10,7 +10,21 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from arm import config as cfgmod  # noqa: E402
 from arm.executor import Executor  # noqa: E402
+
+# 37.3（2026-11-26）：自检自己在一进程里连/断 100 次 Executor，量出来三个问题：
+#   1) Executor.disconnect() 不 clear _poll_stop，每个实例漏一个 20 Hz 的
+#      _poll_loop 线程；断开以后它继续按“零位预演”算 FK/围栏。
+#   2) 每次 connect 都起一个 enforce_quota 线程全量扫 runs/；笔记本上 runs/ 有
+#      14.9 GB / 1346 个目录，0.5 s/次，几十个扫描线程叠起来吃满 CPU。
+#   3) 结果：用例越靠后越慢（第 1 个用例 20/20，到第 5 个只过 1/20），
+#      不是保护判据的问题，是自检自己把机器拖垮了。
+# 这里让自检用一个小 runs 目录，并在每轮结束显式收线程。判据、观察窗口、
+# 注入时刻一概不改。执行器那两个清理 bug 仍要 PC 在 arm/executor.py 修。
+TRIAL_RUNS_DIR = Path("/tmp/trend_guard_trial_runs")
+_CFG = dict(cfgmod.load_executor())
+_CFG["runs_dir"] = str(TRIAL_RUNS_DIR)
 
 
 def wait_done(ex, timeout=8.0):
@@ -24,7 +38,7 @@ def wait_done(ex, timeout=8.0):
 
 
 def run_case(move, faults, inject_after=1.2, trial_time=6.0):
-    ex = Executor()
+    ex = Executor(_CFG)
     ex.connect("mock")
     ex.motion.speed_scale = 0.5
     ex.bus.enable_all(True, allow_restart=True)
@@ -68,6 +82,13 @@ def run_case(move, faults, inject_after=1.2, trial_time=6.0):
     ph = ex.motion.status.get("phase")
     ex.bus.clear_faults()
     ex.disconnect()
+    # 37.3：把这一轮漏下的 _poll_loop 线程收掉（见文件头注释）。
+    try:
+        ex._poll_stop.set()
+        if getattr(ex, "_poll_thread", None):
+            ex._poll_thread.join(timeout=0.5)
+    except Exception:  # noqa: BLE001
+        pass
     dt = None if t_abort is None else round(t_abort - t_inj, 2)
     return {"phase": ph, "reason": reason, "dt_s": dt}
 
@@ -80,6 +101,9 @@ def _safe_move(ex, q):
 
 
 def main():
+    import shutil
+    shutil.rmtree(TRIAL_RUNS_DIR, ignore_errors=True)
+    TRIAL_RUNS_DIR.mkdir(parents=True, exist_ok=True)
     results = {}
     cases = [
         ("1 落后 8° 但一直在追", [0, 60, 0, 0, 0, 0],
